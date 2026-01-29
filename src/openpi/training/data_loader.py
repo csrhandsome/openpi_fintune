@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+from datasets.features import features as hf_features
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -17,6 +18,15 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _ensure_legacy_list_feature() -> None:
+    # HF Datasets <3.0 stored fixed-size sequences with the "List" feature type.
+    if "List" not in hf_features._FEATURE_TYPES:
+        hf_features._FEATURE_TYPES["List"] = hf_features.Sequence
+
+
+_ensure_legacy_list_feature()
 
 
 class Dataset(Protocol[T_co]):

@@ -1,0 +1,1 @@
+uv run scripts/train.py pi05_droid_lora_finetune --exp_name openpi_fintune

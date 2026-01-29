@@ -42,6 +42,7 @@ class FrankaRobotEnv:
         camera_width: int = 640,
         camera_height: int = 480,
         camera_fps: int = 30,
+        color_only: bool = False,
         use_external_for_right: bool = True,
         control_frequency_hz: float = 15.0,
         joint_velocity_scale: float = 0.5,
@@ -75,6 +76,7 @@ class FrankaRobotEnv:
             width=camera_width,
             height=camera_height,
             fps=camera_fps,
+            color_only=color_only,
         )
         self._cameras.connect()
 

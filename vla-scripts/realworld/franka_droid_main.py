@@ -51,6 +51,7 @@ class Args:
     camera_width: int = 640
     camera_height: int = 480
     camera_fps: int = 30
+    color_only: bool = False
     use_external_for_right: bool = True
 
     # Control parameters
@@ -100,6 +101,7 @@ def main(args: Args):
         camera_width=args.camera_width,
         camera_height=args.camera_height,
         camera_fps=args.camera_fps,
+        color_only=args.color_only,
         use_external_for_right=args.use_external_for_right,
         control_frequency_hz=DROID_CONTROL_FREQUENCY,
         joint_velocity_scale=args.joint_velocity_scale,

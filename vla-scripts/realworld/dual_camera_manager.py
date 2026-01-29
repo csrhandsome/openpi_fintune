@@ -27,6 +27,7 @@ class DualCameraManager:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        color_only: bool = False,
     ) -> None:
         """
         初始化双相机管理器
@@ -47,6 +48,7 @@ class DualCameraManager:
             width=width,
             height=height,
             fps=fps,
+            enable_depth=not color_only,
             align_depth_to_color=True,
         )
 
@@ -57,6 +59,7 @@ class DualCameraManager:
             width=width,
             height=height,
             fps=fps,
+            enable_depth=not color_only,
             align_depth_to_color=True,
         )
 
