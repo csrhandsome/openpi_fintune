@@ -928,17 +928,17 @@ _CONFIGS = [
         ),
         data=LeRobotDROIDDataConfig(
             # Replace with your custom DROID LeRobot dataset repo id.
-            repo_id="franka_droid_lerobot_20260126_155327",
+            repo_id="franka_droid_lerobot_20260130_161202",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
-                # Important: reuse the original DROID norm stats during fine-tuning!
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                asset_id="droid",
+                # Use locally computed norm stats under assets/<config>/<repo_id>.
+                assets_dir="./assets/pi05_droid_lora_finetune",
+                asset_id="franka_droid_lerobot_20260130_161202",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
-        num_train_steps=20_000,
-        batch_size=32,
+        num_train_steps=10_000,
+        batch_size=6,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,

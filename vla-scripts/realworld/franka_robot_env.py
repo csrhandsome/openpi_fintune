@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional,TYPE_CHECKING
 
 import numpy as np
 
 from dual_camera_manager import DualCameraManager
 from robotic_arm_controller import RoboticArmControler
 
+if TYPE_CHECKING:
+    from robotic_arm_controller import RoboticArmControler
 
 @dataclass
 class FrankaCameraIds:
@@ -83,7 +85,7 @@ class FrankaRobotEnv:
         for _ in range(max(0, int(warmup_frames))):
             self._cameras.update(timeout_ms=self._camera_timeout_ms)
 
-        self._robot = RoboticArmControler(
+        self._robot: RoboticArmControler = RoboticArmControler(
             auto_move_to_start=auto_move_to_start,
         )
         if auto_move_to_start:
@@ -161,7 +163,19 @@ class FrankaRobotEnv:
             self._last_gripper_open = gripper_open
 
     def reset(self) -> dict:
+        # 停止流式控制器以避免控制冲突
+        self._robot.stop_velocity_streaming()
+
+        # 移动到起始位置
+        self._robot.gripper_open()
         self._robot.move_to_start()
+
+        # 重新启动流式速度控制器
+        self._robot.start_velocity_streaming(
+            control_frequency=max(self._control_frequency_hz * 10, 200.0),
+            time_step=1.0 / self._control_frequency_hz,
+        )
+
         return self.get_observation()
 
     def close(self) -> None:

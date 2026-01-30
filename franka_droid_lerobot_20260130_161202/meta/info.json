@@ -1,18 +1,18 @@
 {
-    "codebase_version": "v3.0",
+    "codebase_version": "v2.1",
     "robot_type": "panda",
-    "total_episodes": 2,
-    "total_frames": 439,
+    "total_episodes": 14,
+    "total_frames": 3737,
     "total_tasks": 1,
+    "total_videos": 0,
+    "total_chunks": 1,
     "chunks_size": 1000,
-    "data_files_size_in_mb": 100,
-    "video_files_size_in_mb": 200,
     "fps": 15.0,
     "splits": {
-        "train": "0:2"
+        "train": "0:14"
     },
-    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+    "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
     "features": {
         "exterior_image_1_left": {
             "dtype": "image",
