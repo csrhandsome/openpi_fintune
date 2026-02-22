@@ -939,8 +939,42 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=10_000,
         batch_size=6,
+        save_interval=500,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # LoRA fine-tuning for Pi0 (full model) on custom DROID-style LeRobot dataset.
+        name="pi0_droid_lora_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            # Replace with your custom DROID LeRobot dataset repo id.
+            repo_id="franka_droid_lerobot_20260130_161202",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Use locally computed norm stats under assets/<config>/<repo_id>.
+                assets_dir="./assets/pi0_droid_lora_finetune",
+                asset_id="franka_droid_lerobot_20260130_161202",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_droid/params"),
+        num_train_steps=5_000,
+        batch_size=5,  # Reduced batch size for larger pi0 model
+        save_interval=1000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=False,
             action_dim=32,
             action_horizon=16,
             paligemma_variant="gemma_2b_lora",

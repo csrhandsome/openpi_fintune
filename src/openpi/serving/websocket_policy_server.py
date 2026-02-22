@@ -29,12 +29,20 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        # Initialized in `run()` to bind to the running event loop.
+        self._infer_lock: asyncio.Lock | None = None
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
     async def run(self):
+        # NOTE: Policy inference is typically synchronous and can take >20s.
+        # If we run it directly in the asyncio handler, it blocks the event loop,
+        # preventing websockets from responding to keepalive pings (client sees
+        # "keepalive ping timeout"). Offload inference to a thread and serialize
+        # access so we don't run multiple inferences concurrently.
+        self._infer_lock = asyncio.Lock()
         async with _server.serve(
             self._handler,
             self._host,
@@ -49,6 +57,10 @@ class WebsocketPolicyServer:
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
 
+        if self._infer_lock is None:
+            # Should be set in `run()`, but keep this robust for alternative entrypoints.
+            self._infer_lock = asyncio.Lock()
+
         await websocket.send(packer.pack(self._metadata))
 
         prev_total_time = None
@@ -58,7 +70,8 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                async with self._infer_lock:
+                    action = await asyncio.to_thread(self._policy.infer, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

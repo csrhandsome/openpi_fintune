@@ -13,6 +13,7 @@ import tyro
 from moviepy import ImageSequenceClip
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
+from panda_py import libfranka
 from PIL import Image
 
 from franka_robot_env import FrankaCameraIds, FrankaRobotEnv
@@ -32,7 +33,7 @@ class Args:
     external_camera: str | None = "left"
 
     # Rollout parameters
-    max_timesteps: int = 600
+    max_timesteps: int = 2000
     # How many actions to execute from a predicted action chunk before querying policy server again
     open_loop_horizon: int = 8
 
@@ -56,6 +57,8 @@ class Args:
 
     # Control parameters
     joint_velocity_scale: float = 1.0  # 改为 1.0 匹配官方 DROID
+    # Top-k sampling (set to >1 to enable; None/<=1 disables)
+    topk_samples: int | None = None
 
 
 # We are using Ctrl+C to optionally terminate rollouts early -- however, if we press Ctrl+C while the policy server is
@@ -78,6 +81,28 @@ def prevent_keyboard_interrupt():
         signal.signal(signal.SIGINT, original_handler)
         if interrupted:
             raise KeyboardInterrupt
+
+
+def _kmeans_topk(samples: np.ndarray, k: int = 3, iters: int = 20) -> tuple[np.ndarray, np.ndarray]:
+    samples = np.asarray(samples, dtype=np.float32)
+    if samples.ndim != 2:
+        raise ValueError(f"Expected samples shape (N, D), got {samples.shape}")
+    if samples.shape[0] == 0:
+        raise ValueError("No samples provided for top-k clustering.")
+    k = min(int(k), samples.shape[0])
+    rng = np.random.default_rng(0)
+    centers = samples[rng.choice(samples.shape[0], size=k, replace=False)]
+    for _ in range(int(iters)):
+        d2 = ((samples[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
+        labels = d2.argmin(-1)
+        for i in range(k):
+            mask = labels == i
+            if np.any(mask):
+                centers[i] = samples[mask].mean(0)
+    probs = np.bincount(labels, minlength=k).astype(np.float32)
+    probs = probs / np.clip(probs.sum(), 1.0, None)
+    order = np.argsort(-probs)
+    return centers[order], probs[order]
 
 
 def main(args: Args):
@@ -107,12 +132,18 @@ def main(args: Args):
         joint_velocity_scale=args.joint_velocity_scale,
     )
 
+    franka_model = None
+    franka_frame = None
+    if args.topk_samples is not None and args.topk_samples > 1:
+        franka_model = env._robot.panda.get_robot().load_model()
+        franka_frame = libfranka.Frame.kEndEffector
+
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
     df = pd.DataFrame(columns=["success", "duration", "video_filename"])
 
     while True:
-        instruction = input("Enter instruction: ")
-
+        # instruction = input("Enter instruction: ")
+        instruction = "pick up the brown bottle"
         actions_from_chunk_completed = 0
         pred_action_chunk = None
         pred_action_horizon = 0
@@ -146,8 +177,38 @@ def main(args: Args):
                         "prompt": instruction,
                     }
 
+                    topk_samples = int(args.topk_samples) if args.topk_samples is not None else 0
                     with prevent_keyboard_interrupt():
-                        pred_action_chunk = policy_client.infer(request_data)["actions"]
+                        if topk_samples and topk_samples > 1:
+                            result = policy_client.infer(request_data)
+                            pred_action_chunk = result["actions"]
+                            samples = [pred_action_chunk[0]]
+                            # 开始循环采样k-1次。创新点所在地，可以看到vla的意图和犹豫。
+                            for _ in range(topk_samples - 1):
+                                samples.append(policy_client.infer(request_data)["actions"][0])
+                            centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=3)
+
+                            # 不阻塞的get_state()，然后用官方的api转换成末端的xyz
+                            robot_state = env._robot.panda.get_state()
+                            q_curr = np.asarray(robot_state.q, dtype=np.float32).reshape(7)
+                            F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
+                            EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
+
+                            topk_xyz = []
+                            for center in centers:
+                                action = np.asarray(center, dtype=np.float32).flatten()
+                                action_clipped = np.clip(action[:7], -1.0, 1.0)
+                                joint_delta = action_clipped * env._max_joint_delta * env._joint_velocity_scale
+                                q_next = q_curr + joint_delta
+                                pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
+                                pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
+                                topk_xyz.append(pose[:3, 3])
+                            topk_xyz = np.asarray(topk_xyz, dtype=np.float32)
+                            print("[TopK] EE xyz candidates (m):")
+                            for idx, (xyz, p) in enumerate(zip(topk_xyz, probs), start=1):
+                                print(f"  {idx}: xyz={xyz.tolist()}, prob={float(p):.3f}")
+                        else:
+                            pred_action_chunk = policy_client.infer(request_data)["actions"]
 
                     if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] < 8:
                         raise ValueError(f"Unexpected action chunk shape: {pred_action_chunk.shape}")
@@ -213,6 +274,7 @@ def main(args: Args):
     timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
     csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
     df.to_csv(csv_filename, index=False)
+    env._robot.move_to_start()
     print(f"Results saved to {csv_filename}")
 
 
