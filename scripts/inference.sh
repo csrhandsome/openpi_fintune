@@ -12,7 +12,8 @@ uv run vla-scripts/realworld/franka_droid_main.py \
   --external-camera-serial 825412070292 \
   --wrist-camera-serial 825412070487 \
   --joint-velocity-scale 1 \
-  --color-only
+  --color-only \
+  --topk_samples 2
 
 
 # franka 推理 5090

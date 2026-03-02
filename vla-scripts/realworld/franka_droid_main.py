@@ -11,12 +11,26 @@ import numpy as np
 import pandas as pd
 import tyro
 from moviepy import ImageSequenceClip
-from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 from panda_py import libfranka
 from PIL import Image
 
 from franka_robot_env import FrankaCameraIds, FrankaRobotEnv
+from plot_topk import plot_topk_xy
+
+
+def _center_crop_and_resize(rgb: np.ndarray, out_hw: int = 224, crop_scale: float = 0.9) -> np.ndarray:
+    """Center crop + resize to match training data preprocessing."""
+    h, w = rgb.shape[:2]
+    frac = float(np.sqrt(crop_scale))
+    crop_h = max(1, min(h, int(round(h * frac))))
+    crop_w = max(1, min(w, int(round(w * frac))))
+    y0 = (h - crop_h) // 2
+    x0 = (w - crop_w) // 2
+    cropped = rgb[y0:y0 + crop_h, x0:x0 + crop_w]
+    img = Image.fromarray(cropped, mode="RGB").resize((out_hw, out_hw), resample=Image.Resampling.BILINEAR)
+    return np.asarray(img, dtype=np.uint8)
+
 
 # DROID data collection frequency -- we slow down execution to match this frequency
 DROID_CONTROL_FREQUENCY = 15
@@ -33,7 +47,7 @@ class Args:
     external_camera: str | None = "left"
 
     # Rollout parameters
-    max_timesteps: int = 2000
+    max_timesteps: int = 800 
     # How many actions to execute from a predicted action chunk before querying policy server again
     open_loop_horizon: int = 8
 
@@ -57,8 +71,11 @@ class Args:
 
     # Control parameters
     joint_velocity_scale: float = 1.0  # 改为 1.0 匹配官方 DROID
-    # Top-k sampling (set to >1 to enable; None/<=1 disables)
+    # Top-k clustering count (set to >1 to enable; None/<=1 disables)
     topk_samples: int | None = None
+    # Number of stochastic policy draws used before clustering.
+    # If None, defaults to max(4 * topk_samples, topk_samples + 1).
+    topk_draws: int | None = None
 
 
 # We are using Ctrl+C to optionally terminate rollouts early -- however, if we press Ctrl+C while the policy server is
@@ -137,13 +154,18 @@ def main(args: Args):
     if args.topk_samples is not None and args.topk_samples > 1:
         franka_model = env._robot.panda.get_robot().load_model()
         franka_frame = libfranka.Frame.kEndEffector
+    plot_xlim: tuple[float, float] | None = None
+    plot_ylim: tuple[float, float] | None = None
 
     policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
     df = pd.DataFrame(columns=["success", "duration", "video_filename"])
 
     while True:
         # instruction = input("Enter instruction: ")
-        instruction = "pick up the brown bottle"
+        instruction = "pick up the beaker"
+        # instruction = "Pick up the wide-mouth bottle"
+        plot_xlim = None
+        plot_ylim = None
         actions_from_chunk_completed = 0
         pred_action_chunk = None
         pred_action_horizon = 0
@@ -168,25 +190,29 @@ def main(args: Args):
                 if pred_action_chunk is None or actions_from_chunk_completed >= effective_horizon:
                     actions_from_chunk_completed = 0
                     request_data = {
-                        "observation/exterior_image_1_left": image_tools.resize_with_pad(
-                            curr_obs[f"{args.external_camera}_image"], 224, 224
+                        "observation/exterior_image_1_left": _center_crop_and_resize(
+                            curr_obs[f"{args.external_camera}_image"]
                         ),
-                        "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 224, 224),
+                        "observation/wrist_image_left": _center_crop_and_resize(curr_obs["wrist_image"]),
                         "observation/joint_position": curr_obs["joint_position"],
                         "observation/gripper_position": curr_obs["gripper_position"],
                         "prompt": instruction,
                     }
 
-                    topk_samples = int(args.topk_samples) if args.topk_samples is not None else 0
+                    # 聚类的个数，有几个无法描述准确的物体就(核心创新点)
+                    topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
                     with prevent_keyboard_interrupt():
-                        if topk_samples and topk_samples > 1:
+                        if topk_k and topk_k > 1:
+                            topk_draws = int(args.topk_draws) if args.topk_draws is not None else max(4 * topk_k, topk_k + 1)
+                            topk_draws = max(topk_draws, topk_k)
                             result = policy_client.infer(request_data)
                             pred_action_chunk = result["actions"]
+                            # 创一个列表放一个action
                             samples = [pred_action_chunk[0]]
-                            # 开始循环采样k-1次。创新点所在地，可以看到vla的意图和犹豫。
-                            for _ in range(topk_samples - 1):
+                            # 额外采样topk_draws次再聚类(核心创新点)
+                            for _ in range(topk_draws - 1):
                                 samples.append(policy_client.infer(request_data)["actions"][0])
-                            centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=3)
+                            centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
 
                             # 不阻塞的get_state()，然后用官方的api转换成末端的xyz
                             robot_state = env._robot.panda.get_state()
@@ -204,9 +230,27 @@ def main(args: Args):
                                 pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
                                 topk_xyz.append(pose[:3, 3])
                             topk_xyz = np.asarray(topk_xyz, dtype=np.float32)
-                            print("[TopK] EE xyz candidates (m):")
-                            for idx, (xyz, p) in enumerate(zip(topk_xyz, probs), start=1):
-                                print(f"  {idx}: xyz={xyz.tolist()}, prob={float(p):.3f}")
+                            # 把末端的xy换成图片保存
+                            curr_pose = np.asarray(robot_state.O_T_EE, dtype=np.float32).reshape(4, 4).T
+                            curr_ee_xyz = curr_pose[:3, 3]
+                            # Freeze XY axis on first plot to avoid per-frame auto-rescaling jitter.
+                            if plot_xlim is None or plot_ylim is None:
+                                xy = np.concatenate([topk_xyz[:, :2], curr_ee_xyz[:2].reshape(1,2)], axis=0)
+                                # 确定坐标轴范围
+                                xy_min = xy.min(axis=0)
+                                xy_max = xy.max(axis=0)
+                                span = np.maximum(xy_max - xy_min, np.array([0.15, 0.15], dtype=np.float32))
+                                pad = 0.25 * span
+                                plot_xlim = (float(xy_min[0] - pad[0]), float(xy_max[0] + pad[0]))
+                                plot_ylim = (float(xy_min[1] - pad[1]), float(xy_max[1] + pad[1]))
+                            plot_path = plot_topk_xy(
+                                topk_xyz,
+                                probs,
+                                current_xyz=curr_ee_xyz,
+                                xlim=plot_xlim,
+                                ylim=plot_ylim,
+                            )
+                            print(f"  [TopK] plot saved: {plot_path}")
                         else:
                             pred_action_chunk = policy_client.infer(request_data)["actions"]
 
@@ -271,11 +315,12 @@ def main(args: Args):
         env.reset()
 
     os.makedirs("results", exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
-    csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
-    df.to_csv(csv_filename, index=False)
+    # timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
+    # csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
+    # df.to_csv(csv_filename, index=False)
     env._robot.move_to_start()
-    print(f"Results saved to {csv_filename}")
+    env._robot.gripper_open()
+    # print(f"Results saved to {csv_filename}")
 
 
 def _extract_observation(args: Args, obs_dict, *, save_to_disk=False):
