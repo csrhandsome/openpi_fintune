@@ -23,8 +23,9 @@ import openpi.shared.array_typing as at
 
 logger = logging.getLogger("openpi")
 
-# Type variable for array types (JAX arrays, PyTorch tensors, or numpy arrays)
-ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
+# Type variable for array-like structures used in model IO. This includes `jax.ShapeDtypeStruct`
+# because `inputs_spec` returns shape-only placeholders with this type.
+ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray | jax.ShapeDtypeStruct)
 
 
 class ModelType(enum.Enum):

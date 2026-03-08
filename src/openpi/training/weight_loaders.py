@@ -72,9 +72,8 @@ class PaliGemmaWeightLoader(WeightLoader):
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
 
-# TODO: 这个loader要改成适应新的force输入的loader
 @dataclasses.dataclass(frozen=True)
-class Pi0ForceWeightLoader(WeightLoader):
+class Pi0GuidanceWeightLoader(WeightLoader):
     """Loads an entire set of weights from a checkpoint.
 
     Compatible with:
@@ -88,8 +87,14 @@ class Pi0ForceWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*limoe.*|.*force.*")
+        # Keep newly introduced force-fusion params from model init, and load everything else from checkpoint.
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*force.*|.*cbam.*|.*adamoe.*")
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0ForceWeightLoader(Pi0GuidanceWeightLoader):
+    """Backward compatible alias for older force model config names."""
+
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.

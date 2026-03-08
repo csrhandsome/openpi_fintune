@@ -1,2 +1,0 @@
-'''输入层： 夹爪内部差异图 (Diff Image，当前帧减去初始帧) $3 \times H \times W$。ResNet 骨干网络： 正常通过 ResNet 的前几个阶段（Layer 1, Layer 2, Layer 3）。插入注意力模块： 在 ResNet 的 Layer 3 和 Layer 4 的输出后面，分别接上一个 CBAM 模块。为什么要放在较深层？ 因为浅层提取的是边缘和角点，深层提取的才是具有物理意义的“大块形变”。在深层做 Attention（聚焦）效果最好。池化与降维： 经过 Global Average Pooling (全局平均池化) 后，用一个全连接层（Linear）将其映射为你需要的维度（比如 256维 或 512维的触觉向量）。特征融合： 将这个 256维的触觉向量，与 VLM（大语言模型）输出的意图向量 Concat（拼接）。输出动作： 送入 Action Expert（动作专家/策略网络），输出机械臂的位姿和夹爪的闭合力度。'''
-# TODO 设计 CBAM 模块

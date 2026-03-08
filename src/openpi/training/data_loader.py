@@ -16,7 +16,7 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
-
+from datasets.features import features as hf_features
 T_co = TypeVar("T_co", covariant=True)
 
 

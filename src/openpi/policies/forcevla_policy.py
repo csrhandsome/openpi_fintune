@@ -12,7 +12,8 @@ def make_forcevla_example() -> dict:
     return {
         "state": np.ones((14,)),  # observation.state, 7 ee pose, 1 gripper, 6 force
         "image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
-        "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
+        "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        "wrist_image_right": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "prompt": "do something",
     }
 
@@ -62,7 +63,11 @@ class Forcevla_inputs(transforms.DataTransformFn):
         # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
         # right wrist image below.
         base_image = _parse_image(data["image"])
-        left_wrist_image = _parse_image(data["wrist_image"])
+        left_wrist_key = "wrist_image_left" if "wrist_image_left" in data else "wrist_image"
+        left_wrist_image = _parse_image(data[left_wrist_key])
+        right_wrist_key = "wrist_image_right"
+        has_right_wrist = right_wrist_key in data
+        right_wrist_image = _parse_image(data[right_wrist_key]) if has_right_wrist else np.zeros_like(base_image)
 
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
@@ -70,14 +75,14 @@ class Forcevla_inputs(transforms.DataTransformFn):
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist_image,
-                # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": np.zeros_like(base_image),
+                # Use right wrist if available, otherwise pad with zeros.
+                "right_wrist_0_rgb": right_wrist_image,
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                # Mask any non-existent images with False (if ``mask_padding`` is True).
-                "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+                # Mask non-existent right wrist images with False when padding is enabled.
+                "right_wrist_0_rgb": np.asarray(has_right_wrist or not mask_padding),
             },
         }
 

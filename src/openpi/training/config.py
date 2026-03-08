@@ -16,9 +16,11 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -460,8 +462,53 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaJointDataConfig(DataConfigFactory):
+    """
+    Config for custom DROID dataset in LeRobot format where ``actions`` stores
+    absolute joint position targets plus an absolute gripper command.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        # Joint targets are stored as absolute positions, so convert the first 7
+        # dimensions to deltas for training and restore them during inference.
+        # The last gripper dimension remains absolute.
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
     
-# TODO: 要修改的dataset,这个dataset要适应新的force的输入
 @dataclasses.dataclass(frozen=True)
 class LeRobotForcevlaDataConfig(DataConfigFactory):
     """
@@ -474,17 +521,6 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # The repack transform is *only* applied to the data coming from the dataset,
-        # and *not* during inference. We can use it to make inputs from the dataset look
-        # as close as possible to those coming from the inference environment (e.g. match the keys).
-        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
-        # the keys we use in our inference pipeline (defined in the inference script for libero).
-        # For your own dataset, first figure out what keys your environment passes to the policy server
-        # and then modify the mappings below so your dataset's keys get matched to those target keys.
-        # The repack transform simply remaps key names here.
-        print("-"*100)
-        print("ForceVla data is loading..")
-        print("-"*100)
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -498,41 +534,25 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
                 )
             ]
         )
-        # The data transforms are applied to the data coming from the dataset *and* during inference.
-        # Below, we define the transforms for data going into the model (``inputs``) and the transforms
-        # for data coming out of the model (``outputs``) (the latter is only used during inference).
-        # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
-        # how to modify the transforms to match your dataset. Once you created your own transforms, you can
-        # replace the transforms below with your own.
         data_transforms = _transforms.Group(
-            inputs=[forcevla_policy.Forcevla_inputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[
+                forcevla_policy.Forcevla_inputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
             outputs=[forcevla_policy.Forcevla_outputs()],
         )
-        # One additional data transform: pi0 models are trained on delta actions (relative to the first
-        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
-        # you can uncomment the following line to convert the actions to delta actions. The only exception
-        # is for the gripper actions which are always absolute.
-        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
-        # leave the 7th action (gripper) unchanged, i.e. absolute.
-        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
-        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
-        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
-
-        # TODO(karl): comment this out once we have updated the Libero checkpoints to not use
-        # the delta action transform
-        ## action: xyz  + rpy + gripper
+        # Keep the PI0-style delta transform for 6D arm motion and preserve gripper absolute value.
         delta_action_mask = _transforms.make_bool_mask(6, -1)
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
         )
-        # Model transforms include things like tokenizing the prompt and action targets
-        # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
 
-        # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs),
+            self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -1059,24 +1079,57 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    TrainConfig(
+        # LoRA fine-tuning for Pi0-base on a custom DROID-style LeRobot dataset
+        # whose actions are absolute joint position targets plus gripper state.
+        name="pi0_base_joint_lora_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotFrankaJointDataConfig(
+            repo_id="openpi/franka_droid_lerobot_3_8",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                # Use locally computed norm stats under assets/<config>/<asset_id>.
+                assets_dir="./assets/pi0_base_droid_joint_lora_finetune",
+                asset_id="franka_droid_lerobot_3_8",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=5_000,
+        batch_size=5,
+        save_interval=1000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
 
     # TODO:之后要添加的config
-    # TrainConfig(
-    #     name="forcevla_lora",
-    #     model=pi0_force.Pi0_GuidanceConfig(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-    #     data=LeRobotForcevlaDataConfig(
-    #         repo_id="flexiv_peel_cucumber_inputForce",
-    #         base_config=DataConfig(prompt_from_task=True),
-    #     ),
-    #     weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-    #     # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-    #     num_train_steps=50_000,
-    #     freeze_filter=pi0_force.Pi0_GuidanceConfig(
-    #         paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-    #     ).get_freeze_filter(),
-    #     ema_decay=None,
-    #     batch_size=4,
-    # ),
+    TrainConfig(
+        name="forcevla_lora",
+        model=pi0_force.Pi0_GuidanceConfig(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotForcevlaDataConfig(
+            repo_id="flexiv_peel_cucumber_inputForce",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.Pi0GuidanceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_force.Pi0_GuidanceConfig(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=4,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
