@@ -162,7 +162,7 @@ def main(args: Args):
 
     while True:
         # instruction = input("Enter instruction: ")
-        instruction = "pick up the beaker"
+        instruction = "pick up the yellow cup"
         # instruction = "Pick up the wide-mouth bottle"
         plot_xlim = None
         plot_ylim = None

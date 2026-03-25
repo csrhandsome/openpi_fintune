@@ -39,6 +39,10 @@ dependencies = [
     "polars>=1.30.0",
     "matplotlib>=3.10.3",
     "crcmod>=1.7",
+    "moviepy>=2.2.1",
+    "panda-python>=0.8.1",
+    "spatialmath-python>=1.1.15",
+    "pyrealsense2>=2.56.5.9235",
 ]
 
 
@@ -62,7 +66,7 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74","av>=16.0.0"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

@@ -162,17 +162,18 @@ def preprocess_observation(
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
-        if image.shape[1:3] != image_resolution:
-            logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
-            image = image_tools.resize_with_pad(image, *image_resolution)
+        leading_shape = image.shape[:-3]
+        flat_image = jnp.reshape(image, (-1, *image.shape[-3:]))
+        if flat_image.shape[1:3] != image_resolution:
+            logger.info(f"Resizing image {key} from {flat_image.shape[1:3]} to {image_resolution}")
+            flat_image = image_tools.resize_with_pad(flat_image, *image_resolution)
 
         if train:
-            # Convert from [-1, 1] to [0, 1] for augmax.
-            image = image / 2.0 + 0.5
+            flat_image = flat_image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
-                height, width = image.shape[1:3]
+            if "wrist" not in key and "gripper" not in key:
+                height, width = flat_image.shape[1:3]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
                     augmax.Resize(width, height),
@@ -181,13 +182,15 @@ def preprocess_observation(
             transforms += [
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
-            sub_rngs = jax.random.split(rng, image.shape[0])
-            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            sub_rngs = jax.random.split(rng, flat_image.shape[0])
+            flat_image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, flat_image)
 
-            # Back to [-1, 1].
-            image = image * 2.0 - 1.0
+            flat_image = flat_image * 2.0 - 1.0
 
-        out_images[key] = image
+        out_images[key] = jnp.reshape(
+            flat_image,
+            (*leading_shape, image_resolution[0], image_resolution[1], flat_image.shape[-1]),
+        )
 
     # obtain mask
     out_masks = {}

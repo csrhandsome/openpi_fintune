@@ -135,11 +135,15 @@ class Pi0_GuidanceConfig(_model.BaseModelConfig):
                         "base_0_rgb": image_spec,
                         "left_wrist_0_rgb": image_spec,
                         "right_wrist_0_rgb": image_spec,
+                        "gripper_left_0_rgb": image_spec,
+                        "gripper_right_0_rgb": image_spec,
                     },
                     image_masks={
                         "base_0_rgb": image_mask_spec,
                         "left_wrist_0_rgb": image_mask_spec,
                         "right_wrist_0_rgb": image_mask_spec,
+                        "gripper_left_0_rgb": image_mask_spec,
+                        "gripper_right_0_rgb": image_mask_spec,
                     },
                     state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                     tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
@@ -179,6 +183,15 @@ class Pi0_Guidance(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        self.prefix_image_keys = (
+            "base_0_rgb",
+            "left_wrist_0_rgb",
+            "right_wrist_0_rgb",
+        )
+        self.force_image_keys = (
+            "gripper_left_0_rgb",
+            "gripper_right_0_rgb",
+        )
 
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -246,7 +259,7 @@ class Pi0_Guidance(_model.BaseModel):
         ar_mask = []
         tokens = []
 
-        for name in obs.images:
+        for name in self.prefix_image_keys:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
             tokens.append(image_tokens)
             input_mask.append(einops.repeat(obs.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
@@ -295,19 +308,17 @@ class Pi0_Guidance(_model.BaseModel):
         return tokens, input_mask, ar_mask
 
     def _embed_force_images(self, obs: _model.Observation) -> at.Float[at.Array, "b 1 d"]:
-        left_wrist = obs.images["left_wrist_0_rgb"]
-        right_wrist = obs.images["right_wrist_0_rgb"]
+        left_gripper = obs.images["gripper_left_0_rgb"]
+        right_gripper = obs.images["gripper_right_0_rgb"]
 
-        if left_wrist.ndim == 4 and right_wrist.ndim == 4:
-            # Default path: single frame per wrist, converted to a sequence with T=1.
-            force_images = jnp.concatenate([left_wrist, right_wrist], axis=-1)[:, None, ...]
-        elif left_wrist.ndim == 5 and right_wrist.ndim == 5:
-            # Optional temporal path: [B, T, H, W, C] from each wrist camera.
-            force_images = jnp.concatenate([left_wrist, right_wrist], axis=-1)
+        if left_gripper.ndim == 4 and right_gripper.ndim == 4:
+            force_images = jnp.concatenate([left_gripper, right_gripper], axis=-1)[:, None, ...]
+        elif left_gripper.ndim == 5 and right_gripper.ndim == 5:
+            force_images = jnp.concatenate([left_gripper, right_gripper], axis=-1)
         else:
             raise ValueError(
-                "left/right wrist image ranks must match and be either 4D or 5D. "
-                f"Got left={left_wrist.shape}, right={right_wrist.shape}."
+                "left/right gripper image ranks must match and be either 4D or 5D. "
+                f"Got left={left_gripper.shape}, right={right_gripper.shape}."
             )
 
         force_images = force_images.astype(jnp.float32)
@@ -338,7 +349,12 @@ class Pi0_Guidance(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng,
+            observation,
+            train=train,
+            image_keys=self.prefix_image_keys + self.force_image_keys,
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -370,7 +386,12 @@ class Pi0_Guidance(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        observation = _model.preprocess_observation(
+            None,
+            observation,
+            train=False,
+            image_keys=self.prefix_image_keys + self.force_image_keys,
+        )
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))

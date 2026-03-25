@@ -1,29 +1,61 @@
-'''要改成自己的policy'''
-# TODO
 import dataclasses
-from typing import ClassVar
+
 import einops
 import numpy as np
-from openpi import transforms  
+
+from openpi import transforms
 from openpi.models import model as _model
 
+
 def make_forcevla_example() -> dict:
-    """Creates a random input example compatible with Flexiv config."""
+    """Creates a random input example for the forcevla policy."""
     return {
-        "state": np.ones((14,)),  # observation.state, 7 ee pose, 1 gripper, 6 force
-        "image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8), 
-        "wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
-        "wrist_image_right": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        "observation/exterior_image_1_left": np.random.randint(
+            256, size=(224, 224, 3), dtype=np.uint8
+        ),
+        "observation/wrist_image_left": np.random.randint(
+            256, size=(224, 224, 3), dtype=np.uint8
+        ),
+        "observation/gripper_image_left": np.random.randint(
+            256, size=(4, 224, 224, 3), dtype=np.uint8
+        ),
+        "observation/gripper_image_right": np.random.randint(
+            256, size=(4, 224, 224, 3), dtype=np.uint8
+        ),
+        "observation/joint_position": np.ones((7,), dtype=np.float32),
+        "observation/gripper_position": np.ones((1,), dtype=np.float32),
         "prompt": "do something",
     }
+
 
 def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
-        image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+        if np.min(image) < 0.0:
+            image = ((image + 1.0) / 2.0 * 255.0).astype(np.uint8)
+        else:
+            image = (255 * image).astype(np.uint8)
+    if image.ndim == 3 and image.shape[0] == 3 and image.shape[-1] != 3:
         image = einops.rearrange(image, "c h w -> h w c")
+    elif image.ndim == 4 and image.shape[1] == 3 and image.shape[-1] != 3:
+        image = einops.rearrange(image, "t c h w -> t h w c")
     return image
+
+
+def _get_first_present(data: dict, keys: tuple[str, ...], *, required: bool = True):
+    for key in keys:
+        if key in data:
+            return data[key]
+    if required:
+        raise KeyError(f"Missing required keys {keys}. Available keys: {tuple(data.keys())}")
+    return None
+
+
+def _as_gripper_position(value) -> np.ndarray:
+    gripper_position = np.asarray(value, dtype=np.float32)
+    if gripper_position.ndim == 0:
+        gripper_position = gripper_position[np.newaxis]
+    return gripper_position
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,75 +75,99 @@ class Forcevla_inputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
-        # We only mask padding for pi0 model, not pi0-FAST. Do not change this for your own dataset.
         mask_padding = self.model_type == _model.ModelType.PI0
 
-        # We pad the proprioceptive input to the action dimension of the model.
-        # For pi0-FAST, we don't pad the state. For Libero, we don't need to differentiate
-        # since the pi0-FAST action_dim = 7, which is < state_dim = 8, so pad is skipped.
-        # Keep this for your own dataset, but if your dataset stores the proprioceptive input
-        # in a different key than "observation/state", you should change it below.
-        state = transforms.pad_to_dim(data["state"], self.action_dim)
+        joint_position = _get_first_present(
+            data,
+            ("observation/joint_position", "joint_position"),
+            required=False,
+        )
+        gripper_position = _get_first_present(
+            data,
+            ("observation/gripper_position", "gripper_position"),
+            required=False,
+        )
+        if joint_position is not None and gripper_position is not None:
+            state_raw = np.concatenate(
+                [
+                    np.asarray(joint_position, dtype=np.float32),
+                    _as_gripper_position(gripper_position),
+                ],
+                axis=-1,
+            )
+        else:
+            state_raw = _get_first_present(data, ("observation/state", "state"))
+        state = transforms.pad_to_dim(np.asarray(state_raw, dtype=np.float32), self.action_dim)
 
-        # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
-        # stores as float32 (C,H,W), gets skipped for policy inference.
-        # Keep this for your own dataset, but if your dataset stores the images
-        # in a different key than "observation/image" or "observation/wrist_image",
-        # you should change it below.
-        # Pi0 models support three image inputs at the moment: one third-person view,
-        # and two wrist views (left and right). If your dataset does not have a particular type
-        # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
-        # right wrist image below.
-        base_image = _parse_image(data["image"])
-        left_wrist_key = "wrist_image_left" if "wrist_image_left" in data else "wrist_image"
-        left_wrist_image = _parse_image(data[left_wrist_key])
-        right_wrist_key = "wrist_image_right"
-        has_right_wrist = right_wrist_key in data
-        right_wrist_image = _parse_image(data[right_wrist_key]) if has_right_wrist else np.zeros_like(base_image)
+        base_image = _parse_image(
+            _get_first_present(
+                data,
+                ("observation/exterior_image_1_left", "image", "observation.image"),
+            )
+        )
+        left_wrist_image = _parse_image(
+            _get_first_present(
+                data,
+                ("observation/wrist_image_left", "wrist_image_left", "wrist_image"),
+            )
+        )
 
-        # Create inputs dict. Do not change the keys in the dict below.
+        right_wrist_value = _get_first_present(
+            data,
+            ("observation/wrist_image_right", "wrist_image_right"),
+            required=False,
+        )
+        has_right_wrist = right_wrist_value is not None
+        right_wrist_image = (
+            _parse_image(right_wrist_value) if has_right_wrist else np.zeros_like(base_image)
+        )
+
+        gripper_left_image = _parse_image(
+            _get_first_present(
+                data,
+                ("observation/gripper_image_left", "gripper_image_left"),
+            )
+        )
+        gripper_right_image = _parse_image(
+            _get_first_present(
+                data,
+                ("observation/gripper_image_right", "gripper_image_right"),
+            )
+        )
+
         inputs = {
             "state": state,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": left_wrist_image,
-                # Use right wrist if available, otherwise pad with zeros.
                 "right_wrist_0_rgb": right_wrist_image,
+                "gripper_left_0_rgb": gripper_left_image,
+                "gripper_right_0_rgb": gripper_right_image,
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                # Mask non-existent right wrist images with False when padding is enabled.
                 "right_wrist_0_rgb": np.asarray(has_right_wrist or not mask_padding),
+                "gripper_left_0_rgb": np.True_,
+                "gripper_right_0_rgb": np.True_,
             },
         }
 
-        # Pad actions to the model action dimension. Keep this for your own dataset.
-        # Actions are only available during training.
-        if "actions" in data:
-            # We are padding to the model action dim.
-            # For pi0-FAST, this is a no-op (since action_dim = 7).
-            actions = transforms.pad_to_dim(data["actions"], self.action_dim)
+        actions_value = _get_first_present(data, ("actions", "action"), required=False)
+        if actions_value is not None:
+            actions = transforms.pad_to_dim(np.asarray(actions_value, dtype=np.float32), self.action_dim)
             inputs["actions"] = actions
 
-        # Pass the prompt (aka language instruction) to the model.
-        # Keep this for your own dataset (but modify the key if the instruction is not
-        # stored in "prompt"; the output dict always needs to have the key "prompt").
         if "prompt" in data:
-            inputs["prompt"] = data["prompt"]
+            prompt = data["prompt"]
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8")
+            inputs["prompt"] = prompt
 
         return inputs
-    
+
+
 @dataclasses.dataclass(frozen=True)
 class Forcevla_outputs(transforms.DataTransformFn):
-    """
-    This class is used to convert outputs from the model back the the dataset specific format. It is
-    used for inference only.
-    For your own dataset, you can copy this class and modify the action dimension based on the comments below.
-    """
     def __call__(self, data: dict) -> dict:
-        # Only return the first N actions -- since we padded actions above to fit the model action
-        # dimension, we need to now parse out the correct number of actions in the return dict.
-        # For forcevla, we only return the first 7 actions (since the rest is padding), xyz  + RPY + gripper
-        # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, :8])}
