@@ -28,6 +28,13 @@ def test_resize_with_pad_shapes():
     assert resized_images.shape == (1, height, width, 3)
     assert jnp.all(resized_images == 0)
 
+
+def test_resize_with_pad_temporal_images():
+    images = jnp.zeros((2, 4, 32, 40, 3), dtype=jnp.uint8)
+    resized_images = image_tools.resize_with_pad(images, 24, 24)
+    assert resized_images.shape == (2, 4, 24, 24, 3)
+    assert jnp.all(resized_images == 0)
+
     # Test case 3: Resize image with odd-numbered padding
     images = jnp.zeros((1, 256, 320, 3), dtype=jnp.uint8)
     height = 60

@@ -42,6 +42,7 @@ class RealSenseConnector:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        enable_depth: bool = True,
         align_depth_to_color: bool = True,
         # YOLO 手部检测参数
         yolo_model_name: str = "hand_yolov8n.pt",
@@ -65,6 +66,7 @@ class RealSenseConnector:
         self._width = int(width)
         self._height = int(height)
         self._fps = int(fps)
+        self._enable_depth = bool(enable_depth)
         self._align_depth_to_color = align_depth_to_color
 
         self._pipeline = None
@@ -126,14 +128,17 @@ class RealSenseConnector:
             cfg.enable_device(self._serial)
 
         cfg.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
-        cfg.enable_stream(rs.stream.depth, self._width, self._height, rs.format.z16, self._fps)
+        if self._enable_depth:
+            cfg.enable_stream(rs.stream.depth, self._width, self._height, rs.format.z16, self._fps)
 
         profile = pipeline.start(cfg)
 
-        depth_sensor = profile.get_device().first_depth_sensor()
-        depth_scale = float(depth_sensor.get_depth_scale())
+        depth_scale = None
+        if self._enable_depth:
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale = float(depth_sensor.get_depth_scale())
 
-        if self._align_depth_to_color:
+        if self._align_depth_to_color and self._enable_depth:
             align = rs.align(rs.stream.color)
         else:
             align = None
@@ -219,9 +224,9 @@ class RealSenseConnector:
             except Exception:
                 pass
 
-        depth_frame = frames.get_depth_frame()
+        depth_frame = frames.get_depth_frame() if self._enable_depth else None
         color_frame = frames.get_color_frame()
-        if not depth_frame or not color_frame:
+        if not color_frame or (self._enable_depth and not depth_frame):
             return False
 
         color_img = np.asanyarray(color_frame.get_data())
@@ -229,13 +234,16 @@ class RealSenseConnector:
             return False
         color_img = color_img.astype(np.uint8, copy=False)  # RGB8
 
-        depth_raw = np.asanyarray(depth_frame.get_data())
-        if depth_raw.ndim != 2:
-            return False
-        depth_scale = 0.001 if self._depth_scale is None else float(self._depth_scale)
-        depth_m = depth_raw.astype(np.float32, copy=False) * depth_scale
+        depth_m = None
+        if self._enable_depth:
+            depth_raw = np.asanyarray(depth_frame.get_data())
+            if depth_raw.ndim != 2:
+                return False
+            depth_scale = 0.001 if self._depth_scale is None else float(self._depth_scale)
+            depth_m = depth_raw.astype(np.float32, copy=False) * depth_scale
 
-        ts = float(getattr(depth_frame, "get_timestamp", lambda: 0.0)())
+        ts_source = depth_frame if depth_frame is not None else color_frame
+        ts = float(getattr(ts_source, "get_timestamp", lambda: 0.0)())
         intrinsics = self._sensor_data.intrinsics
         self._sensor_data = RealSenseSensorData(
             timestamp=ts,

@@ -3,6 +3,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 from typing_extensions import override
+import websockets.exceptions
 import websockets.sync.client
 
 from openpi_client import base_policy as _base_policy
@@ -35,7 +36,14 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    # Real-world policy inference can take >20s (e.g. first-call JIT compile).
+                    # Increase keepalive timeout to avoid spurious disconnects.
+                    ping_timeout=300,
+                    open_timeout=10,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
@@ -46,8 +54,14 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
         data = self._packer.pack(obs)
-        self._ws.send(data)
-        response = self._ws.recv()
+        try:
+            self._ws.send(data)
+            response = self._ws.recv()
+        except websockets.exceptions.ConnectionClosed:
+            # Reconnect once on transient disconnects (e.g. server restart).
+            self._ws, self._server_metadata = self._wait_for_server()
+            self._ws.send(data)
+            response = self._ws.recv()
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")

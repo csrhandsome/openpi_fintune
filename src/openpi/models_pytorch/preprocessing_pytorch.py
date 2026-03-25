@@ -37,13 +37,23 @@ def preprocess_observation_pytorch(
     for key in image_keys:
         image = observation.images[key]
 
-        # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
-        # Handle both [B, C, H, W] and [B, H, W, C] formats
-        is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
+        if image.dim() < 4:
+            raise ValueError(
+                f"Image tensor for key '{key}' must have at least 4 dims, got shape {tuple(image.shape)}"
+            )
 
-        if is_channels_first:
-            # Convert [B, C, H, W] to [B, H, W, C] for processing
-            image = image.permute(0, 2, 3, 1)
+        if image.shape[-1] <= 4:
+            is_channels_first = False
+            leading_shape = image.shape[:-3]
+            image = image.reshape(-1, *image.shape[-3:])
+        elif image.shape[-3] <= 4:
+            is_channels_first = True
+            leading_shape = image.shape[:-3]
+            image = image.reshape(-1, *image.shape[-3:]).permute(0, 2, 3, 1)
+        else:
+            raise ValueError(
+                f"Unable to infer channel axis for key '{key}' with shape {tuple(image.shape)}"
+            )
 
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
@@ -54,7 +64,7 @@ def preprocess_observation_pytorch(
             image = image / 2.0 + 0.5
 
             # Apply PyTorch-based augmentations
-            if "wrist" not in key:
+            if "wrist" not in key and "gripper" not in key:
                 # Geometric augmentations for non-wrist cameras
                 height, width = image.shape[1:3]
 
@@ -141,11 +151,10 @@ def preprocess_observation_pytorch(
             # Back to [-1, 1]
             image = image * 2.0 - 1.0
 
-        # Convert back to [B, C, H, W] format if it was originally channels-first
         if is_channels_first:
-            image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+            image = image.permute(0, 3, 1, 2)
 
-        out_images[key] = image
+        out_images[key] = image.reshape(*leading_shape, *image.shape[1:])
 
     # obtain mask
     out_masks = {}

@@ -19,9 +19,13 @@ def resize_with_pad(
     """Replicates tf.image.resize_with_pad. Resizes an image to a target height and width without distortion
     by padding with black. If the image is float32, it must be in the range [-1, 1].
     """
-    has_batch_dim = images.ndim == 4
-    if not has_batch_dim:
-        images = images[None]  # type: ignore
+    images = jnp.asarray(images)
+    if images.ndim < 3:
+        raise ValueError(f"Expected images with shape [..., h, w, c], got {images.shape}")
+
+    lead_shape = images.shape[:-3]
+    images = jnp.reshape(images, (-1, *images.shape[-3:]))
+
     cur_height, cur_width = images.shape[1:3]
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
@@ -47,9 +51,7 @@ def resize_with_pad(
         constant_values=0 if images.dtype == jnp.uint8 else -1.0,
     )
 
-    if not has_batch_dim:
-        padded_images = padded_images[0]
-    return padded_images
+    return jnp.reshape(padded_images, (*lead_shape, height, width, images.shape[-1]))
 
 
 def resize_with_pad_torch(
@@ -70,19 +72,22 @@ def resize_with_pad_torch(
     Returns:
         Resized and padded tensor with same shape format as input
     """
-    # Check if input is in channels-last format [*b, h, w, c] or channels-first [*b, c, h, w]
-    if images.shape[-1] <= 4:  # Assume channels-last format
-        channels_last = True
-        # Convert to channels-first for torch operations
-        if images.dim() == 3:
-            images = images.unsqueeze(0)  # Add batch dimension
-        images = images.permute(0, 3, 1, 2)  # [b, h, w, c] -> [b, c, h, w]
-    else:
-        channels_last = False
-        if images.dim() == 3:
-            images = images.unsqueeze(0)  # Add batch dimension
+    if images.dim() < 3:
+        raise ValueError(f"Expected images with shape [..., h, w, c] or [..., c, h, w], got {tuple(images.shape)}")
 
-    batch_size, channels, cur_height, cur_width = images.shape
+    if images.shape[-1] <= 4:
+        channels_last = True
+        lead_shape = images.shape[:-3]
+        flat_images = images.reshape(-1, *images.shape[-3:])
+        images_cf = flat_images.permute(0, 3, 1, 2)
+    elif images.shape[-3] <= 4:
+        channels_last = False
+        lead_shape = images.shape[:-3]
+        images_cf = images.reshape(-1, *images.shape[-3:])
+    else:
+        raise ValueError(f"Unable to infer channel axis for image tensor with shape {tuple(images.shape)}")
+
+    batch_size, channels, cur_height, cur_width = images_cf.shape
 
     # Calculate resize ratio
     ratio = max(cur_width / width, cur_height / height)
@@ -91,16 +96,19 @@ def resize_with_pad_torch(
 
     # Resize
     resized_images = F.interpolate(
-        images, size=(resized_height, resized_width), mode=mode, align_corners=False if mode == "bilinear" else None
+        images_cf,
+        size=(resized_height, resized_width),
+        mode=mode,
+        align_corners=False if mode == "bilinear" else None,
     )
 
     # Handle dtype-specific clipping
-    if images.dtype == torch.uint8:
+    if images_cf.dtype == torch.uint8:
         resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
-    elif images.dtype == torch.float32:
+    elif images_cf.dtype == torch.float32:
         resized_images = resized_images.clamp(-1.0, 1.0)
     else:
-        raise ValueError(f"Unsupported image dtype: {images.dtype}")
+        raise ValueError(f"Unsupported image dtype: {images_cf.dtype}")
 
     # Calculate padding
     pad_h0, remainder_h = divmod(height - resized_height, 2)
@@ -109,7 +117,7 @@ def resize_with_pad_torch(
     pad_w1 = pad_w0 + remainder_w
 
     # Pad
-    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    constant_value = 0 if images_cf.dtype == torch.uint8 else -1.0
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
@@ -117,10 +125,7 @@ def resize_with_pad_torch(
         value=constant_value,
     )
 
-    # Convert back to original format if needed
     if channels_last:
-        padded_images = padded_images.permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
-        if batch_size == 1 and images.shape[0] == 1:
-            padded_images = padded_images.squeeze(0)  # Remove batch dimension if it was added
+        padded_images = padded_images.permute(0, 2, 3, 1)
 
-    return padded_images
+    return padded_images.reshape(*lead_shape, *padded_images.shape[1:])

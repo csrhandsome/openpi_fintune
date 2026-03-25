@@ -49,7 +49,9 @@ class CheckpointWeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path), restore_type=np.ndarray
+        )
         # Add all missing LoRA weights.
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
@@ -64,16 +66,54 @@ class PaliGemmaWeightLoader(WeightLoader):
 
     def load(self, params: at.Params) -> at.Params:
         path = download.maybe_download(
-            "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz", gs={"token": "anon"}
+            "gs://vertex-model-garden-paligemma-us/paligemma/pt_224.npz",
+            gs={"token": "anon"},
         )
         with path.open("rb") as f:
             flat_params = dict(np.load(f, allow_pickle=False))
-        loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
+        loaded_params = {
+            "PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")[
+                "params"
+            ]
+        }
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
-def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
+@dataclasses.dataclass(frozen=True)
+class Pi0GuidanceWeightLoader(WeightLoader):
+    """Loads an entire set of weights from a checkpoint.
+
+    Compatible with:
+      trained checkpoints:
+        example: "./checkpoints/<config>/<exp>/<step>/params"
+      released checkpoints:
+        example: "s3://openpi-assets/checkpoints/<model>/params"
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path), restore_type=np.ndarray
+        )
+        # Keep newly introduced force-fusion params from model init, and load everything else from checkpoint.
+        return _merge_params(
+            loaded_params,
+            params,
+            missing_regex=".*lora.*|.*force.*|.*cbam.*|.*adamoe.*",
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0ForceWeightLoader(Pi0GuidanceWeightLoader):
+    """Backward compatible alias for older force model config names."""
+
+
+def _merge_params(
+    loaded_params: at.Params, params: at.Params, *, missing_regex: str
+) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
     Args:
@@ -91,7 +131,9 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     result = {}
     for k, v in flat_loaded.items():
         if k in flat_ref:
-            result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+            result[k] = (
+                v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+            )
 
     flat_loaded.clear()
 

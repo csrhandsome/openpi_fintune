@@ -10,13 +10,23 @@ import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+from datasets.features import features as hf_features
 
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
-
+from datasets.features import features as hf_features
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _ensure_legacy_list_feature() -> None:
+    # HF Datasets <3.0 stored fixed-size sequences with the "List" feature type.
+    if "List" not in hf_features._FEATURE_TYPES:
+        hf_features._FEATURE_TYPES["List"] = hf_features.Sequence
+
+
+_ensure_legacy_list_feature()
 
 
 class Dataset(Protocol[T_co]):
@@ -138,11 +148,18 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    delta_timestamps.update(
+        {
+            key: [delta / dataset_meta.fps for delta in delta_indices]
+            for key, delta_indices in data_config.delta_indices.items()
+        }
+    )
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps or None,
     )
 
     if data_config.prompt_from_task:
