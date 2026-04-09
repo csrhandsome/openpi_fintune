@@ -5,18 +5,18 @@ import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+from datasets.features import features as hf_features
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
-from datasets.features import features as hf_features
 
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
-from datasets.features import features as hf_features
+
 T_co = TypeVar("T_co", covariant=True)
 
 

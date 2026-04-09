@@ -14,11 +14,13 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
+import openpi.models.pi0_audio as pi0_audio
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.audiovla_policy as audiovla_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
@@ -74,19 +76,13 @@ class DataConfig:
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
-    repack_transforms: _transforms.Group = dataclasses.field(
-        default_factory=_transforms.Group
-    )
+    repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Data transforms, typically include robot specific transformations. Will be applied
     # before the data is normalized. See `model.Observation` and `model.Actions` to learn about the
     # normalized data.
-    data_transforms: _transforms.Group = dataclasses.field(
-        default_factory=_transforms.Group
-    )
+    data_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # Model specific transforms. Will be applied after the data is normalized.
-    model_transforms: _transforms.Group = dataclasses.field(
-        default_factory=_transforms.Group
-    )
+    model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
@@ -124,7 +120,7 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI0_AUDIO:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -155,25 +151,19 @@ class ModelTransformFactory(GroupFactory):
                     else model_config.fast_model_tokenizer
                 )
                 tokenizer_kwargs = (
-                    {}
-                    if model_config.fast_model_tokenizer_kwargs is None
-                    else model_config.fast_model_tokenizer_kwargs
+                    {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
                 )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizeFASTInputs(
-                            tokenizer_cls(
-                                model_config.max_token_len, **tokenizer_kwargs
-                            ),
+                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
                     ],
                     outputs=[
                         _transforms.ExtractFASTActions(
-                            tokenizer_cls(
-                                model_config.max_token_len, **tokenizer_kwargs
-                            ),
+                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                             action_horizon=model_config.action_horizon,
                             action_dim=model_config.action_dim,
                         )
@@ -191,29 +181,21 @@ class DataConfigFactory(abc.ABC):
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
     @abc.abstractmethod
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
 
-    def create_base_config(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(
-                epath.Path(self.assets.assets_dir or assets_dirs), asset_id
-            ),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            use_quantile_norm=model_config.model_type not in (ModelType.PI0, ModelType.PI0_AUDIO),
         )
 
-    def _load_norm_stats(
-        self, assets_dir: epath.Path, asset_id: str | None
-    ) -> dict[str, _transforms.NormStats] | None:
+    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
             return None
         try:
@@ -231,27 +213,19 @@ class FakeDataConfig(DataConfigFactory):
     repo_id: str = "fake"
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         return DataConfig(repo_id=self.repo_id)
 
 
 @dataclasses.dataclass(frozen=True)
 class SimpleDataConfig(DataConfigFactory):
     # Factory for the data transforms.
-    data_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(
-        default_factory=GroupFactory
-    )
+    data_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=GroupFactory)
     # Factory for the model transforms.
-    model_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(
-        default_factory=ModelTransformFactory
-    )
+    model_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=ModelTransformFactory)
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             data_transforms=self.data_transforms(model_config),
@@ -289,9 +263,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     action_sequence_keys: Sequence[str] = ("action",)
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
@@ -303,9 +275,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(
-            model_config
-        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -327,9 +297,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     extra_delta_transform: bool = False
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # The repack transform is *only* applied to the data coming from the dataset,
         # and *not* during inference. We can use it to make inputs from the dataset look
         # as close as possible to those coming from the inference environment (e.g. match the keys).
@@ -419,9 +387,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
     )
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -452,9 +418,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory()(model_config)
 
-        assert (
-            self.rlds_data_dir is not None
-        ), "Need to set rlds data dir for RLDS data loader."
+        assert self.rlds_data_dir is not None, "Need to set rlds data dir for RLDS data loader."
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -475,9 +439,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
     """
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -516,9 +478,7 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
     """
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
@@ -528,6 +488,8 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
                         "observation/wrist_image_left": "wrist_image_left",
                         "observation/joint_position": "joint_position",
                         "observation/gripper_position": "gripper_position",
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
                         "actions": "actions",
                         "prompt": "prompt",
                     }
@@ -556,6 +518,73 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
         )
 
 
+# audio的dataconfig,在这里决定什么key,决定最终怎么transform数据
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
+    """Franka joint-control dataset with sidecar audio aligned by episode/frame indices."""
+
+    audio_fallback_fps: float = 20.0
+    audio_strict: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not isinstance(model_config, pi0_audio.Pi0AudioConfig):
+            raise TypeError("LeRobotFrankaJointAudioDataConfig requires Pi0AudioConfig.")
+
+        dataset_root = self.repo_id if self.repo_id is not tyro.MISSING else None
+        if dataset_root is None:
+            raise ValueError("repo_id is required for Franka audio datasets with sidecar WAV files.")
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_left": "exterior_image_2_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "observation/joint_position": "joint_position",
+                        "observation/gripper_position": "gripper_position",
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                audiovla_policy.AudiovlaInputs(
+                    action_dim=model_config.action_dim,
+                    audio_num_samples=model_config.audio_num_samples,
+                    audio_sample_rate=model_config.audio_sample_rate,
+                    use_whisper=model_config.use_whisper,
+                    whisper_model_name=model_config.whisper_model_name,
+                    whisper_output_dim=model_config.audio_feature_dim,
+                    whisper_device=model_config.whisper_device,
+                    dataset_root=dataset_root,
+                    audio_fallback_fps=self.audio_fallback_fps,
+                    audio_strict=self.audio_strict,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[audiovla_policy.AudiovlaOutputs()],
+        )
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotForcevlaDataConfig(DataConfigFactory):
     """
@@ -569,9 +598,7 @@ class LeRobotForcevlaDataConfig(DataConfigFactory):
     force_history: int = 4
 
     @override
-    def create(
-        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
-    ) -> DataConfig:
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         if self.force_history <= 0:
             raise ValueError("force_history must be > 0")
 
@@ -635,14 +662,10 @@ class TrainConfig:
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
-    model: _model.BaseModelConfig = dataclasses.field(
-        default_factory=pi0_config.Pi0Config
-    )
+    model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
 
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
-    weight_loader: weight_loaders.WeightLoader = dataclasses.field(
-        default_factory=weight_loaders.NoOpWeightLoader
-    )
+    weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
@@ -650,18 +673,12 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
-    lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(
-        default_factory=_optimizer.CosineDecaySchedule
-    )
-    optimizer: _optimizer.OptimizerConfig = dataclasses.field(
-        default_factory=_optimizer.AdamW
-    )
+    lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
+    optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
 
     # Specifies which weights should be frozen.
-    freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(
-        default_factory=nnx.Nothing
-    )
+    freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -715,9 +732,7 @@ class TrainConfig:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
-        return (
-            pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name
-        ).resolve()
+        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -843,9 +858,7 @@ _CONFIGS = [
         ),
         # Here you define which pre-trained checkpoint you want to load to initialize the model.
         # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
@@ -853,17 +866,13 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ),
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
         # The freeze filter defines which parameters should be frozen during training.
         # We have a convenience function in the model config that returns the default freeze filter
@@ -887,18 +896,14 @@ _CONFIGS = [
         # max_token_len). A good rule of thumb is to use approx 180 for single-arm robots, and approx 250 for
         # two-arm robots. Generally, err on the lower side here first, and potentially increase the value if
         # you see many warnings being thrown during training.
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180
-        ),
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
         # Note that we load the pi0-FAST base model checkpoint here.
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -916,9 +921,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
         # Again, make sure to match the model config above when extracting the freeze filter
         # that specifies which parameters should be frozen during LoRA finetuning.
@@ -933,9 +936,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=10, discrete_state_input=False
-        ),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -950,9 +951,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
@@ -987,9 +986,7 @@ _CONFIGS = [
                 ]
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
     TrainConfig(
@@ -1018,9 +1015,7 @@ _CONFIGS = [
                 ]
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
     ),
@@ -1043,9 +1038,7 @@ _CONFIGS = [
             rlds_data_dir="<path_to_droid_rlds_dataset>",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -1079,9 +1072,7 @@ _CONFIGS = [
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -1115,9 +1106,7 @@ _CONFIGS = [
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_droid/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
     ),
@@ -1141,9 +1130,7 @@ _CONFIGS = [
                 asset_id="franka_droid_lerobot_20260130_161202",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_droid/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=10_000,
         batch_size=6,
         save_interval=500,
@@ -1176,9 +1163,7 @@ _CONFIGS = [
                 asset_id="franka_droid_lerobot_20260130_161202",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_droid/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_droid/params"),
         num_train_steps=5_000,
         batch_size=5,  # Reduced batch size for larger pi0 model
         save_interval=1000,
@@ -1211,9 +1196,7 @@ _CONFIGS = [
                 asset_id="franka_droid_lerobot_3_8",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=5_000,
         batch_size=5,
         save_interval=1000,
@@ -1227,19 +1210,15 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # TODO:之后要添加的config
+    # TODO:之后要添加的力的config
     TrainConfig(
-        name="forcevla_lora",
-        model=pi0_force.Pi0_GuidanceConfig(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ),
+        name="pi0_base_forcevla_joint_lora",
+        model=pi0_force.Pi0_GuidanceConfig(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotForcevlaDataConfig(
             repo_id="flexiv_peel_cucumber_inputForce",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.Pi0GuidanceWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_force.Pi0_GuidanceConfig(
@@ -1247,6 +1226,40 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         batch_size=4,
+    ),
+    # 声音训练config
+    TrainConfig(
+        name="pi0_base_audio_joint_lora",
+        model=pi0_audio.Pi0AudioConfig(
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_whisper=True,
+            whisper_model_name="openai/whisper-tiny",
+        ),
+        data=LeRobotFrankaJointAudioDataConfig(
+            # 数据放在openpi的根目录且名称为repo_id
+            repo_id="franka_lerobot_4_9_audio",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_audio_joint_lora",
+                asset_id="franka_lerobot_4_9_audio",
+            ),
+        ),
+        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=5_000,
+        batch_size=4,
+        save_interval=1000,
+        freeze_filter=pi0_audio.Pi0AudioConfig(
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_whisper=True,
+            whisper_model_name="openai/whisper-tiny",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
@@ -1259,9 +1272,7 @@ _CONFIGS = [
             default_prompt="Transfer cube",
             use_delta_joint_actions=False,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi0_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
     #
@@ -1271,9 +1282,7 @@ _CONFIGS = [
         name="debug",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(
-            paligemma_variant="dummy", action_expert_variant="dummy"
-        ),
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
         save_interval=100,
         overwrite=True,
         exp_name="debug",
@@ -1284,12 +1293,8 @@ _CONFIGS = [
         name="debug_restore",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(
-            paligemma_variant="dummy", action_expert_variant="dummy"
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/debug/debug/9/params"
-        ),
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
@@ -1297,14 +1302,22 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="debug_pi05",
-        model=pi0_config.Pi0Config(
-            pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"
-        ),
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
         data=FakeDataConfig(),
         batch_size=2,
         num_train_steps=10,
         overwrite=True,
         exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pi0_audio",
+        model=pi0_audio.Pi0AudioConfig(paligemma_variant="dummy", action_expert_variant="dummy"),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_pi0_audio",
         wandb_enabled=False,
     ),
     # RoboArena & PolaRiS configs.
@@ -1318,17 +1331,13 @@ _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
 def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli(
-        {k: (k, v) for k, v in _CONFIGS_DICT.items()}
-    )
+    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
 
 
 def get_config(config_name: str) -> TrainConfig:
     """Get a config by name."""
     if config_name not in _CONFIGS_DICT:
-        closest = difflib.get_close_matches(
-            config_name, _CONFIGS_DICT.keys(), n=1, cutoff=0.0
-        )
+        closest = difflib.get_close_matches(config_name, _CONFIGS_DICT.keys(), n=1, cutoff=0.0)
         closest_str = f" Did you mean '{closest[0]}'? " if closest else ""
         raise ValueError(f"Config '{config_name}' not found.{closest_str}")
 

@@ -1,7 +1,8 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+from pathlib import Path
 import re
-from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import Literal, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
 import jax
@@ -10,6 +11,7 @@ from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
+from openpi.shared import audio_tools as _audio_tools
 from openpi.shared import normalize as _normalize
 
 DataDict: TypeAlias = at.PyTree
@@ -335,6 +337,170 @@ class PadStatesAndActions(DataTransformFn):
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
+
+
+def _find_first_present(data: DataDict, keys: Sequence[str]):
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
+_AUDIO_PASSTHROUGH_KEYS: tuple[tuple[str, Sequence[str]], ...] = (
+    ("audio", ("audio", "observation/audio", "audio_window", "observation/audio_window")),
+    ("audio_mask", ("audio_mask", "observation/audio_mask")),
+    ("audio_sample_rate", ("audio_sample_rate", "observation/audio_sample_rate")),
+    ("episode_index", ("episode_index", "observation/episode_index")),
+    ("frame_index", ("frame_index", "observation/frame_index")),
+)
+
+
+def copy_present_audio_fields(source: Mapping[str, object], dest: dict) -> dict:
+    """Copy any available audio-related fields into a transformed input dict."""
+    for out_key, candidate_keys in _AUDIO_PASSTHROUGH_KEYS:
+        value = _find_first_present(source, candidate_keys)
+        if value is not None:
+            dest[out_key] = value
+    return dest
+
+
+def _as_int(value, *, key: str) -> int:
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError(f"{key} must be a scalar, got shape {array.shape}")
+    return int(array.reshape(()).item())
+
+
+def _as_bool(value) -> np.bool_:
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError(f"Expected a scalar boolean mask, got shape {array.shape}")
+    return np.bool_(array.reshape(()).item())
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractAudioWindow(DataTransformFn):
+    """Materialize an aligned audio window into a fixed-size float32 array."""
+
+    window_num_samples: int
+    target_sample_rate: int = 16_000
+    dataset_root: str | None = None
+    fallback_fps: float = 20.0
+    strict: bool = True
+    audio_keys: Sequence[str] = ("audio", "observation/audio", "audio_window", "observation/audio_window")
+    audio_mask_keys: Sequence[str] = ("audio_mask", "observation/audio_mask")
+    audio_sample_rate_keys: Sequence[str] = ("audio_sample_rate", "observation/audio_sample_rate")
+    episode_index_keys: Sequence[str] = ("episode_index", "observation/episode_index")
+    frame_index_keys: Sequence[str] = ("frame_index", "observation/frame_index")
+
+    def __post_init__(self) -> None:
+        if self.window_num_samples <= 0:
+            raise ValueError("window_num_samples must be > 0")
+        if self.target_sample_rate <= 0:
+            raise ValueError("target_sample_rate must be > 0")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        """调用了之后返回一个统一过采样率的一维的声音的窗口"""
+        raw_audio = _find_first_present(data, self.audio_keys)
+        if raw_audio is not None:
+            sample_rate = _find_first_present(data, self.audio_sample_rate_keys)
+            sample_rate = (
+                self.target_sample_rate if sample_rate is None else _as_int(sample_rate, key="audio_sample_rate")
+            )
+            audio = np.asarray(raw_audio, dtype=np.float32).reshape(-1)
+            if sample_rate != self.target_sample_rate:
+                # 统一到traget的samele rate
+                audio = _audio_tools.resample_audio(audio, sample_rate, self.target_sample_rate)
+
+            raw_mask = _find_first_present(data, self.audio_mask_keys)
+            audio_mask = bool(audio.size > 0) if raw_mask is None else bool(_as_bool(raw_mask))
+            return {
+                **data,
+                "audio": _audio_tools.fit_audio_window(audio, self.window_num_samples),
+                "audio_mask": np.bool_(audio_mask),
+            }
+
+        episode_index = _find_first_present(data, self.episode_index_keys)
+        frame_index = _find_first_present(data, self.frame_index_keys)
+        if episode_index is None or frame_index is None:
+            if not self.strict:
+                return {
+                    **data,
+                    "audio": np.zeros((self.window_num_samples,), dtype=np.float32),
+                    "audio_mask": np.False_,
+                }
+            raise ValueError(
+                "Audio window extraction requires raw audio or episode/frame indices. "
+                f"Available keys: {tuple(data.keys())}"
+            )
+
+        if self.dataset_root is None:
+            raise ValueError("dataset_root is required when audio must be loaded from episode sidecars.")
+
+        try:
+            audio, has_audio = _audio_tools.extract_episode_audio_window(
+                dataset_root=Path(self.dataset_root),
+                episode_index=_as_int(episode_index, key="episode_index"),
+                frame_index=_as_int(frame_index, key="frame_index"),
+                window_num_samples=self.window_num_samples,
+                target_sample_rate=self.target_sample_rate,
+                fallback_fps=self.fallback_fps,
+            )
+        except Exception:
+            if self.strict:
+                raise
+            audio = np.zeros((self.window_num_samples,), dtype=np.float32)
+            has_audio = False
+
+        return {
+            **data,
+            "audio": audio,
+            "audio_mask": np.bool_(has_audio),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractWhisperAudioEmbedding(DataTransformFn):
+    """Encode an audio waveform window into a pooled Whisper embedding."""
+
+    model_name: str = "openai/whisper-tiny"
+    sample_rate: int = 16_000
+    device: str = "cpu"
+    pooling: Literal["mean", "first"] = "mean"
+    output_dim: int | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_audio = data.get("audio")
+        if raw_audio is None:
+            raise ValueError("Whisper embedding extraction requires an `audio` field.")
+
+        raw_mask = data.get("audio_mask")
+        has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
+        expected_dim = self.output_dim or _audio_tools.infer_whisper_hidden_size(self.model_name)
+
+        if not has_audio:
+            return {
+                **data,
+                "audio": np.zeros((expected_dim,), dtype=np.float32),
+                "audio_mask": np.False_,
+            }
+
+        embedding = _audio_tools.compute_whisper_audio_embedding(
+            np.asarray(raw_audio, dtype=np.float32),
+            sample_rate=self.sample_rate,
+            model_name=self.model_name,
+            device=self.device,
+            pooling=self.pooling,
+        )
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if embedding.shape != (expected_dim,):
+            raise ValueError(f"Whisper embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
+
+        return {
+            **data,
+            "audio": embedding,
+            "audio_mask": np.True_,
+        }
 
 
 def flatten_dict(tree: at.PyTree) -> dict:

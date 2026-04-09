@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional,TYPE_CHECKING
-
-import numpy as np
+from typing import TYPE_CHECKING
 
 from dual_camera_manager import DualCameraManager
+import numpy as np
 from robotic_arm_controller import RoboticArmControler
 
 if TYPE_CHECKING:
     from robotic_arm_controller import RoboticArmControler
+
 
 @dataclass
 class FrankaCameraIds:
@@ -39,8 +39,8 @@ class FrankaRobotEnv:
         franka_username: str = "your_username",
         franka_password: str = "your_password",
         camera_ids: FrankaCameraIds | None = None,
-        external_camera_serial: Optional[str] = None,
-        wrist_camera_serial: Optional[str] = None,
+        external_camera_serial: str | None = None,
+        wrist_camera_serial: str | None = None,
         camera_width: int = 640,
         camera_height: int = 480,
         camera_fps: int = 30,
@@ -70,7 +70,7 @@ class FrankaRobotEnv:
         self._gripper_open_threshold = float(gripper_open_threshold)
         self._gripper_max_width_m = float(gripper_max_width_m)
         self._last_observation: dict | None = None
-        self._last_gripper_open: Optional[bool] = None
+        self._last_gripper_open: bool | None = None
 
         self._cameras = DualCameraManager(
             external_serial=external_camera_serial,
@@ -183,7 +183,7 @@ class FrankaRobotEnv:
         self._cameras.close()
         self._robot.cleanup()
 
-    def __enter__(self) -> "FrankaRobotEnv":
+    def __enter__(self) -> FrankaRobotEnv:
         return self
 
     def __exit__(self, exc_type, exc, exc_tb) -> bool:

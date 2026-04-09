@@ -56,7 +56,7 @@ def plot_topk_xy(
     # annotate each point
     for i, (xy, p) in enumerate(zip(topk_xyz, probs)):
         ax.annotate(
-            f"#{i+1} {p:.0%}",
+            f"#{i + 1} {p:.0%}",
             (xy[0], xy[1]),
             textcoords="offset points",
             xytext=(8, 8),

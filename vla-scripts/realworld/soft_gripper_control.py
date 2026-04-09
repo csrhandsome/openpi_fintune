@@ -1,11 +1,13 @@
-'''新的控制夹爪的sdk,需要更新robotic_arm_controller这个类里面的控制夹爪的函数(datacollect里面的都不要多线程控制夹爪了哈哈哈)'''
-import serial
+"""新的控制夹爪的sdk,需要更新robotic_arm_controller这个类里面的控制夹爪的函数(datacollect里面的都不要多线程控制夹爪了哈哈哈)"""
+
 import time
+
 import crcmod
-import threading
+import serial
 from tqdm import *
 
-class ControlRoot(object):
+
+class ControlRoot:
     def __init__(self, com="/dev/ttyUSB0"):
         self.sc = serial.Serial(port=com, baudrate=115200)
         self.crc16 = crcmod.mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
@@ -21,12 +23,12 @@ class ControlRoot(object):
     #     return int(crcQ.encode(), 16), int(crcH.encode(), 16)
 
     def calCrc(self, array):
-        bytes_ = b''
+        bytes_ = b""
         for i in range(array.__len__()):
-            bytes_ = bytes_ + array[i].to_bytes(1, byteorder='big', signed=True)
-        crc = self.crc16(bytes_).to_bytes(2, byteorder='big', signed=False)
-        crcH = int.from_bytes(crc[0:1], byteorder='big', signed=False)
-        crcQ = int.from_bytes(crc[1:2], byteorder='big', signed=False)
+            bytes_ = bytes_ + array[i].to_bytes(1, byteorder="big", signed=True)
+        crc = self.crc16(bytes_).to_bytes(2, byteorder="big", signed=False)
+        crcH = int.from_bytes(crc[0:1], byteorder="big", signed=False)
+        crcQ = int.from_bytes(crc[1:2], byteorder="big", signed=False)
         return crcQ, crcH
 
     def readSerial(self):
@@ -41,35 +43,42 @@ class ControlRoot(object):
         else:
             SetAddress = 0x03
         Value = Value if Value >= 0 else Value - 1
-        bytes_ = Value.to_bytes(2, byteorder='big', signed=True)
-        ValueHexQ = int.from_bytes(bytes_[0:1], byteorder='big', signed=True)
-        ValueHexH = int.from_bytes(bytes_[1:2], byteorder='big', signed=True)
+        bytes_ = Value.to_bytes(2, byteorder="big", signed=True)
+        ValueHexQ = int.from_bytes(bytes_[0:1], byteorder="big", signed=True)
+        ValueHexH = int.from_bytes(bytes_[1:2], byteorder="big", signed=True)
         array = [0x01, SetAddress, ModbusHighAddress, ModbusLowAddress, ValueHexQ, ValueHexH]
         currentValueQ, currentValueH = self.calCrc(array)
-        setValueCmd = [0x01, SetAddress, ModbusHighAddress, ModbusLowAddress, ValueHexQ, ValueHexH,
-                       currentValueQ,
-                       currentValueH]
+        setValueCmd = [
+            0x01,
+            SetAddress,
+            ModbusHighAddress,
+            ModbusLowAddress,
+            ValueHexQ,
+            ValueHexH,
+            currentValueQ,
+            currentValueH,
+        ]
         for i in range(setValueCmd.__len__()):
             setValueCmd[i] = setValueCmd[i] if setValueCmd[i] >= 0 else setValueCmd[i] + 256
         self.sc.write(setValueCmd)
 
         if isReadSerial:
             back = self.readSerial()
-            value = int.from_bytes(back[3:5], byteorder='big', signed=True)
+            value = int.from_bytes(back[3:5], byteorder="big", signed=True)
             if value < 0:
                 value = value + 1
             self.sc.flush()
             return value
-        else:
-            time.sleep(0.005)
-            return
+        time.sleep(0.005)
+        return None
+
 
 def isRange(value, min_, max_):
     if not min_ <= value <= max_:
-        raise RuntimeError('Out of range')
+        raise RuntimeError("Out of range")
 
 
-class DHgripper(object):
+class DHgripper:
     def __init__(self, ControlInstance=ControlRoot()):
         self.Hand = ControlInstance
         self.HandInit()
@@ -126,11 +135,10 @@ class DHgripper(object):
             print(back)
 
 
-class ReadStatus(object):
+class ReadStatus:
     def __init__(self, ControlInstance=ControlRoot()):
         self.Hand = ControlInstance
 
     def RTRotateAngle(self):
         back = self.Hand.sendCmd(ModbusHighAddress=0x02, ModbusLowAddress=0x08, isSet=False)
         print(back)
- 

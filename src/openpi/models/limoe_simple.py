@@ -14,24 +14,18 @@
 """ViT implementation adapted from https://github.com/google-research/vision_transformer/blob/main/vit_jax/models_vit.py."""
 
 from collections.abc import Callable
-import pdb
 from typing import Any
-from typing import Optional
 
-import flax.linen as nn
 import flax
+import flax.linen as nn
 from flax.linen import partitioning as flax_partitioning
-import jax
-import jax.numpy as jnp
-
-import openpi.shared.array_typing as at
-
-
 from flaxformer.architectures.moe import routing
 from flaxformer.architectures.moe import scatter_utils
 from flaxformer.components import dense
 from flaxformer.types import Array
 from flaxformer.types import DType
+import jax
+import jax.numpy as jnp
 
 Array = Any
 PRNGKey = Any
@@ -55,12 +49,8 @@ class MlpBlock(nn.Module):
     param_dtype: Dtype = jnp.float32
     out_dim: int | None = None
     dropout_rate: float = 0.1
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = (
-        nn.initializers.xavier_uniform()
-    )
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(
-        stddev=1e-6
-    )
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
 
     @nn.compact
     def __call__(self, inputs, *, deterministic):
@@ -135,9 +125,9 @@ class Encoder1DBlock(nn.Module):
         # MLP block.
         # pdb.set_trace()
         y = nn.LayerNorm(name="encoder_out_norm", dtype=self.dtype)(inputs)
-        y = MlpBlock(
-            mlp_dim=self.mlp_dim, dtype=self.dtype, dropout_rate=self.dropout_rate
-        )(y, deterministic=deterministic)
+        y = MlpBlock(mlp_dim=self.mlp_dim, dtype=self.dtype, dropout_rate=self.dropout_rate)(
+            y, deterministic=deterministic
+        )
 
         return inputs + y, None
 
@@ -242,14 +232,13 @@ class MoeLayer(nn.Module):
     dtype: DType = jnp.bfloat16
     split_params: bool = True
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT
-    num_model_partitions: Optional[int] = None
+    num_model_partitions: int | None = None
 
     def setup(self):
         """Verifies that the MoeLayer is correctly configured."""
         if self.num_model_partitions is not None and self.num_model_partitions <= 1:
             raise ValueError(
-                f"num_model_partitions={self.num_model_partitions} has "
-                "no effect; please set it to None instead."
+                f"num_model_partitions={self.num_model_partitions} has no effect; please set it to None instead."
             )
 
     @nn.compact
@@ -258,7 +247,7 @@ class MoeLayer(nn.Module):
         inputs,
         decode: bool = False,
         prefill: bool = False,
-        prefill_lengths: Optional[Array] = None,
+        prefill_lengths: Array | None = None,
         *,
         enable_dropout: bool = True,
     ) -> Array:
@@ -295,9 +284,7 @@ class MoeLayer(nn.Module):
         else:  # Eval
             capacity_factor = self.eval_capacity_factor
         # Each group will send expert_capacity tokens to each expert.
-        expert_capacity = int(
-            round(capacity_factor * tokens_per_group / self.num_experts)
-        )
+        expert_capacity = int(round(capacity_factor * tokens_per_group / self.num_experts))
         expert_capacity = max(expert_capacity, self.min_expert_capacity)
 
         # Reshape batch and sequence/token dimensions for expert routing.
@@ -330,9 +317,7 @@ class MoeLayer(nn.Module):
         result = outputs.reshape((batch_size, seq_length, hidden_dim))
         return result
 
-    def _scatter_to_experts(
-        self, token_inputs: Array, enable_dropout: bool, expert_capacity: int, **kwargs
-    ) -> Array:
+    def _scatter_to_experts(self, token_inputs: Array, enable_dropout: bool, expert_capacity: int, **kwargs) -> Array:
         """Wraps expert scatter routing and dispatching algorithm.
 
         This algorithm takes the following steps:
@@ -354,9 +339,7 @@ class MoeLayer(nn.Module):
         num_groups, tokens_per_group, hidden_dim = token_inputs.shape
         num_tokens = num_groups * tokens_per_group
 
-        router_indices = self.router(
-            token_inputs, self.num_experts, expert_capacity, apply_jitter=enable_dropout
-        )
+        router_indices = self.router(token_inputs, self.num_experts, expert_capacity, apply_jitter=enable_dropout)
         num_selected_experts = self.router.num_selected_experts
 
         # We need num_selected_experts copies of inputs for dispatching. This is a
@@ -379,9 +362,7 @@ class MoeLayer(nn.Module):
         )
 
         # Combine tokens_per_group and num_selected_experts axes.
-        flattened_dispatch_indices = router_indices.dispatch_indices.reshape(
-            num_groups, -1, 2
-        )
+        flattened_dispatch_indices = router_indices.dispatch_indices.reshape(num_groups, -1, 2)
 
         # Scatter masked inputs.
         shape = (self.num_experts, expert_capacity, hidden_dim)
@@ -397,14 +378,10 @@ class MoeLayer(nn.Module):
 
         # Gather outputs.
         # Shape: [num_groups, tokens_per_group * num_selected_experts, hidden_dim].
-        expert_outputs = jax.vmap(lambda i, x: x[i[:, 0], i[:, 1]])(
-            flattened_dispatch_indices, expert_outputs
-        )
+        expert_outputs = jax.vmap(lambda i, x: x[i[:, 0], i[:, 1]])(flattened_dispatch_indices, expert_outputs)
         # Separate out num_selected_experts dimension.
         # Shape: [num_groups, tokens_per_group, num_selected_experts, hidden_dim].
-        expert_outputs = expert_outputs.reshape(
-            (num_groups, tokens_per_group, num_selected_experts, hidden_dim)
-        )
+        expert_outputs = expert_outputs.reshape((num_groups, tokens_per_group, num_selected_experts, hidden_dim))
 
         # Shape: [num_groups, tokens_per_group, num_selected_experts, hidden_dim].
         # Weighted sum of the outputs from the different experts.
@@ -416,14 +393,10 @@ class MoeLayer(nn.Module):
         )
 
         # Gather and sow expert metrics.
-        successfully_routed = successfully_routed.reshape(
-            (num_groups, tokens_per_group, num_selected_experts)
-        )
+        successfully_routed = successfully_routed.reshape((num_groups, tokens_per_group, num_selected_experts))
         # Number of tokens that were dispatched to at least one expert.
         num_tokens_dispatched_somewhere = jnp.max(successfully_routed, axis=-1).sum()
-        fraction_tokens_left_behind = 1.0 - num_tokens_dispatched_somewhere / float(
-            num_tokens
-        )
+        fraction_tokens_left_behind = 1.0 - num_tokens_dispatched_somewhere / float(num_tokens)
         # Total number of tokens that were dispatched (one token could be dispatched
         # to multiple experts).
         num_tokens_dispatched = successfully_routed.sum()
@@ -466,9 +439,7 @@ class MoeLayer(nn.Module):
         num_groups, tokens_per_group, _ = token_inputs.shape
         num_tokens = num_groups * tokens_per_group
 
-        router_mask = self.router(
-            token_inputs, self.num_experts, expert_capacity, apply_jitter=enable_dropout
-        )
+        router_mask = self.router(token_inputs, self.num_experts, expert_capacity, apply_jitter=enable_dropout)
 
         # Shape: [num_groups, num_experts, expert_capacity, hidden_dim].
         expert_inputs = jnp.einsum(
@@ -490,12 +461,8 @@ class MoeLayer(nn.Module):
 
         # Gather and sow expert metrics.
         # Number of tokens that were dispatched to at least one expert.
-        num_tokens_dispatched_somewhere = jnp.max(
-            router_mask.dispatch_mask, axis=(-1, -2)
-        ).sum()
-        fraction_tokens_left_behind = 1.0 - num_tokens_dispatched_somewhere / float(
-            num_tokens
-        )
+        num_tokens_dispatched_somewhere = jnp.max(router_mask.dispatch_mask, axis=(-1, -2)).sum()
+        fraction_tokens_left_behind = 1.0 - num_tokens_dispatched_somewhere / float(num_tokens)
         # Total number of tokens that were dispatched (one token could be
         # dispatched to multiple experts).
         num_tokens_dispatched = router_mask.dispatch_mask.sum()
@@ -545,12 +512,8 @@ class MoeLayer(nn.Module):
         inputs = jax.lax.convert_element_type(inputs, self.dtype)
 
         # Send examples to their target devices.
-        inputs = flax_partitioning.with_sharding_constraint(
-            inputs, ("expert", "unmodeled", "length", "embed")
-        )
-        inputs = inputs.reshape(
-            num_experts, num_groups // num_experts, num_experts, capacity, hidden_dim
-        )
+        inputs = flax_partitioning.with_sharding_constraint(inputs, ("expert", "unmodeled", "length", "embed"))
+        inputs = inputs.reshape(num_experts, num_groups // num_experts, num_experts, capacity, hidden_dim)
 
         # Induce all-to-all communication by interchanging expert axes.
         if self.num_model_partitions is not None and self.num_model_partitions > 1:
@@ -558,18 +521,14 @@ class MoeLayer(nn.Module):
             # all-to-all communications in model parallelism cases.
             # Shape: [num_experts, num_groups // num_experts, num_experts, capacity,
             # hidden_dim, self.num_model_partitions]
-            inputs = self._swapaxes_with_sharding_constraint(
-                inputs, 0, 2, capacity, hidden_dim
-            )
+            inputs = self._swapaxes_with_sharding_constraint(inputs, 0, 2, capacity, hidden_dim)
         else:
             # Shape: [num_experts, num_groups // num_experts, num_experts, capacity,
             # hidden_dim]
             inputs = jnp.swapaxes(inputs, 0, 2)
 
             inputs = inputs.reshape(-1, hidden_dim)
-            inputs = flax_partitioning.with_sharding_constraint(
-                inputs, ("expert", "embed")
-            )
+            inputs = flax_partitioning.with_sharding_constraint(inputs, ("expert", "embed"))
             inputs = inputs.reshape(num_experts, num_groups * capacity, hidden_dim)
 
         # Apply expert transformation.
@@ -591,29 +550,21 @@ class MoeLayer(nn.Module):
 
         # Send examples back to their original devices.
         outputs = outputs.reshape(num_experts * num_groups, capacity, hidden_dim)
-        outputs = flax_partitioning.with_sharding_constraint(
-            outputs, ("expert", "length", "embed")
-        )
-        outputs = outputs.reshape(
-            num_experts, num_groups // num_experts, num_experts, capacity, hidden_dim
-        )
+        outputs = flax_partitioning.with_sharding_constraint(outputs, ("expert", "length", "embed"))
+        outputs = outputs.reshape(num_experts, num_groups // num_experts, num_experts, capacity, hidden_dim)
 
         # Induce all-to-all communication by interchanging expert axes.
         if self.num_model_partitions is not None and self.num_model_partitions > 1:
             # Shape: [num_experts, num_groups // num_experts, num_experts, capacity,
             # hidden_dim, self.num_model_partitions]
-            outputs = self._swapaxes_with_sharding_constraint(
-                outputs, 0, 2, capacity, hidden_dim
-            )
+            outputs = self._swapaxes_with_sharding_constraint(outputs, 0, 2, capacity, hidden_dim)
         else:
             # Shape: [num_experts, num_groups // num_experts, num_experts, capacity,
             # hidden_dim]
             outputs = jnp.swapaxes(outputs, 0, 2)
 
         outputs = outputs.reshape(num_groups, num_experts, capacity, hidden_dim)
-        outputs = flax_partitioning.with_sharding_constraint(
-            outputs, ("expert", "unmodeled", "length", "embed")
-        )
+        outputs = flax_partitioning.with_sharding_constraint(outputs, ("expert", "unmodeled", "length", "embed"))
 
         return jax.lax.convert_element_type(outputs, inputs_dtype)
 
@@ -672,10 +623,7 @@ class MoeLayer(nn.Module):
         ValueError if num_model_partitions is None or 1.
         """
         if self.num_model_partitions is None or self.num_model_partitions <= 1:
-            raise ValueError(
-                "Expected num_model_partitions to be > 1 but got: "
-                f"{self.num_model_partitions}"
-            )
+            raise ValueError(f"Expected num_model_partitions to be > 1 but got: {self.num_model_partitions}")
         array = array.reshape(
             self.num_experts,
             -1,
@@ -775,12 +723,8 @@ class LIMoEBlock(nn.Module):
     num_experts: int = 4
     num_top_k: int = 1
     param_dtype: Dtype = jnp.float32
-    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = (
-        nn.initializers.xavier_uniform()
-    )
-    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(
-        stddev=1e-6
-    )
+    kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.xavier_uniform()
+    bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.normal(stddev=1e-6)
 
     dropout_rate: float = 0.1
     remat_policy: str = "nothing_saveable"
@@ -809,7 +753,7 @@ class LIMoEBlock(nn.Module):
         )
 
         x, _ = Encoder1DBlock(
-            name=f"encoderblock",
+            name="encoderblock",
             dtype=self.dtype,
             mlp_dim=self.mlp_dim,
             num_heads=self.num_heads,

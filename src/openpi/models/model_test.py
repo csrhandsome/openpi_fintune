@@ -3,6 +3,7 @@ import jax
 import pytest
 
 from openpi.models import model as _model
+from openpi.models import pi0_audio
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
 from openpi.shared import download
@@ -37,6 +38,29 @@ def test_pi0_lora_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi0_audio_model():
+    key = jax.random.key(0)
+    config = pi0_audio.Pi0AudioConfig()
+    model = config.create(key)
+
+    batch_size = 2
+    obs, act = config.fake_obs(batch_size), config.fake_act(batch_size)
+
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+    assert loss.shape == (batch_size, config.action_horizon)
+
+    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
+    assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi0_audio_whisper_inputs_spec_uses_feature_dim():
+    config = pi0_audio.Pi0AudioConfig(use_whisper=True, whisper_model_name="openai/whisper-tiny")
+    obs_spec, _ = config.inputs_spec(batch_size=2)
+
+    assert config.audio_feature_dim == 384
+    assert obs_spec.audio.shape == (2, 384)
 
 
 def test_pi0_fast_model():

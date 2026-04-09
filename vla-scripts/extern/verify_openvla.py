@@ -7,9 +7,10 @@ Given an HF-exported OpenVLA model, attempt to load via AutoClasses, and verify 
 import time
 
 import numpy as np
-import torch
 from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
+import torch
+from transformers import AutoModelForVision2Seq
+from transformers import AutoProcessor
 
 # === Verification Arguments
 MODEL_PATH = "openvla/openvla-7b"
@@ -23,8 +24,7 @@ INSTRUCTION = "put spoon on towel"
 def get_openvla_prompt(instruction: str) -> str:
     if "v01" in MODEL_PATH:
         return f"{SYSTEM_PROMPT} USER: What action should the robot take to {instruction.lower()}? ASSISTANT:"
-    else:
-        return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+    return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
 
 
 @torch.inference_mode()

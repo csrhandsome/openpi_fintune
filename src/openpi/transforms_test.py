@@ -85,6 +85,36 @@ def test_tokenize_no_prompt():
         transform({})
 
 
+def test_copy_present_audio_fields():
+    inputs = _transforms.copy_present_audio_fields(
+        {
+            "observation/audio": np.array([1.0, 2.0], dtype=np.float32),
+            "observation/audio_mask": np.True_,
+            "frame_index": np.int32(7),
+        },
+        {"state": np.array([0.0], dtype=np.float32)},
+    )
+
+    assert np.allclose(inputs["audio"], np.array([1.0, 2.0], dtype=np.float32))
+    assert inputs["audio_mask"] == np.True_
+    assert inputs["frame_index"] == np.int32(7)
+
+
+def test_extract_audio_window_from_raw_audio():
+    transform = _transforms.ExtractAudioWindow(window_num_samples=6, target_sample_rate=16_000)
+
+    output = transform(
+        {
+            "audio": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+            "audio_sample_rate": np.int32(16_000),
+        }
+    )
+
+    assert output["audio"].shape == (6,)
+    assert np.allclose(output["audio"], np.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32))
+    assert output["audio_mask"] == np.True_
+
+
 def test_transform_dict():
     # Rename and remove keys.
     input = {"a": {"b": 1, "c": 2}}

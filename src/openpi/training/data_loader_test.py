@@ -62,6 +62,22 @@ def test_with_fake_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
+def test_with_fake_audio_dataset():
+    config = _config.get_config("debug_pi0_audio")
+
+    loader = _data_loader.create_data_loader(config, skip_norm_stats=True, num_batches=2)
+    batches = list(loader)
+
+    assert len(batches) == 2
+
+    for observation, actions in batches:
+        assert observation.audio is not None
+        assert observation.audio.shape == (config.batch_size, config.model.audio_num_samples)
+        assert observation.audio_mask is not None
+        assert observation.audio_mask.shape == (config.batch_size,)
+        assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
 def test_with_real_dataset():
     config = _config.get_config("pi0_aloha_sim")
     config = dataclasses.replace(config, batch_size=4)

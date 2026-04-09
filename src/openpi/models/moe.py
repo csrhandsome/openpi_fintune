@@ -1,4 +1,5 @@
-'''从AdaMoE论文获得的moe模块,准备将这个用于学习力的moe'''
+"""从AdaMoE论文获得的moe模块,准备将这个用于学习力的moe"""
+
 # 将limoe_simlpe的moe改成适应新的force输入的moe
 import flax.linen as nn
 import jax
@@ -64,9 +65,7 @@ class BaseMoEFeedForward(nn.Module):
         }
 
         if gate_scale_fn is not None:
-            gate_scales = gate_scale_fn(
-                x_flat, gating_scores_softmax, top_k_indices, dtype
-            )
+            gate_scales = gate_scale_fn(x_flat, gating_scores_softmax, top_k_indices, dtype)
         else:
             gate_scales = top_k_values
 
@@ -74,35 +73,25 @@ class BaseMoEFeedForward(nn.Module):
 
     def forward_expert(self, x_flat, top_k_indices, gate_scales, dtype=jnp.float32):
         # Gate projection
-        ff_gate = jnp.einsum(
-            "bf, efh -> beh", x_flat, self.w_expert_hidden[0].astype(dtype)
-        )
+        ff_gate = jnp.einsum("bf, efh -> beh", x_flat, self.w_expert_hidden[0].astype(dtype))
         gate_value = nn.gelu(ff_gate)
 
         # Up projection
-        ff1 = jnp.einsum(
-            "bf, efh -> beh", x_flat, self.w_expert_hidden[1].astype(dtype)
-        )
+        ff1 = jnp.einsum("bf, efh -> beh", x_flat, self.w_expert_hidden[1].astype(dtype))
         expert_hidden = gate_value * ff1
 
         # Down projection
-        expert_output = jnp.einsum(
-            "beh, ehd -> bed", expert_hidden, self.w_expert_output.astype(dtype)
-        )
+        expert_output = jnp.einsum("beh, ehd -> bed", expert_hidden, self.w_expert_output.astype(dtype))
 
         # Select top-k expert outputs and gate scales
         selected_outputs = jnp.take_along_axis(
             expert_output, top_k_indices[..., None], axis=1
         )  # (B*S, top_k, expert_dim)
-        selected_scales = jnp.take_along_axis(
-            gate_scales, top_k_indices, axis=1
-        )  # (B*S, top_k)
+        selected_scales = jnp.take_along_axis(gate_scales, top_k_indices, axis=1)  # (B*S, top_k)
 
         # Weighted sum
         selected_scales = selected_scales[..., None]  # (B*S, top_k, 1)
-        weighted_outputs = jnp.sum(
-            selected_outputs * selected_scales, axis=1
-        )  # (B*S, expert_dim)
+        weighted_outputs = jnp.sum(selected_outputs * selected_scales, axis=1)  # (B*S, expert_dim)
 
         return weighted_outputs
 
@@ -129,14 +118,11 @@ class AdaMoEFeedForward(BaseMoEFeedForward):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-
         def gate_scale_fn(x_flat, gating_scores, top_k_indices, dtype):
             scale = jnp.dot(x_flat, self.w_gating_scale.astype(dtype))
             return gating_scores + scale
 
-        x_flat, top_k_indices, gate_scales, moe_info = self.gating_topk(
-            x, gate_scale_fn=gate_scale_fn
-        )
+        x_flat, top_k_indices, gate_scales, moe_info = self.gating_topk(x, gate_scale_fn=gate_scale_fn)
         weighted_outputs = self.forward_expert(x_flat, top_k_indices, gate_scales)
         output = weighted_outputs.reshape(*x.shape).astype(x.dtype)
         return output, moe_info
@@ -154,15 +140,12 @@ class CSMoEFeedForward(BaseMoEFeedForward):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-
         def gate_scale_fn(x_flat, gating_scores, top_k_indices, dtype):
             scale_input = jnp.concatenate([x_flat, gating_scores], axis=-1)
             gate_scales = jnp.dot(scale_input, self.w_gating_scale.astype(dtype))
             return nn.softmax(gate_scales, axis=-1)
 
-        x_flat, top_k_indices, gate_scales, moe_info = self.gating_topk(
-            x, gate_scale_fn=gate_scale_fn
-        )
+        x_flat, top_k_indices, gate_scales, moe_info = self.gating_topk(x, gate_scale_fn=gate_scale_fn)
         weighted_outputs = self.forward_expert(x_flat, top_k_indices, gate_scales)
         output = weighted_outputs.reshape(*x.shape).astype(x.dtype)
         return output, moe_info

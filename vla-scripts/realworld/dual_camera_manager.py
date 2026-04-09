@@ -3,9 +3,9 @@ Dual RealSense Camera Manager for DROID-style deployment
 
 管理两个 RealSense 相机（外部相机 + 腕部相机），模拟 DROID 的相机配置
 """
+
 from __future__ import annotations
 
-from typing import Optional, Tuple
 import numpy as np
 from realsense_connector import RealSenseConnector
 
@@ -22,8 +22,8 @@ class DualCameraManager:
     def __init__(
         self,
         *,
-        external_serial: Optional[str] = None,
-        wrist_serial: Optional[str] = None,
+        external_serial: str | None = None,
+        wrist_serial: str | None = None,
         width: int = 640,
         height: int = 480,
         fps: int = 30,
@@ -65,7 +65,7 @@ class DualCameraManager:
 
         self._connected = False
 
-    def connect(self) -> "DualCameraManager":
+    def connect(self) -> DualCameraManager:
         """连接所有相机"""
         if self._connected:
             return self
@@ -80,7 +80,7 @@ class DualCameraManager:
         print("[DualCameraManager] 双相机系统已连接")
         return self
 
-    def update(self, timeout_ms: int = 1000) -> Tuple[bool, bool]:
+    def update(self, timeout_ms: int = 1000) -> tuple[bool, bool]:
         """
         更新所有相机
 
@@ -91,7 +91,7 @@ class DualCameraManager:
         wrist_ok = self.wrist_camera.update(timeout=timeout_ms)
         return external_ok, wrist_ok
 
-    def get_images(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def get_images(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """
         获取两个相机的图像
 
@@ -102,7 +102,7 @@ class DualCameraManager:
         wrist_img = self.wrist_camera.img
         return external_img, wrist_img
 
-    def get_depths(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def get_depths(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """
         获取两个相机的深度图
 
@@ -120,7 +120,7 @@ class DualCameraManager:
         self.wrist_camera.close()
         self._connected = False
 
-    def __enter__(self) -> "DualCameraManager":
+    def __enter__(self) -> DualCameraManager:
         return self.connect()
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:

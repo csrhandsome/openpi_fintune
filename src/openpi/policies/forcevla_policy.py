@@ -47,7 +47,9 @@ def _get_first_present(data: dict, keys: tuple[str, ...], *, required: bool = Tr
         if key in data:
             return data[key]
     if required:
-        raise KeyError(f"Missing required keys {keys}. Available keys: {tuple(data.keys())}")
+        raise KeyError(
+            f"Missing required keys {keys}. Available keys: {tuple(data.keys())}"
+        )
     return None
 
 
@@ -97,7 +99,9 @@ class Forcevla_inputs(transforms.DataTransformFn):
             )
         else:
             state_raw = _get_first_present(data, ("observation/state", "state"))
-        state = transforms.pad_to_dim(np.asarray(state_raw, dtype=np.float32), self.action_dim)
+        state = transforms.pad_to_dim(
+            np.asarray(state_raw, dtype=np.float32), self.action_dim
+        )
 
         base_image = _parse_image(
             _get_first_present(
@@ -119,7 +123,9 @@ class Forcevla_inputs(transforms.DataTransformFn):
         )
         has_right_wrist = right_wrist_value is not None
         right_wrist_image = (
-            _parse_image(right_wrist_value) if has_right_wrist else np.zeros_like(base_image)
+            _parse_image(right_wrist_value)
+            if has_right_wrist
+            else np.zeros_like(base_image)
         )
 
         gripper_left_image = _parse_image(
@@ -155,7 +161,9 @@ class Forcevla_inputs(transforms.DataTransformFn):
 
         actions_value = _get_first_present(data, ("actions", "action"), required=False)
         if actions_value is not None:
-            actions = transforms.pad_to_dim(np.asarray(actions_value, dtype=np.float32), self.action_dim)
+            actions = transforms.pad_to_dim(
+                np.asarray(actions_value, dtype=np.float32), self.action_dim
+            )
             inputs["actions"] = actions
 
         if "prompt" in data:
