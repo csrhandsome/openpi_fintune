@@ -204,7 +204,11 @@ def frame_range_to_audio_samples(
         return fallback_start, max(fallback_start, fallback_end)
 
     start_ns = _safe_int(start_record.get("host_frame_monotonic_ns"))
-    end_ns = _safe_int(next_record.get("host_frame_monotonic_ns"))
+    end_ns = (
+        _safe_int(next_record.get("host_frame_monotonic_ns"))
+        if next_record is not None
+        else None
+    )
     if end_ns is None:
         last_ns = _safe_int(end_record.get("host_frame_monotonic_ns"))
         if last_ns is not None:
