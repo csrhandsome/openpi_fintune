@@ -153,7 +153,7 @@ def main(args: Args):
     franka_model = None
     franka_frame = None
     if args.topk_samples is not None and args.topk_samples > 1:
-        franka_model = env._robot.panda.get_robot().load_model()
+        franka_model = env.robot.panda.get_robot().load_model()
         franka_frame = libfranka.Frame.kEndEffector
     plot_xlim: tuple[float, float] | None = None
     plot_ylim: tuple[float, float] | None = None
@@ -218,7 +218,7 @@ def main(args: Args):
                             centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
 
                             # 不阻塞的get_state()，然后用官方的api转换成末端的xyz
-                            robot_state = env._robot.panda.get_state()
+                            robot_state = env.robot.panda.get_state()
                             q_curr = np.asarray(robot_state.q, dtype=np.float32).reshape(7)
                             F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
                             EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
@@ -321,8 +321,8 @@ def main(args: Args):
     # timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
     # csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
     # df.to_csv(csv_filename, index=False)
-    env._robot.move_to_start()
-    env._robot.gripper_open()
+    env.robot.move_to_start()
+    env.robot.gripper_open()
     # print(f"Results saved to {csv_filename}")
 
 
