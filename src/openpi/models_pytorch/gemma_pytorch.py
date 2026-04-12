@@ -100,6 +100,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
+            # 跑推理的前半段,保存vlm的kv cache
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -112,6 +113,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            # 推理的后半段,不断的在循环里面根据最快到达的速度迭代到action,外层会多次调用
+            # 对于之前训练好的action expert,进行一次推理
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
@@ -124,6 +127,9 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
+            # 训练的部分
+            # 训练时虽然看起来是 prefix/suffix 一起搅成 hidden states,但真正被拿去监督、真正负责出动作的,是 suffix 这条 expert 分支。
+            # 训练时这大段 else 代码是在手工实现 prefix 和 suffix 的联合 attention,在这个过程中,会真正用到并更新两边层里的attention的qkv
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
@@ -156,12 +162,14 @@ class PaliGemmaWithExpertModel(nn.Module):
 
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
+                # 通过这套交叉计算,把 VLM 和 expert 内部的 attention 参数训出来
                 models = [self.paligemma.language_model, self.gemma_expert.model]
 
                 query_states = []
                 key_states = []
                 value_states = []
                 gates = []
+                # inputs_embeds 是 [prefix_embs, suffix_embs],因此0的时候对应self.paligemma.language_model,1对应的是self.gemma_expert.model
                 for i, hidden_states in enumerate(inputs_embeds):
                     layer = models[i].layers[layer_idx]
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
