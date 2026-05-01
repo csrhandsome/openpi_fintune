@@ -54,8 +54,10 @@ class AudiovlaInputs(transforms.DataTransformFn):
 
     action_dim: int
     audio_num_samples: int
+    instruction_audio_num_samples: int | None = None
     audio_sample_rate: int = 16_000
     use_whisper: bool = False
+    audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
     whisper_device: str = "cpu"
@@ -66,6 +68,9 @@ class AudiovlaInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         mask_padding = self.model_type in (_model.ModelType.PI0, _model.ModelType.PI0_AUDIO)
+        instruction_num_samples = (
+            self.audio_num_samples if self.instruction_audio_num_samples is None else self.instruction_audio_num_samples
+        )
 
         joint_position = _get_first_present(
             data,
@@ -142,15 +147,64 @@ class AudiovlaInputs(transforms.DataTransformFn):
             fallback_fps=self.audio_fallback_fps,
             strict=self.audio_strict,
         )(inputs)
+        outputs = transforms.ExtractInstructionAudioWindow(
+            window_num_samples=instruction_num_samples,
+            target_sample_rate=self.audio_sample_rate,
+            dataset_root=self.dataset_root,
+            fallback_fps=self.audio_fallback_fps,
+            strict=self.audio_strict,
+        )(outputs)
         if not self.use_whisper:
             return outputs
 
-        return transforms.ExtractWhisperAudioEmbedding(
+        if self.audio_tokenizer_type == "pooled_baseline":
+            outputs = transforms.ExtractWhisperAudioEmbedding(
+                model_name=self.whisper_model_name,
+                sample_rate=self.audio_sample_rate,
+                device=self.whisper_device,
+                output_dim=self.whisper_output_dim,
+                audio_key="ambient_audio",
+                audio_mask_key="ambient_audio_mask",
+            )(outputs)
+            outputs = transforms.ExtractWhisperAudioEmbedding(
+                model_name=self.whisper_model_name,
+                sample_rate=self.audio_sample_rate,
+                device=self.whisper_device,
+                output_dim=self.whisper_output_dim,
+                audio_key="instruction_audio",
+                audio_mask_key="instruction_audio_mask",
+            )(outputs)
+            outputs["audio"] = outputs["ambient_audio"]
+            outputs["audio_mask"] = outputs["ambient_audio_mask"]
+            return outputs
+
+        outputs = transforms.ExtractWhisperAudioSequence(
             model_name=self.whisper_model_name,
             sample_rate=self.audio_sample_rate,
             device=self.whisper_device,
+            num_frames=transforms._audio_tools.whisper_num_frames_for_duration(
+                self.audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+            ),
             output_dim=self.whisper_output_dim,
+            audio_key="ambient_audio",
+            audio_mask_key="ambient_audio_mask",
         )(outputs)
+        outputs = transforms.ExtractWhisperAudioSequence(
+            model_name=self.whisper_model_name,
+            sample_rate=self.audio_sample_rate,
+            device=self.whisper_device,
+            num_frames=transforms._audio_tools.whisper_num_frames_for_duration(
+                instruction_num_samples,
+                sample_rate=self.audio_sample_rate,
+            ),
+            output_dim=self.whisper_output_dim,
+            audio_key="instruction_audio",
+            audio_mask_key="instruction_audio_mask",
+        )(outputs)
+        outputs["audio"] = outputs["ambient_audio"]
+        outputs["audio_mask"] = outputs["ambient_audio_mask"]
+        return outputs
 
 
 @dataclasses.dataclass(frozen=True)

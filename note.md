@@ -1,5 +1,4 @@
-pipeline:  基于pi05真机lora微调（pick-）任务; 采/处理数据、lora微调。（pi05改的）
-
-/home/three/DataFromRoot/codes/grade_two/github/robot/openpi/src/openpi/models_pytorch/pi0_pytorch.py
-
-
+计划列表
+1.尝试完成训推的流程，用原有数据，查看loss收敛情况（5.1）
+2.继续采集新的数据，补充到100条左右，测试前一天的权重推理，完成推理流程（5.2）
+3.用新的权重进行训练

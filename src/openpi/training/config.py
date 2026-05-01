@@ -557,8 +557,10 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
                 audiovla_policy.AudiovlaInputs(
                     action_dim=model_config.action_dim,
                     audio_num_samples=model_config.audio_num_samples,
+                    instruction_audio_num_samples=model_config.instruction_audio_num_samples,
                     audio_sample_rate=model_config.audio_sample_rate,
                     use_whisper=model_config.use_whisper,
+                    audio_tokenizer_type=model_config.audio_tokenizer_type,
                     whisper_model_name=model_config.whisper_model_name,
                     whisper_output_dim=model_config.audio_feature_dim,
                     whisper_device=model_config.whisper_device,

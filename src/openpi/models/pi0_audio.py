@@ -48,7 +48,10 @@ def make_attn_mask(input_mask, mask_ar):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+    pos: at.Real[at.Array, " b"],
+    embedding_dim: int,
+    min_period: float,
+    max_period: float,
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
@@ -67,10 +70,15 @@ def posemb_sincos(
 
 @dataclasses.dataclass(frozen=True)
 class Pi0AudioConfig(pi0_config.Pi0Config):
-    audio_num_samples: int = 16_000
+    ambient_audio_num_samples: int = 16_000
+    instruction_audio_num_samples: int = 16_000
     audio_sample_rate: int = 16_000
     audio_projector_dim: int = 512
+    ambient_audio_num_tokens: int = 32
+    instruction_audio_num_tokens: int = 24
+    audio_resampler_heads: int = 8
     use_whisper: bool = False
+    audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
     whisper_device: str = "cpu"
@@ -80,12 +88,24 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.audio_num_samples <= 0:
-            raise ValueError("audio_num_samples must be > 0")
+        if self.ambient_audio_num_samples <= 0:
+            raise ValueError("ambient_audio_num_samples must be > 0")
+        if self.instruction_audio_num_samples <= 0:
+            raise ValueError("instruction_audio_num_samples must be > 0")
         if self.audio_sample_rate <= 0:
             raise ValueError("audio_sample_rate must be > 0")
         if self.audio_projector_dim <= 0:
             raise ValueError("audio_projector_dim must be > 0")
+        if self.ambient_audio_num_tokens <= 0:
+            raise ValueError("ambient_audio_num_tokens must be > 0")
+        if self.instruction_audio_num_tokens <= 0:
+            raise ValueError("instruction_audio_num_tokens must be > 0")
+        if self.audio_resampler_heads <= 0:
+            raise ValueError("audio_resampler_heads must be > 0")
+        if self.audio_tokenizer_type not in ("sequence_resampler", "pooled_baseline"):
+            raise ValueError(
+                "audio_tokenizer_type must be 'sequence_resampler' or 'pooled_baseline'"
+            )
         if self.audio_limoe_num_experts <= 0:
             raise ValueError("audio_limoe_num_experts must be > 0")
         if self.audio_limoe_top_k <= 0:
@@ -99,7 +119,53 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             if self.whisper_output_dim is not None:
                 return self.whisper_output_dim
             return _audio_tools.infer_whisper_hidden_size(self.whisper_model_name)
-        return self.audio_num_samples
+        return 1
+
+    @property
+    def ambient_audio_input_shape(self) -> tuple[int, ...]:
+        if self.use_whisper:
+            if self.audio_tokenizer_type == "pooled_baseline":
+                return (self.audio_feature_dim,)
+            return (self.ambient_audio_num_frames, self.audio_feature_dim)
+        return (self.ambient_audio_num_samples,)
+
+    @property
+    def instruction_audio_input_shape(self) -> tuple[int, ...]:
+        if self.use_whisper:
+            if self.audio_tokenizer_type == "pooled_baseline":
+                return (self.audio_feature_dim,)
+            return (self.instruction_audio_num_frames, self.audio_feature_dim)
+        return (self.instruction_audio_num_samples,)
+
+    @property
+    def audio_input_shape(self) -> tuple[int, ...]:
+        return self.ambient_audio_input_shape
+
+    @property
+    def ambient_audio_num_frames(self) -> int:
+        return _audio_tools.whisper_num_frames_for_duration(
+            self.ambient_audio_num_samples,
+            sample_rate=self.audio_sample_rate,
+        )
+
+    @property
+    def instruction_audio_num_frames(self) -> int:
+        return _audio_tools.whisper_num_frames_for_duration(
+            self.instruction_audio_num_samples,
+            sample_rate=self.audio_sample_rate,
+        )
+
+    @property
+    def audio_num_samples(self) -> int:
+        return self.ambient_audio_num_samples
+
+    @property
+    def audio_num_tokens(self) -> int:
+        return self.ambient_audio_num_tokens
+
+    @property
+    def audio_num_frames(self) -> int:
+        return self.ambient_audio_num_frames
 
     @property
     @override
@@ -111,8 +177,12 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
         return Pi0Audio(self, rngs=nnx.Rngs(rng))
 
     @override
-    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+    def inputs_spec(
+        self, *, batch_size: int = 1
+    ) -> tuple[_model.Observation, _model.Actions]:
+        image_spec = jax.ShapeDtypeStruct(
+            [batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32
+        )
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
@@ -128,16 +198,34 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                audio=jax.ShapeDtypeStruct([batch_size, self.audio_feature_dim], jnp.float32),
+                audio=jax.ShapeDtypeStruct(
+                    [batch_size, *self.audio_input_shape], jnp.float32
+                ),
                 audio_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
-                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
-                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                ambient_audio=jax.ShapeDtypeStruct(
+                    [batch_size, *self.ambient_audio_input_shape], jnp.float32
+                ),
+                ambient_audio_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
+                instruction_audio=jax.ShapeDtypeStruct(
+                    [batch_size, *self.instruction_audio_input_shape], jnp.float32
+                ),
+                instruction_audio_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
+                tokenized_prompt=jax.ShapeDtypeStruct(
+                    [batch_size, self.max_token_len], jnp.int32
+                ),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct(
+                    [batch_size, self.max_token_len], bool
+                ),
             )
-        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        action_spec = jax.ShapeDtypeStruct(
+            [batch_size, self.action_horizon, self.action_dim], jnp.float32
+        )
         return observation_spec, action_spec
 
     def load_pytorch(self, train_config, weight_path: str):
-        raise NotImplementedError("Pi0AudioConfig currently supports JAX checkpoints only.")
+        raise NotImplementedError(
+            "Pi0AudioConfig currently supports JAX checkpoints only."
+        )
 
 
 class Pi0Audio(_model.BaseModel):
@@ -146,6 +234,9 @@ class Pi0Audio(_model.BaseModel):
         self.pi05 = config.pi05
         self.use_audio_limoe = config.use_audio_limoe
         self.audio_limoe_num_experts = config.audio_limoe_num_experts
+        self.ambient_audio_num_tokens = config.ambient_audio_num_tokens
+        self.instruction_audio_num_tokens = config.instruction_audio_num_tokens
+        self.audio_tokenizer_type = config.audio_tokenizer_type
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -157,7 +248,11 @@ class Pi0Audio(_model.BaseModel):
                 adarms=config.pi05,
             )
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        llm.lazy_init(
+            rngs=rngs,
+            method="init",
+            use_adarms=[False, True] if config.pi05 else [False, False],
+        )
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -167,11 +262,76 @@ class Pi0Audio(_model.BaseModel):
                 dtype_mm=config.dtype,
             )
         )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        img.lazy_init(
+            next(iter(config.fake_obs().images.values())), train=False, rngs=rngs
+        )
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
-        # audio部分的处理模块
-        self.audio_in_proj = nnx.Linear(config.audio_feature_dim, config.audio_projector_dim, rngs=rngs)
-        self.audio_out_proj = nnx.Linear(config.audio_projector_dim, paligemma_config.width, rngs=rngs)
+        self.ambient_audio_in_proj = nnx.Linear(
+            config.audio_feature_dim, config.audio_projector_dim, rngs=rngs
+        )
+        self.instruction_audio_in_proj = nnx.Linear(
+            config.audio_feature_dim, config.audio_projector_dim, rngs=rngs
+        )
+        if self.audio_tokenizer_type == "sequence_resampler":
+            self.ambient_audio_resampler = nnx.MultiHeadAttention(
+                num_heads=config.audio_resampler_heads,
+                in_features=config.audio_projector_dim,
+                qkv_features=config.audio_projector_dim,
+                out_features=config.audio_projector_dim,
+                decode=False,
+                rngs=rngs,
+            )
+            self.instruction_audio_resampler = nnx.MultiHeadAttention(
+                num_heads=config.audio_resampler_heads,
+                in_features=config.audio_projector_dim,
+                qkv_features=config.audio_projector_dim,
+                out_features=config.audio_projector_dim,
+                decode=False,
+                rngs=rngs,
+            )
+            self.ambient_audio_query_tokens = nnx.Param(
+                jax.random.normal(
+                    rngs.params(),
+                    (config.ambient_audio_num_tokens, config.audio_projector_dim),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            self.instruction_audio_query_tokens = nnx.Param(
+                jax.random.normal(
+                    rngs.params(),
+                    (config.instruction_audio_num_tokens, config.audio_projector_dim),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            self.ambient_audio_query_norm = nnx.LayerNorm(
+                config.audio_projector_dim, rngs=rngs
+            )
+            self.ambient_audio_kv_norm = nnx.LayerNorm(
+                config.audio_projector_dim, rngs=rngs
+            )
+            self.instruction_audio_query_norm = nnx.LayerNorm(
+                config.audio_projector_dim, rngs=rngs
+            )
+            self.instruction_audio_kv_norm = nnx.LayerNorm(
+                config.audio_projector_dim, rngs=rngs
+            )
+        else:
+            self.ambient_audio_resampler = None
+            self.instruction_audio_resampler = None
+            self.ambient_audio_query_tokens = None
+            self.instruction_audio_query_tokens = None
+            self.ambient_audio_query_norm = None
+            self.ambient_audio_kv_norm = None
+            self.instruction_audio_query_norm = None
+            self.instruction_audio_kv_norm = None
+        self.ambient_audio_out_proj = nnx.Linear(
+            config.audio_projector_dim, paligemma_config.width, rngs=rngs
+        )
+        self.instruction_audio_out_proj = nnx.Linear(
+            config.audio_projector_dim, paligemma_config.width, rngs=rngs
+        )
         if config.use_audio_limoe:
             try:
                 from openpi.models import limoe_simple
@@ -192,7 +352,10 @@ class Pi0Audio(_model.BaseModel):
                 )
             )
             audio_limoe.lazy_init(
-                jnp.zeros((1, config.audio_limoe_num_experts, paligemma_config.width), dtype=jnp.float32),
+                jnp.zeros(
+                    (1, config.audio_limoe_num_experts, paligemma_config.width),
+                    dtype=jnp.float32,
+                ),
                 True,
                 rngs=rngs,
             )
@@ -200,33 +363,151 @@ class Pi0Audio(_model.BaseModel):
         else:
             self.audio_limoe = None
 
-        self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        self.action_in_proj = nnx.Linear(
+            config.action_dim, action_expert_config.width, rngs=rngs
+        )
         if config.pi05:
-            self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            self.time_mlp_in = nnx.Linear(
+                action_expert_config.width, action_expert_config.width, rngs=rngs
+            )
+            self.time_mlp_out = nnx.Linear(
+                action_expert_config.width, action_expert_config.width, rngs=rngs
+            )
         else:
-            self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
-            self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
-        self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+            self.state_proj = nnx.Linear(
+                config.action_dim, action_expert_config.width, rngs=rngs
+            )
+            self.action_time_mlp_in = nnx.Linear(
+                2 * action_expert_config.width, action_expert_config.width, rngs=rngs
+            )
+            self.action_time_mlp_out = nnx.Linear(
+                action_expert_config.width, action_expert_config.width, rngs=rngs
+            )
+        self.action_out_proj = nnx.Linear(
+            action_expert_config.width, config.action_dim, rngs=rngs
+        )
 
         self.deterministic = True
 
-    def _embed_audio_prefix(
-        self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b 1 emb"] | None, at.Bool[at.Array, "b 1"] | None]:
-        if obs.audio is None:
+    def _prepare_audio_sequence(
+        self,
+        audio_value,
+        audio_mask_value,
+    ) -> tuple[at.Float[at.Array, "b t d"] | None, at.Bool[at.Array, "b t"] | None]:
+        if audio_value is None:
             return None, None
 
-        audio = jnp.asarray(obs.audio, dtype=jnp.float32)
-        audio_hidden = self.audio_in_proj(audio)
-        audio_hidden = nnx.swish(audio_hidden)
-        audio_token = self.audio_out_proj(audio_hidden)[:, None, :]
+        audio = jnp.asarray(audio_value, dtype=jnp.float32)
+        original_ndim = audio.ndim
+        if original_ndim == 2:
+            audio = audio[..., None]
+        elif original_ndim != 3:
+            raise ValueError(
+                f"Audio input must have rank 2 or 3, got shape {audio.shape}"
+            )
 
-        if obs.audio_mask is None:
+        if audio_mask_value is None:
+            audio_mask = jnp.ones((audio.shape[0],), dtype=jnp.bool_)
+        else:
+            audio_mask = jnp.asarray(audio_mask_value, dtype=jnp.bool_)
+
+        if audio.shape[1] == 0:
+            return None, None
+
+        if original_ndim == 2:
+            frame_mask = jnp.broadcast_to(audio_mask[:, None], audio.shape[:2])
+        else:
+            frame_energy = jnp.max(jnp.abs(audio), axis=-1)
+            frame_mask = frame_energy > 0
+            frame_mask = jnp.where(audio_mask[:, None], frame_mask, False)
+        return audio, frame_mask
+
+    def _embed_audio_prefix(
+        self,
+        audio_value,
+        audio_mask_value,
+        *,
+        in_proj,
+        resampler,
+        query_tokens_param,
+        query_norm,
+        kv_norm,
+        out_proj,
+        num_tokens: int,
+    ) -> tuple[at.Float[at.Array, "b s emb"] | None, at.Bool[at.Array, "b s"] | None]:
+        if self.audio_tokenizer_type == "pooled_baseline":
+            return self._embed_audio_prefix_baseline(
+                audio_value,
+                audio_mask_value,
+                in_proj=in_proj,
+                out_proj=out_proj,
+            )
+
+        audio, frame_mask = self._prepare_audio_sequence(audio_value, audio_mask_value)
+        if audio is None or frame_mask is None:
+            return None, None
+
+        audio_hidden = in_proj(audio)
+        audio_hidden = nnx.swish(audio_hidden)
+        audio_hidden = kv_norm(audio_hidden)
+
+        batch_size = audio_hidden.shape[0]
+        query_tokens = jnp.broadcast_to(
+            query_tokens_param.value[None, :, :],
+            (
+                batch_size,
+                num_tokens,
+                query_tokens_param.value.shape[-1],
+            ),
+        )
+        query_tokens = query_norm(query_tokens)
+
+        attn_mask = frame_mask[:, None, None, :]
+        audio_tokens = resampler(
+            query_tokens,
+            audio_hidden,
+            mask=attn_mask,
+            decode=False,
+        )
+        audio_tokens = nnx.swish(audio_tokens)
+        audio_tokens = out_proj(audio_tokens)
+
+        if audio_mask_value is None:
+            audio_mask = jnp.ones((batch_size, num_tokens), dtype=jnp.bool_)
+        else:
+            audio_mask = jnp.broadcast_to(
+                jnp.asarray(audio_mask_value, dtype=jnp.bool_)[:, None],
+                (batch_size, num_tokens),
+            )
+        audio_tokens = audio_tokens * audio_mask[..., None].astype(audio_tokens.dtype)
+        return audio_tokens, audio_mask
+
+    def _embed_audio_prefix_baseline(
+        self,
+        audio_value,
+        audio_mask_value,
+        *,
+        in_proj,
+        out_proj,
+    ) -> tuple[at.Float[at.Array, "b 1 emb"] | None, at.Bool[at.Array, "b 1"] | None]:
+        if audio_value is None:
+            return None, None
+
+        audio = jnp.asarray(audio_value, dtype=jnp.float32)
+        if audio.ndim != 2:
+            raise ValueError(
+                "pooled_baseline expects audio features with shape [B, D]. "
+                f"Got shape {audio.shape}"
+            )
+
+        audio_hidden = in_proj(audio)
+        audio_hidden = nnx.swish(audio_hidden)
+        audio_token = out_proj(audio_hidden)[:, None, :]
+
+        if audio_mask_value is None:
             audio_mask = jnp.ones((audio.shape[0], 1), dtype=jnp.bool_)
         else:
-            audio_mask = jnp.asarray(obs.audio_mask, dtype=jnp.bool_)[:, None]
+            audio_mask = jnp.asarray(audio_mask_value, dtype=jnp.bool_)[:, None]
         audio_token = audio_token * audio_mask[..., None].astype(audio_token.dtype)
         return audio_token, audio_mask
 
@@ -247,7 +528,9 @@ class Pi0Audio(_model.BaseModel):
         limoe_tokens = limoe_tokens * padded_mask[..., None].astype(limoe_tokens.dtype)
         if pad_seq:
             limoe_tokens = jnp.pad(limoe_tokens, ((0, 0), (0, pad_seq), (0, 0)))
-            padded_mask = jnp.pad(padded_mask, ((0, 0), (0, pad_seq)), constant_values=False)
+            padded_mask = jnp.pad(
+                padded_mask, ((0, 0), (0, pad_seq)), constant_values=False
+            )
 
         limoe_out, _ = self.audio_limoe(limoe_tokens, deterministic=not train)
         limoe_out = limoe_out * padded_mask[..., None].astype(limoe_out.dtype)
@@ -258,10 +541,38 @@ class Pi0Audio(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation, *, train: bool = False
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
+
+        # language
+        if obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # 添加audio通过vad识别的指令槽的embed
+        instruction_audio_token, instruction_audio_mask = self._embed_audio_prefix(
+            obs.instruction_audio,
+            obs.instruction_audio_mask,
+            in_proj=self.instruction_audio_in_proj,
+            resampler=self.instruction_audio_resampler,
+            query_tokens_param=self.instruction_audio_query_tokens,
+            query_norm=self.instruction_audio_query_norm,
+            kv_norm=self.instruction_audio_kv_norm,
+            out_proj=self.instruction_audio_out_proj,
+            num_tokens=self.instruction_audio_num_tokens,
+        )
+        if instruction_audio_token is not None and instruction_audio_mask is not None:
+            target_dtype = tokens[0].dtype if tokens else instruction_audio_token.dtype
+            instruction_audio_token = instruction_audio_token.astype(target_dtype)
+            tokens.append(instruction_audio_token)
+            input_mask.append(instruction_audio_mask)
+            ar_mask += [False] * instruction_audio_token.shape[1]
 
         # img
         for name in obs.images:
@@ -275,20 +586,26 @@ class Pi0Audio(_model.BaseModel):
                 )
             )
             ar_mask += [False] * image_tokens.shape[1]
-        # language
-        if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            ar_mask += [False] * tokenized_inputs.shape[1]
 
-        # new audio
-        audio_token, audio_mask = self._embed_audio_prefix(obs)
-        if audio_token is not None and audio_mask is not None:
-            audio_token = audio_token.astype(tokens[0].dtype)
-            tokens.append(audio_token)
-            input_mask.append(audio_mask)
-            ar_mask += [False] * audio_token.shape[1]
+        ambient_audio_token, ambient_audio_mask = self._embed_audio_prefix(
+            obs.ambient_audio if obs.ambient_audio is not None else obs.audio,
+            obs.ambient_audio_mask
+            if obs.ambient_audio_mask is not None
+            else obs.audio_mask,
+            in_proj=self.ambient_audio_in_proj,
+            resampler=self.ambient_audio_resampler,
+            query_tokens_param=self.ambient_audio_query_tokens,
+            query_norm=self.ambient_audio_query_norm,
+            kv_norm=self.ambient_audio_kv_norm,
+            out_proj=self.ambient_audio_out_proj,
+            num_tokens=self.ambient_audio_num_tokens,
+        )
+        if ambient_audio_token is not None and ambient_audio_mask is not None:
+            target_dtype = tokens[0].dtype if tokens else ambient_audio_token.dtype
+            ambient_audio_token = ambient_audio_token.astype(target_dtype)
+            tokens.append(ambient_audio_token)
+            input_mask.append(ambient_audio_mask)
+            ar_mask += [False] * ambient_audio_token.shape[1]
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
@@ -300,7 +617,10 @@ class Pi0Audio(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -317,7 +637,9 @@ class Pi0Audio(_model.BaseModel):
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        time_emb = posemb_sincos(
+            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+        )
         if self.pi05:
             time_emb = self.time_mlp_in(time_emb)
             time_emb = nnx.swish(time_emb)
@@ -326,7 +648,9 @@ class Pi0Audio(_model.BaseModel):
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
         else:
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            time_tokens = einops.repeat(
+                time_emb, "b emb -> b s emb", s=self.action_horizon
+            )
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -343,10 +667,17 @@ class Pi0Audio(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -355,14 +686,21 @@ class Pi0Audio(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, train=train)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
+            observation, train=train
+        )
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, x_t, time
+        )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -381,12 +719,18 @@ class Pi0Audio(_model.BaseModel):
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(
+                rng, (batch_size, self.action_horizon, self.action_dim)
+            )
 
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
+            observation, train=False
+        )
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
 
         def step(carry):
             x_t, time = carry
@@ -394,14 +738,22 @@ class Pi0Audio(_model.BaseModel):
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            prefix_attn_mask = einops.repeat(
+                prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1]
+            )
+            full_attn_mask = jnp.concatenate(
+                [prefix_attn_mask, suffix_attn_mask], axis=-1
+            )
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],

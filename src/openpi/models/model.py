@@ -66,8 +66,12 @@ IMAGE_RESOLUTION = (224, 224)
 #         ...  # Masks for additional views
 #     },
 #     "state": float32[*b, s],  # Low-dimensional robot state
-#     "audio": float32[*b, t],  # Optional fixed-length audio representation (waveform window or embedding)
-#     "audio_mask": bool[*b],  # Optional audio validity mask
+#     "audio": float32[*b, ...],  # Optional legacy audio alias for ambient_audio
+#     "audio_mask": bool[*b],  # Optional legacy audio validity mask
+#     "ambient_audio": float32[*b, ...],  # Optional ambient audio representation
+#     "ambient_audio_mask": bool[*b],  # Optional ambient audio validity mask
+#     "instruction_audio": float32[*b, ...],  # Optional VAD-selected instruction audio representation
+#     "instruction_audio_mask": bool[*b],  # Optional instruction audio validity mask
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
@@ -97,10 +101,19 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
-    # Optional fixed-length audio representation (waveform window or embedding).
-    audio: at.Float[ArrayT, "*b t"] | None = None
-    # Optional audio validity mask.
+    # Optional legacy audio representation. This aliases `ambient_audio` for backward
+    # compatibility with single-slot audio code paths.
+    audio: at.Float[ArrayT, "..."] | None = None
+    # Optional legacy audio validity mask.
     audio_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional ambient audio representation (waveform window or time-sequence features).
+    ambient_audio: at.Float[ArrayT, "..."] | None = None
+    # Optional ambient audio validity mask.
+    ambient_audio_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional instruction audio representation (for example VAD-selected speech).
+    instruction_audio: at.Float[ArrayT, "..."] | None = None
+    # Optional instruction audio validity mask.
+    instruction_audio_mask: at.Bool[ArrayT, "*b"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -120,8 +133,12 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        if "audio_mask" in data and "audio" not in data:
-            raise ValueError("audio_mask cannot be provided without audio.")
+        if "audio_mask" in data and "audio" not in data and "ambient_audio" not in data:
+            raise ValueError("audio_mask cannot be provided without audio or ambient_audio.")
+        if "ambient_audio_mask" in data and "ambient_audio" not in data and "audio" not in data:
+            raise ValueError("ambient_audio_mask cannot be provided without ambient_audio or audio.")
+        if "instruction_audio_mask" in data and "instruction_audio" not in data:
+            raise ValueError("instruction_audio_mask cannot be provided without instruction_audio.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -129,14 +146,31 @@ class Observation(Generic[ArrayT]):
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
 
-        audio = data.get("audio")
-        audio_mask = data.get("audio_mask")
-        if audio is not None and audio_mask is None:
-            audio_batch_shape = audio.shape[:-1]
-            if isinstance(audio, torch.Tensor):
-                audio_mask = torch.ones(audio_batch_shape, dtype=torch.bool, device=audio.device)
-            else:
-                audio_mask = np.ones(audio_batch_shape, dtype=np.bool_)
+        def _default_audio_mask(audio_value, audio_mask_value):
+            if audio_value is None or audio_mask_value is not None:
+                return audio_mask_value
+            audio_batch_shape = audio_value.shape[:-2] if audio_value.ndim >= 3 else audio_value.shape[:-1]
+            if isinstance(audio_value, torch.Tensor):
+                return torch.ones(audio_batch_shape, dtype=torch.bool, device=audio_value.device)
+            return np.ones(audio_batch_shape, dtype=np.bool_)
+
+        ambient_audio = data.get("ambient_audio", data.get("audio"))
+        ambient_audio_mask = data.get("ambient_audio_mask", data.get("audio_mask"))
+        ambient_audio_mask = _default_audio_mask(ambient_audio, ambient_audio_mask)
+
+        instruction_audio = data.get("instruction_audio")
+        instruction_audio_mask = _default_audio_mask(
+            instruction_audio,
+            data.get("instruction_audio_mask"),
+        )
+
+        audio = ambient_audio if ambient_audio is not None else data.get("audio")
+        audio_mask = (
+            ambient_audio_mask
+            if ambient_audio_mask is not None
+            else data.get("audio_mask")
+        )
+        audio_mask = _default_audio_mask(audio, audio_mask)
 
         return cls(
             images=data["image"],
@@ -144,6 +178,10 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             audio=audio,
             audio_mask=audio_mask,
+            ambient_audio=ambient_audio,
+            ambient_audio_mask=ambient_audio_mask,
+            instruction_audio=instruction_audio,
+            instruction_audio_mask=instruction_audio_mask,
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -226,8 +264,16 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
-        audio=observation.audio,
-        audio_mask=observation.audio_mask,
+        audio=observation.audio if observation.audio is not None else observation.ambient_audio,
+        audio_mask=(
+            observation.audio_mask
+            if observation.audio_mask is not None
+            else observation.ambient_audio_mask
+        ),
+        ambient_audio=observation.ambient_audio,
+        ambient_audio_mask=observation.ambient_audio_mask,
+        instruction_audio=observation.instruction_audio,
+        instruction_audio_mask=observation.instruction_audio_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

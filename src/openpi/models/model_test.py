@@ -60,7 +60,25 @@ def test_pi0_audio_whisper_inputs_spec_uses_feature_dim():
     obs_spec, _ = config.inputs_spec(batch_size=2)
 
     assert config.audio_feature_dim == 384
+    assert config.ambient_audio_num_frames == 50
+    assert config.instruction_audio_num_frames == 250
+    assert obs_spec.audio.shape == (2, 50, 384)
+    assert obs_spec.ambient_audio.shape == (2, 50, 384)
+    assert obs_spec.instruction_audio.shape == (2, 250, 384)
+
+
+def test_pi0_audio_whisper_baseline_inputs_spec_uses_pooled_feature_dim():
+    config = pi0_audio.Pi0AudioConfig(
+        use_whisper=True,
+        audio_tokenizer_type="pooled_baseline",
+        whisper_model_name="openai/whisper-tiny",
+    )
+    obs_spec, _ = config.inputs_spec(batch_size=2)
+
+    assert config.audio_feature_dim == 384
     assert obs_spec.audio.shape == (2, 384)
+    assert obs_spec.ambient_audio.shape == (2, 384)
+    assert obs_spec.instruction_audio.shape == (2, 384)
 
 
 def test_pi0_fast_model():

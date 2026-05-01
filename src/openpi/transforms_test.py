@@ -95,6 +95,8 @@ def test_copy_present_audio_fields():
         {"state": np.array([0.0], dtype=np.float32)},
     )
 
+    assert np.allclose(inputs["ambient_audio"], np.array([1.0, 2.0], dtype=np.float32))
+    assert inputs["ambient_audio_mask"] == np.True_
     assert np.allclose(inputs["audio"], np.array([1.0, 2.0], dtype=np.float32))
     assert inputs["audio_mask"] == np.True_
     assert inputs["frame_index"] == np.int32(7)
@@ -111,8 +113,29 @@ def test_extract_audio_window_from_raw_audio():
     )
 
     assert output["audio"].shape == (6,)
+    assert output["ambient_audio"].shape == (6,)
     assert np.allclose(output["audio"], np.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32))
+    assert np.allclose(output["ambient_audio"], np.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32))
     assert output["audio_mask"] == np.True_
+    assert output["ambient_audio_mask"] == np.True_
+
+
+def test_extract_instruction_audio_window_from_raw_audio():
+    transform = _transforms.ExtractInstructionAudioWindow(window_num_samples=6, target_sample_rate=16_000)
+
+    output = transform(
+        {
+            "instruction_audio": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+            "instruction_audio_sample_rate": np.int32(16_000),
+        }
+    )
+
+    assert output["instruction_audio"].shape == (6,)
+    assert np.allclose(
+        output["instruction_audio"],
+        np.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32),
+    )
+    assert output["instruction_audio_mask"] == np.True_
 
 
 def test_transform_dict():

@@ -72,9 +72,17 @@ def test_with_fake_audio_dataset():
 
     for observation, actions in batches:
         assert observation.audio is not None
-        assert observation.audio.shape == (config.batch_size, config.model.audio_num_samples)
+        assert observation.audio.shape == (config.batch_size, config.model.ambient_audio_num_samples)
         assert observation.audio_mask is not None
         assert observation.audio_mask.shape == (config.batch_size,)
+        assert observation.ambient_audio is not None
+        assert observation.ambient_audio.shape == (config.batch_size, config.model.ambient_audio_num_samples)
+        assert observation.ambient_audio_mask is not None
+        assert observation.ambient_audio_mask.shape == (config.batch_size,)
+        assert observation.instruction_audio is not None
+        assert observation.instruction_audio.shape == (config.batch_size, config.model.instruction_audio_num_samples)
+        assert observation.instruction_audio_mask is not None
+        assert observation.instruction_audio_mask.shape == (config.batch_size,)
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 

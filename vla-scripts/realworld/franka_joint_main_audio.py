@@ -7,6 +7,9 @@ import os
 import signal
 import time
 
+from audio_conditioning import audio_conditioning_config_from_args
+from audio_conditioning import LiveAudioConditioning
+from audio_conditioning import validate_audio_conditioning_config
 from franka_robot_env import FrankaCameraIds
 from franka_robot_env import FrankaRobotEnv
 from moviepy import ImageSequenceClip
@@ -18,8 +21,6 @@ import pandas as pd
 from PIL import Image
 from plot_topk import plot_topk_xy
 import tyro
-
-from openpi.shared import audio_tools
 
 DEFAULT_CONTROL_FREQUENCY = 30.0
 GRIPPER_OPEN = 1.0
@@ -105,9 +106,19 @@ class Args:
     audio_sample_rate: int = 16_000
     audio_channels: int = 1
     audio_num_samples: int = 16_000
+    instruction_audio_num_samples: int = 16_000
     audio_buffer_num_samples: int = 32_000
     audio_block_duration_s: float = 0.05
     audio_startup_timeout_s: float = 1.0
+
+    # Online Silero-VAD parameters for extracting the latest completed instruction utterance.
+    vad_history_num_samples: int = 80_000
+    vad_threshold: float = 0.5
+    vad_neg_threshold: float | None = None
+    vad_min_speech_duration_ms: int = 250
+    vad_max_speech_duration_s: float = 5.0
+    vad_min_silence_duration_ms: int = 100
+    vad_speech_pad_ms: int = 30
 
 
 # We are using Ctrl+C to optionally terminate rollouts early -- however, if we press Ctrl+C while the policy server is
@@ -246,42 +257,6 @@ def _extract_observation(
     return observation
 
 
-def _start_audio_buffer(args: Args) -> audio_tools.MultiprocessAudioBuffer | None:
-    audio_buffer = audio_tools.MultiprocessAudioBuffer(
-        sample_rate=args.audio_sample_rate,
-        channels=args.audio_channels,
-        window_num_samples=args.audio_num_samples,
-        buffer_num_samples=args.audio_buffer_num_samples,
-        block_duration_s=args.audio_block_duration_s,
-        device=args.audio_device,
-    )
-    try:
-        audio_buffer.start()
-        ready = audio_buffer.wait_until_ready(args.audio_startup_timeout_s)
-    except Exception as exc:
-        audio_buffer.stop()
-        if args.audio_required:
-            raise RuntimeError(f"Failed to start microphone capture: {exc}") from exc
-        print(f"[Audio] Warning: microphone capture unavailable, continuing without audio: {exc}")
-        return None
-
-    if not ready:
-        audio_buffer.stop()
-        msg = f"No microphone samples arrived within {args.audio_startup_timeout_s:.2f}s."
-        if args.audio_required:
-            raise RuntimeError(msg)
-        print(f"[Audio] Warning: {msg} Continuing without audio.")
-        return None
-
-    print(
-        "[Audio] Live microphone capture enabled (multiprocess): "
-        f"{audio_buffer.sample_rate} Hz, {args.audio_channels} channel(s), "
-        f"window={args.audio_num_samples} samples, "
-        f"device={audio_buffer.input_device if audio_buffer.input_device is not None else 'default'}"
-    )
-    return audio_buffer
-
-
 def _apply_gripper_if_needed(
     env: FrankaRobotEnv,
     controller,
@@ -330,18 +305,9 @@ def main(args: Args):
         raise ValueError("--max-joint-delta must be >= 0")
     if args.joint_velocity_limit < 0.0:
         raise ValueError("--joint-velocity-limit must be >= 0")
-    if args.audio_sample_rate <= 0:
-        raise ValueError("--audio-sample-rate must be > 0")
-    if args.audio_channels <= 0:
-        raise ValueError("--audio-channels must be > 0")
-    if args.audio_num_samples <= 0:
-        raise ValueError("--audio-num-samples must be > 0")
-    if args.audio_buffer_num_samples < args.audio_num_samples:
-        raise ValueError("--audio-buffer-num-samples must be >= --audio-num-samples")
-    if args.audio_block_duration_s <= 0.0:
-        raise ValueError("--audio-block-duration-s must be > 0")
-    if args.audio_startup_timeout_s < 0.0:
-        raise ValueError("--audio-startup-timeout-s must be >= 0")
+
+    audio_config = audio_conditioning_config_from_args(args)
+    validate_audio_conditioning_config(audio_config)
 
     env = FrankaRobotEnv(
         action_space="joint_velocity",
@@ -367,10 +333,10 @@ def main(args: Args):
     )
 
     controller = None
-    audio_buffer = None
+    live_audio = LiveAudioConditioning(audio_config)
     try:
         controller, gripper_state = _reset_robot(env, controller, settle_s=args.controller_settle_s)
-        audio_buffer = _start_audio_buffer(args)
+        live_audio.start()
 
         franka_model = None
         franka_frame = None
@@ -387,6 +353,7 @@ def main(args: Args):
             instruction = args.instruction.strip() or input("Enter instruction: ").strip()
             if not instruction:
                 raise ValueError("Instruction must not be empty.")
+            live_audio.reset_instruction()
 
             plot_xlim = None
             plot_ylim = None
@@ -428,15 +395,7 @@ def main(args: Args):
                             "observation/gripper_position": curr_obs["gripper_position"],
                             "prompt": instruction,
                         }
-                        if audio_buffer is not None:
-                            # 获得前1s窗口的值
-                            audio_window, has_audio = audio_buffer.read_window_for_duration(
-                                target_num_samples=args.audio_num_samples,
-                                target_sample_rate=args.audio_sample_rate,
-                            )
-                            request_data["observation/audio"] = audio_window
-                            request_data["observation/audio_sample_rate"] = np.int32(audio_buffer.sample_rate)
-                            request_data["observation/audio_mask"] = np.bool_(has_audio)
+                        request_data.update(live_audio.build_request_fields())
                         # args.topk_samples默认为0(应该)
                         topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
                         with prevent_keyboard_interrupt():
@@ -613,8 +572,7 @@ def main(args: Args):
         controller, gripper_state = _reset_robot(env, controller, settle_s=0.0)
     finally:
         with contextlib.suppress(Exception):
-            if audio_buffer is not None:
-                audio_buffer.stop()
+            live_audio.stop()
         with contextlib.suppress(Exception):
             if controller is not None:
                 _hold_current_joint_position(env, controller)

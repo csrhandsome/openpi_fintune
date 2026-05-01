@@ -94,13 +94,76 @@ def compute_whisper_audio_embedding(
         hidden = model.encoder(input_features=input_features).last_hidden_state
 
     if pooling == "mean":
-        pooled = hidden.mean(dim=1)
+        pooled = hidden.mean(dim=1)  # [b, T, d] -> [b, d]
     elif pooling == "first":
-        pooled = hidden[:, 0, :]
+        pooled = hidden[:, 0, :]  # [b, T, d] -> [b, d]
     else:
         raise ValueError(f"Unsupported Whisper pooling '{pooling}'")
 
     return pooled[0].to(dtype=torch.float32, device="cpu").numpy()
+
+
+def compute_whisper_audio_sequence(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    model_name: str,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Extract Whisper encoder hidden states without collapsing the time dimension."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.ndim != 1:
+        raise ValueError(f"Expected 1D audio, got shape {audio.shape}")
+
+    feature_extractor, model, resolved_device = _load_whisper_components(
+        model_name, device
+    )
+
+    import torch
+
+    inputs = feature_extractor(
+        audio,
+        sampling_rate=sample_rate,
+        return_tensors="pt",
+        padding="do_not_pad",
+    )
+    input_features = inputs.input_features.to(resolved_device)
+    if resolved_device.startswith("cuda"):
+        input_features = input_features.to(dtype=torch.float16)
+
+    with torch.inference_mode():
+        hidden = model.encoder(input_features=input_features).last_hidden_state
+
+    return hidden[0].to(dtype=torch.float32, device="cpu").numpy()
+
+
+def whisper_num_frames_for_duration(
+    num_samples: int,
+    *,
+    sample_rate: int,
+) -> int:
+    """Approximate Whisper encoder output length at 20 ms resolution."""
+    if num_samples <= 0:
+        return 1
+    return max(1, int(round(float(num_samples) / float(sample_rate) * 50.0)))
+
+
+def fit_audio_feature_sequence(
+    features: np.ndarray,
+    target_num_frames: int,
+) -> np.ndarray:
+    features = np.asarray(features, dtype=np.float32)
+    if features.ndim != 2:
+        raise ValueError(f"Expected audio feature sequence with shape [T, D], got {features.shape}")
+    if target_num_frames <= 0:
+        raise ValueError("target_num_frames must be > 0")
+
+    if features.shape[0] >= target_num_frames:
+        return np.ascontiguousarray(features[-target_num_frames:], dtype=np.float32)
+
+    padded = np.zeros((target_num_frames, features.shape[1]), dtype=np.float32)
+    padded[-features.shape[0] :, :] = features
+    return padded
 
 
 def episode_audio_stem(episode_index: int) -> str:
@@ -120,6 +183,15 @@ def _safe_int(value: object) -> int | None:
         if value is None:
             return None
         return int(value)
+    except Exception:
+        return None
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
     except Exception:
         return None
 
@@ -176,6 +248,17 @@ def resolve_audio_path_from_sync(
     if audio_path.is_absolute():
         return audio_path
     return Path(dataset_root) / audio_path
+
+
+def resolve_dataset_path(
+    dataset_root: str | Path, raw_path: str | Path | None
+) -> Path | None:
+    if raw_path is None:
+        return None
+    path = Path(str(raw_path))
+    if path.is_absolute():
+        return path
+    return Path(dataset_root) / path
 
 
 def get_frame_record(frame_records: list[dict], frame_index: int) -> dict | None:
@@ -289,6 +372,34 @@ def fit_audio_window(audio: np.ndarray, window_num_samples: int) -> np.ndarray:
     padded = np.zeros((window_num_samples,), dtype=np.float32)
     padded[-audio.shape[0] :] = audio
     return padded
+
+
+def find_latest_completed_vad_segment(
+    sync_data: dict | None,
+    *,
+    current_time_sec: float,
+    kind: str | None = "instruction",
+) -> dict | None:
+    if not sync_data:
+        return None
+    raw_segments = sync_data.get("vad_segments")
+    if not isinstance(raw_segments, list):
+        return None
+
+    latest_segment = None
+    latest_end_sec = -float("inf")
+    for segment in raw_segments:
+        if not isinstance(segment, dict):
+            continue
+        if kind is not None and segment.get("kind") not in (None, kind):
+            continue
+        end_sec = _safe_float(segment.get("end_sec"))
+        if end_sec is None or end_sec > current_time_sec:
+            continue
+        if end_sec >= latest_end_sec:
+            latest_segment = segment
+            latest_end_sec = end_sec
+    return latest_segment
 
 
 def block_frames_for_sample_rate(
@@ -945,3 +1056,79 @@ def extract_episode_audio_window(
 
     has_audio = segment.size > 0
     return fit_audio_window(segment, window_num_samples), has_audio
+
+
+def extract_episode_instruction_audio(
+    *,
+    dataset_root: str | Path,
+    episode_index: int,
+    frame_index: int,
+    window_num_samples: int,
+    target_sample_rate: int,
+    fallback_fps: float,
+) -> tuple[np.ndarray, bool]:
+    default_audio_path, sync_path = resolve_episode_audio_paths(
+        dataset_root, episode_index
+    )
+    sync_data = load_json(sync_path)
+    if not sync_data:
+        return np.zeros((window_num_samples,), dtype=np.float32), False
+
+    audio_path = (
+        resolve_audio_path_from_sync(dataset_root, sync_data) or default_audio_path
+    )
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    full_audio, sample_rate = read_wav_mono(audio_path)
+    fps = (
+        float(sync_data.get("control_frequency", fallback_fps))
+        if sync_data
+        else float(fallback_fps)
+    )
+    _, current_end_sample = frame_range_to_audio_samples(
+        sync_data=sync_data,
+        start_frame_index=frame_index,
+        end_frame_index=frame_index + 1,
+        sample_rate=sample_rate,
+        audio_total_samples=int(full_audio.shape[0]),
+        fps=fps,
+    )
+    current_time_sec = float(current_end_sample) / float(sample_rate)
+    segment = find_latest_completed_vad_segment(
+        sync_data,
+        current_time_sec=current_time_sec,
+        kind="instruction",
+    )
+    if segment is None:
+        return np.zeros((window_num_samples,), dtype=np.float32), False
+
+    segment_audio = None
+    segment_sample_rate = sample_rate
+    segment_path = resolve_dataset_path(dataset_root, segment.get("audio_wav_path"))
+    if segment_path is not None and segment_path.is_file():
+        segment_audio, segment_sample_rate = read_wav_mono(segment_path)
+    else:
+        start_sample = _safe_int(segment.get("start_sample"))
+        end_sample = _safe_int(segment.get("end_sample"))
+        if (
+            start_sample is not None
+            and end_sample is not None
+            and 0 <= start_sample < end_sample <= full_audio.shape[0]
+        ):
+            segment_audio = np.ascontiguousarray(
+                full_audio[start_sample:end_sample],
+                dtype=np.float32,
+            )
+
+    if segment_audio is None or segment_audio.size == 0:
+        return np.zeros((window_num_samples,), dtype=np.float32), False
+
+    if segment_sample_rate != target_sample_rate:
+        segment_audio = resample_audio(
+            segment_audio,
+            segment_sample_rate,
+            target_sample_rate,
+        )
+
+    return fit_audio_window(segment_audio, window_num_samples), True
