@@ -1241,15 +1241,15 @@ _CONFIGS = [
         ),
         data=LeRobotFrankaJointAudioDataConfig(
             # 数据放在openpi的根目录且名称为repo_id
-            repo_id="franka_lerobot_4_9_audio",
+            repo_id="franka_lerobot_5_1_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_4_9_audio",
+                asset_id="franka_lerobot_5_1_audio",
             ),
         ),
         weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=5_000,
+        num_train_steps=20_000,
         batch_size=4,
         save_interval=1000,
         freeze_filter=pi0_audio.Pi0AudioConfig(

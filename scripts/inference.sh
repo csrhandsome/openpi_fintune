@@ -16,14 +16,14 @@ uv run vla-scripts/realworld/franka_droid_main.py \
   --topk_samples 2
 
 # joint 推理
-uv run vla-scripts/realworld/franka_joint_main.py \
+uv run vla-scripts/realworld/franka_joint_main_audio.py \
     --remote-host 192.168.5.55 \
     --remote-port 8001 \
     --franka-hostname 192.168.1.100 \
     --external-camera-serial 825412070292 \
     --wrist-camera-serial 825412070487 \
     --color-only \
-    --instruction "Stack the yellow cup on the blue cup" \
+    --instruction "Place the object into the basket" \
     --control-frequency-hz 20
 
 

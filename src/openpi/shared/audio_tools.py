@@ -125,7 +125,8 @@ def compute_whisper_audio_sequence(
         audio,
         sampling_rate=sample_rate,
         return_tensors="pt",
-        padding="do_not_pad",
+        padding="max_length",
+        truncation=True,
     )
     input_features = inputs.input_features.to(resolved_device)
     if resolved_device.startswith("cuda"):
@@ -134,7 +135,11 @@ def compute_whisper_audio_sequence(
     with torch.inference_mode():
         hidden = model.encoder(input_features=input_features).last_hidden_state
 
-    return hidden[0].to(dtype=torch.float32, device="cpu").numpy()
+    real_num_frames = min(
+        whisper_num_frames_for_duration(audio.shape[0], sample_rate=sample_rate),
+        int(hidden.shape[1]),
+    )
+    return hidden[0, :real_num_frames].to(dtype=torch.float32, device="cpu").numpy()
 
 
 def whisper_num_frames_for_duration(

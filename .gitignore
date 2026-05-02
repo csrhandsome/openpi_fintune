@@ -175,3 +175,7 @@ cython_debug/
 
 # vscode
 .vscode/
+
+franka_lerobot_4_9_audio
+franka_lerobot_5_1_audio
+*.mp4
