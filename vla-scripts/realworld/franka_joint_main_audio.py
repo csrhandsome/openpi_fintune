@@ -7,8 +7,8 @@ import os
 import signal
 import time
 
-from audio_conditioning import audio_conditioning_config_from_args
 from audio_conditioning import LiveAudioConditioning
+from audio_conditioning import audio_conditioning_config_from_args
 from audio_conditioning import validate_audio_conditioning_config
 from franka_robot_env import FrankaCameraIds
 from franka_robot_env import FrankaRobotEnv
@@ -21,6 +21,8 @@ import pandas as pd
 from PIL import Image
 from plot_topk import plot_topk_xy
 import tyro
+
+from openpi.serving.reactive_desk_vla_client import ReactiveDeskVlaClient
 
 DEFAULT_CONTROL_FREQUENCY = 30.0
 GRIPPER_OPEN = 1.0
@@ -99,6 +101,12 @@ class Args:
     # Number of stochastic policy draws used before clustering.
     # If None, defaults to max(4 * topk_samples, topk_samples + 1).
     topk_draws: int | None = None
+
+    # Reactive Desk visualization websocket.
+    reactive_desk_enabled: bool = True
+    reactive_desk_host: str = "127.0.0.1"
+    reactive_desk_port: int = 8000
+    reactive_desk_path: str = "/ws/VlaIngest"
 
     # Audio conditioning parameters for pi0_base_audio_joint_lora.
     audio_required: bool = True
@@ -347,6 +355,12 @@ def main(args: Args):
         plot_ylim: tuple[float, float] | None = None
 
         policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
+        reactive_desk_client = ReactiveDeskVlaClient(
+            host=args.reactive_desk_host,
+            port=args.reactive_desk_port,
+            path=args.reactive_desk_path,
+            enabled=args.reactive_desk_enabled,
+        )
         df = pd.DataFrame(columns=["success", "duration", "video_filename"])
 
         while True:
@@ -396,19 +410,21 @@ def main(args: Args):
                             "prompt": instruction,
                         }
                         request_data.update(live_audio.build_request_fields())
-                        # args.topk_samples默认为0(应该)
+                        # args.topk_samples默认为0,这里的topk_k为0,不进入绘图的分支
                         topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
                         with prevent_keyboard_interrupt():
+                            # 默认没有进入
                             if topk_k and topk_k > 1:
-                                topk_draws = (
+                                # 确定最终的采样次数
+                                topk_samples = (
                                     int(args.topk_draws) if args.topk_draws is not None else max(4 * topk_k, topk_k + 1)
                                 )
-                                topk_draws = max(topk_draws, topk_k)
+                                topk_samples = max(topk_samples, topk_k)
                                 pred_action_chunk = _normalize_action_chunk(
                                     policy_client.infer(request_data)["actions"]
                                 )
                                 samples = [pred_action_chunk[0]]
-                                for _ in range(topk_draws - 1):
+                                for _ in range(topk_samples - 1):
                                     samples.append(
                                         _normalize_action_chunk(policy_client.infer(request_data)["actions"])[0]
                                     )
@@ -458,12 +474,45 @@ def main(args: Args):
                                     xlim=plot_xlim,
                                     ylim=plot_ylim,
                                 )
+                                reactive_desk_client.send_predictions(
+                                    topk_xyz,
+                                    probs,
+                                    prompt=instruction,
+                                    is_executing=True,
+                                )
                                 print(f"  [TopK] plot saved: {plot_path}")
                             else:
+                                # 没有画图和kmeans聚类,进入单一预测输出逻辑
                                 pred_action_chunk = _normalize_action_chunk(
                                     policy_client.infer(request_data)["actions"]
                                 )
-
+                                # 将action chunk里的joint delta转换为xy传递给reactive desk
+                                robot_state = env.robot.panda.get_state()
+                                q_curr = np.asarray(robot_state.q, dtype=np.float64).reshape(7)
+                                F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
+                                EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
+                                if franka_model is None or franka_frame is None:
+                                    franka_model = env.robot.panda.get_robot().load_model()
+                                    franka_frame = libfranka.Frame.kEndEffector
+                                chunk_xyz = []
+                                for chunk_action in pred_action_chunk:
+                                    q_next, _ = _sanitize_joint_target(args, q_curr, chunk_action[:7])
+                                    pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
+                                    pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
+                                    chunk_xyz.append(pose[:3, 3])
+                                chunk_xyz = np.asarray(chunk_xyz, dtype=np.float32)
+                                chunk_probs = np.full(
+                                    chunk_xyz.shape[0],
+                                    1.0 / max(chunk_xyz.shape[0], 1),
+                                    dtype=np.float32,
+                                )
+                                print("send prediction")
+                                reactive_desk_client.send_predictions(
+                                    chunk_xyz,
+                                    chunk_probs,
+                                    prompt=instruction,
+                                    is_executing=True,
+                                )
                         pred_action_horizon = pred_action_chunk.shape[0]
 
                     action = np.asarray(
@@ -580,6 +629,8 @@ def main(args: Args):
             env.robot.panda.stop_controller()
         with contextlib.suppress(Exception):
             env.close()
+        with contextlib.suppress(Exception):
+            reactive_desk_client.close()
 
 
 if __name__ == "__main__":
