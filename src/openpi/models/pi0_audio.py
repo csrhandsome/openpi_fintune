@@ -85,6 +85,7 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     use_audio_limoe: bool = False
     audio_limoe_num_experts: int = 4
     audio_limoe_top_k: int = 1
+    rtc_train_max_delay: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -112,6 +113,10 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("audio_limoe_top_k must be > 0")
         if self.whisper_output_dim is not None and self.whisper_output_dim <= 0:
             raise ValueError("whisper_output_dim must be > 0")
+        if self.rtc_train_max_delay < 0:
+            raise ValueError("rtc_train_max_delay must be >= 0")
+        if self.rtc_train_max_delay >= self.action_horizon:
+            raise ValueError("rtc_train_max_delay must be smaller than action_horizon")
 
     @property
     def audio_feature_dim(self) -> int:
@@ -237,6 +242,7 @@ class Pi0Audio(_model.BaseModel):
         self.ambient_audio_num_tokens = config.ambient_audio_num_tokens
         self.instruction_audio_num_tokens = config.instruction_audio_num_tokens
         self.audio_tokenizer_type = config.audio_tokenizer_type
+        self.rtc_train_max_delay = config.rtc_train_max_delay
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -615,17 +621,83 @@ class Pi0Audio(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    def _time_embedding(
+        self,
+        timestep: at.Float[at.Array, "..."],
+        batch_size: int,
+    ) -> at.Float[at.Array, "... emb"]:
+        timestep = jnp.asarray(timestep, dtype=jnp.float32)
+        if timestep.ndim == 0:
+            timestep = jnp.broadcast_to(timestep, (batch_size,))
+        if timestep.ndim == 1:
+            return posemb_sincos(
+                timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+            )
+        if timestep.ndim != 2:
+            raise ValueError(f"timestep must be scalar, [B], or [B, H], got shape {timestep.shape}")
+        flat_time = jnp.reshape(timestep, (-1,))
+        flat_emb = posemb_sincos(
+            flat_time, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
+        )
+        return jnp.reshape(flat_emb, (*timestep.shape, flat_emb.shape[-1]))
+
+    def _prepare_action_prefix(
+        self,
+        action_prefix: at.Float[at.Array, "..."] | None,
+        batch_size: int,
+    ) -> at.Float[at.Array, "b ah ad"]:
+        if action_prefix is None:
+            return jnp.zeros((batch_size, self.action_horizon, self.action_dim), dtype=jnp.float32)
+
+        prefix = jnp.asarray(action_prefix, dtype=jnp.float32)
+        if prefix.ndim == 2:
+            prefix = prefix[None, ...]
+        if prefix.ndim != 3:
+            raise ValueError(f"action_prefix must have shape [H, D] or [B, H, D], got {prefix.shape}")
+        if prefix.shape[0] == 1 and batch_size != 1:
+            prefix = jnp.broadcast_to(prefix, (batch_size, prefix.shape[1], prefix.shape[2]))
+        elif prefix.shape[0] != batch_size:
+            raise ValueError(f"action_prefix batch size {prefix.shape[0]} does not match observation batch size {batch_size}")
+
+        if prefix.shape[1] < self.action_horizon:
+            prefix = jnp.pad(prefix, ((0, 0), (0, self.action_horizon - prefix.shape[1]), (0, 0)))
+        elif prefix.shape[1] > self.action_horizon:
+            prefix = prefix[:, : self.action_horizon]
+        if prefix.shape[2] < self.action_dim:
+            prefix = jnp.pad(prefix, ((0, 0), (0, 0), (0, self.action_dim - prefix.shape[2])))
+        elif prefix.shape[2] > self.action_dim:
+            prefix = prefix[:, :, : self.action_dim]
+        return prefix
+
+    def _prepare_delay(
+        self,
+        delay: int | at.Int[at.Array, "..."] | None,
+        batch_size: int,
+    ) -> at.Int[at.Array, "b"]:
+        if delay is None:
+            return jnp.zeros((batch_size,), dtype=jnp.int32)
+        delay = jnp.asarray(delay, dtype=jnp.int32)
+        if delay.ndim == 0:
+            delay = jnp.broadcast_to(delay, (batch_size,))
+        elif delay.ndim != 1:
+            raise ValueError(f"delay must be scalar or [B], got shape {delay.shape}")
+        if delay.shape[0] == 1 and batch_size != 1:
+            delay = jnp.broadcast_to(delay, (batch_size,))
+        elif delay.shape[0] != batch_size:
+            raise ValueError(f"delay batch size {delay.shape[0]} does not match observation batch size {batch_size}")
+        return jnp.clip(delay, 0, self.action_horizon)
+
     @at.typecheck
     def embed_suffix(
         self,
         obs: _model.Observation,
         noisy_actions: _model.Actions,
-        timestep: at.Float[at.Array, " b"],
+        timestep: at.Float[at.Array, "..."],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b ..."] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -637,9 +709,7 @@ class Pi0Audio(_model.BaseModel):
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
-        time_emb = posemb_sincos(
-            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0
-        )
+        time_emb = self._time_embedding(timestep, obs.state.shape[0])
         if self.pi05:
             time_emb = self.time_mlp_in(time_emb)
             time_emb = nnx.swish(time_emb)
@@ -648,9 +718,10 @@ class Pi0Audio(_model.BaseModel):
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
         else:
-            time_tokens = einops.repeat(
-                time_emb, "b emb -> b s emb", s=self.action_horizon
-            )
+            if time_emb.ndim == 2:
+                time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            else:
+                time_tokens = time_emb
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -674,7 +745,7 @@ class Pi0Audio(_model.BaseModel):
         *,
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, noise_rng, time_rng, delay_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(
             preprocess_rng, observation, train=train
         )
@@ -682,17 +753,25 @@ class Pi0Audio(_model.BaseModel):
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
+
+        prefix_mask = None
+        if self.rtc_train_max_delay > 0:
+            delay = jax.random.randint(delay_rng, batch_shape, 0, self.rtc_train_max_delay + 1)
+            prefix_mask = jnp.arange(self.action_horizon) < delay[..., None]
+            # In this repo t=0 is clean action and t=1 is noise, so RTC prefix tokens use t=0.
+            time = jnp.where(prefix_mask, 0.0, time[..., None])
+
+        time_expanded = time[..., None] if time.ndim == len(batch_shape) + 1 else time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
+        prefix_tokens, prefix_mask_tokens, prefix_ar_mask = self.embed_prefix(
             observation, train=train
         )
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
             observation, x_t, time
         )
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        input_mask = jnp.concatenate([prefix_mask_tokens, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
@@ -704,7 +783,13 @@ class Pi0Audio(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if prefix_mask is not None:
+            postfix_mask = jnp.logical_not(prefix_mask)
+            postfix_count = jnp.sum(postfix_mask, axis=-1, keepdims=True)
+            loss_scale = self.action_horizon / jnp.maximum(postfix_count, 1)
+            loss = loss * postfix_mask * loss_scale
+        return loss
 
     @override
     def sample_actions(
@@ -714,6 +799,8 @@ class Pi0Audio(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: at.Float[at.Array, "..."] | None = None,
+        delay: int | at.Int[at.Array, "..."] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         dt = -1.0 / num_steps
@@ -722,6 +809,10 @@ class Pi0Audio(_model.BaseModel):
             noise = jax.random.normal(
                 rng, (batch_size, self.action_horizon, self.action_dim)
             )
+        action_prefix = self._prepare_action_prefix(action_prefix, batch_size)
+        delay = self._prepare_delay(delay, batch_size)
+        action_prefix_mask = jnp.arange(self.action_horizon)[None, :] < delay[:, None]
+        noise = jnp.where(action_prefix_mask[:, :, None], action_prefix, noise)
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(
             observation, train=False
@@ -734,8 +825,10 @@ class Pi0Audio(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            x_t = jnp.where(action_prefix_mask[:, :, None], action_prefix, x_t)
+            timestep = jnp.where(action_prefix_mask, 0.0, time)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, timestep
             )
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask = einops.repeat(
@@ -765,7 +858,9 @@ class Pi0Audio(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            x_next = x_t + dt * v_t
+            x_next = jnp.where(action_prefix_mask[:, :, None], action_prefix, x_next)
+            return x_next, time + dt
 
         def cond(carry):
             _, time = carry

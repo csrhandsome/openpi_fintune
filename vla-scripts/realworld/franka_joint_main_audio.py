@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import dataclasses
 import datetime
@@ -69,6 +70,8 @@ class Args:
     max_timesteps: int = 2000
     # How many actions to execute from a predicted action chunk before querying policy server again
     open_loop_horizon: int = 8
+    # Number of overlapping previous-chunk actions to condition on for training-time RTC inference.
+    rtc_inference_delay: int = 0
 
     # Remote server parameters
     remote_host: str = "192.168.5.89"
@@ -173,6 +176,26 @@ def _kmeans_topk(samples: np.ndarray, k: int = 3, iters: int = 20) -> tuple[np.n
     return centers[order], probs[order]
 
 
+
+def _attach_rtc_prefix(
+    request_data: dict,
+    previous_chunk: np.ndarray | None,
+    prefix_start: int,
+    delay: int,
+) -> int:
+    if previous_chunk is None or delay <= 0:
+        return 0
+    chunk = np.asarray(previous_chunk, dtype=np.float32)
+    if chunk.ndim != 2:
+        return 0
+    prefix = chunk[int(prefix_start) : int(prefix_start) + int(delay)]
+    if prefix.shape[0] == 0:
+        return 0
+    request_data["action_prefix"] = prefix
+    request_data["rtc_delay"] = np.asarray(prefix.shape[0], dtype=np.int32)
+    return int(prefix.shape[0])
+
+
 def _normalize_action_chunk(actions: np.ndarray) -> np.ndarray:
     chunk = np.asarray(actions, dtype=np.float32)
     if chunk.ndim == 1:
@@ -180,6 +203,115 @@ def _normalize_action_chunk(actions: np.ndarray) -> np.ndarray:
     if chunk.ndim != 2 or chunk.shape[1] < 8:
         raise ValueError(f"Unexpected action chunk shape: {chunk.shape}")
     return chunk[:, :8]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PolicyChunkResult:
+    action_chunk: np.ndarray
+    rtc_skip: int
+    topk_centers: np.ndarray | None = None
+    topk_probs: np.ndarray | None = None
+
+
+def _run_policy_request(
+    policy_client: websocket_client_policy.WebsocketClientPolicy,
+    request_data: dict,
+    *,
+    topk_k: int,
+    topk_draws: int | None,
+    rtc_skip: int,
+) -> _PolicyChunkResult:
+    if topk_k and topk_k > 1:
+        sample_count = topk_draws if topk_draws is not None else max(4 * topk_k, topk_k + 1)
+        sample_count = max(int(sample_count), topk_k)
+        action_chunk = _normalize_action_chunk(policy_client.infer(request_data)["actions"])
+        sample_index = min(int(rtc_skip), action_chunk.shape[0] - 1)
+        samples = [action_chunk[sample_index]]
+        for _ in range(sample_count - 1):
+            sample_chunk = _normalize_action_chunk(policy_client.infer(request_data)["actions"])
+            samples.append(sample_chunk[min(int(rtc_skip), sample_chunk.shape[0] - 1)])
+        centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
+        return _PolicyChunkResult(action_chunk=action_chunk, rtc_skip=int(rtc_skip), topk_centers=centers, topk_probs=probs)
+
+    return _PolicyChunkResult(
+        action_chunk=_normalize_action_chunk(policy_client.infer(request_data)["actions"]),
+        rtc_skip=int(rtc_skip),
+    )
+
+
+def _send_prediction_visualization(
+    *,
+    args: Args,
+    env: FrankaRobotEnv,
+    reactive_desk_client: ReactiveDeskVlaClient,
+    instruction: str,
+    result: _PolicyChunkResult,
+    franka_model,
+    franka_frame,
+    plot_xlim: tuple[float, float] | None,
+    plot_ylim: tuple[float, float] | None,
+):
+    robot_state = env.robot.panda.get_state()
+    q_curr = np.asarray(robot_state.q, dtype=np.float64).reshape(7)
+    F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
+    EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
+    if franka_model is None or franka_frame is None:
+        franka_model = env.robot.panda.get_robot().load_model()
+        franka_frame = libfranka.Frame.kEndEffector
+
+    if result.topk_centers is not None and result.topk_probs is not None:
+        topk_xyz = []
+        for center in result.topk_centers:
+            q_next, _ = _sanitize_joint_target(args, q_curr, center[:7])
+            pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
+            pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
+            topk_xyz.append(pose[:3, 3])
+        topk_xyz = np.asarray(topk_xyz, dtype=np.float32)
+        curr_pose = np.asarray(robot_state.O_T_EE, dtype=np.float32).reshape(4, 4).T
+        curr_ee_xyz = curr_pose[:3, 3]
+        if plot_xlim is None or plot_ylim is None:
+            xy = np.concatenate([topk_xyz[:, :2], curr_ee_xyz[:2].reshape(1, 2)], axis=0)
+            xy_min = xy.min(axis=0)
+            xy_max = xy.max(axis=0)
+            span = np.maximum(xy_max - xy_min, np.array([0.15, 0.15], dtype=np.float32))
+            pad = 0.25 * span
+            plot_xlim = (float(xy_min[0] - pad[0]), float(xy_max[0] + pad[0]))
+            plot_ylim = (float(xy_min[1] - pad[1]), float(xy_max[1] + pad[1]))
+        plot_path = plot_topk_xy(
+            topk_xyz,
+            result.topk_probs,
+            current_xyz=curr_ee_xyz,
+            xlim=plot_xlim,
+            ylim=plot_ylim,
+        )
+        reactive_desk_client.send_predictions(
+            topk_xyz,
+            result.topk_probs,
+            prompt=instruction,
+            is_executing=True,
+        )
+        print(f"  [TopK] plot saved: {plot_path}")
+        return franka_model, franka_frame, plot_xlim, plot_ylim
+
+    chunk_for_viz = result.action_chunk[result.rtc_skip :]
+    if chunk_for_viz.shape[0] == 0:
+        chunk_for_viz = result.action_chunk[-1:]
+    chunk_xyz = []
+    for chunk_action in chunk_for_viz:
+        q_next, _ = _sanitize_joint_target(args, q_curr, chunk_action[:7])
+        pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
+        pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
+        chunk_xyz.append(pose[:3, 3])
+    chunk_xyz = np.asarray(chunk_xyz, dtype=np.float32)
+    chunk_probs = np.full(chunk_xyz.shape[0], 1.0 / max(chunk_xyz.shape[0], 1), dtype=np.float32)
+    print("send prediction")
+    reactive_desk_client.send_predictions(
+        chunk_xyz,
+        chunk_probs,
+        prompt=instruction,
+        is_executing=True,
+    )
+    return franka_model, franka_frame, plot_xlim, plot_ylim
 
 
 def _hold_current_joint_position(env: FrankaRobotEnv, controller) -> np.ndarray:
@@ -341,6 +473,8 @@ def main(args: Args):
     )
 
     controller = None
+    reactive_desk_client = None
+    policy_executor = None
     live_audio = LiveAudioConditioning(audio_config)
     try:
         controller, gripper_state = _reset_robot(env, controller, settle_s=args.controller_settle_s)
@@ -355,6 +489,7 @@ def main(args: Args):
         plot_ylim: tuple[float, float] | None = None
 
         policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
+        policy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc-policy")
         reactive_desk_client = ReactiveDeskVlaClient(
             host=args.reactive_desk_host,
             port=args.reactive_desk_port,
@@ -374,6 +509,8 @@ def main(args: Args):
             actions_from_chunk_completed = 0
             pred_action_chunk = None
             pred_action_horizon = 0
+            pending_policy_future: concurrent.futures.Future[_PolicyChunkResult] | None = None
+            pending_switch_step = 0
 
             timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")  # noqa: DTZ005
             video = []
@@ -394,13 +531,11 @@ def main(args: Args):
                     wrist_frame = curr_obs["wrist_image"]
                     video.append(np.concatenate([external_frame, wrist_frame], axis=1))
 
-                    effective_horizon = min(
-                        args.open_loop_horizon,
-                        pred_action_horizon or args.open_loop_horizon,
-                    )
-                    if pred_action_chunk is None or actions_from_chunk_completed >= effective_horizon:
-                        actions_from_chunk_completed = 0
-                        request_data = {
+                    topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
+                    topk_draws = int(args.topk_draws) if args.topk_draws is not None else None
+
+                    def build_request_data() -> dict:
+                        request = {
                             "observation/exterior_image_1_left": _center_crop_and_resize(
                                 curr_obs[f"{args.external_camera}_image"]
                             ),
@@ -409,111 +544,79 @@ def main(args: Args):
                             "observation/gripper_position": curr_obs["gripper_position"],
                             "prompt": instruction,
                         }
-                        request_data.update(live_audio.build_request_fields())
-                        # args.topk_samples默认为0,这里的topk_k为0,不进入绘图的分支
-                        topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
+                        request.update(live_audio.build_request_fields())
+                        return request
+
+                    if pred_action_chunk is None:
+                        request_data = build_request_data()
+                        pending_policy_future = policy_executor.submit(
+                            _run_policy_request,
+                            policy_client,
+                            request_data,
+                            topk_k=topk_k,
+                            topk_draws=topk_draws,
+                            rtc_skip=0,
+                        )
                         with prevent_keyboard_interrupt():
-                            # 默认没有进入
-                            if topk_k and topk_k > 1:
-                                # 确定最终的采样次数
-                                topk_samples = (
-                                    int(args.topk_draws) if args.topk_draws is not None else max(4 * topk_k, topk_k + 1)
-                                )
-                                topk_samples = max(topk_samples, topk_k)
-                                pred_action_chunk = _normalize_action_chunk(
-                                    policy_client.infer(request_data)["actions"]
-                                )
-                                samples = [pred_action_chunk[0]]
-                                for _ in range(topk_samples - 1):
-                                    samples.append(
-                                        _normalize_action_chunk(policy_client.infer(request_data)["actions"])[0]
-                                    )
-                                centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
-
-                                robot_state = env.robot.panda.get_state()
-                                q_curr = np.asarray(robot_state.q, dtype=np.float64).reshape(7)
-                                F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
-                                EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
-
-                                topk_xyz = []
-                                for center in centers:
-                                    q_next, _ = _sanitize_joint_target(args, q_curr, center[:7])
-                                    pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
-                                    pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
-                                    topk_xyz.append(pose[:3, 3])
-                                topk_xyz = np.asarray(topk_xyz, dtype=np.float32)
-                                curr_pose = np.asarray(robot_state.O_T_EE, dtype=np.float32).reshape(4, 4).T
-                                curr_ee_xyz = curr_pose[:3, 3]
-                                if plot_xlim is None or plot_ylim is None:
-                                    xy = np.concatenate(
-                                        [
-                                            topk_xyz[:, :2],
-                                            curr_ee_xyz[:2].reshape(1, 2),
-                                        ],
-                                        axis=0,
-                                    )
-                                    xy_min = xy.min(axis=0)
-                                    xy_max = xy.max(axis=0)
-                                    span = np.maximum(
-                                        xy_max - xy_min,
-                                        np.array([0.15, 0.15], dtype=np.float32),
-                                    )
-                                    pad = 0.25 * span
-                                    plot_xlim = (
-                                        float(xy_min[0] - pad[0]),
-                                        float(xy_max[0] + pad[0]),
-                                    )
-                                    plot_ylim = (
-                                        float(xy_min[1] - pad[1]),
-                                        float(xy_max[1] + pad[1]),
-                                    )
-                                plot_path = plot_topk_xy(
-                                    topk_xyz,
-                                    probs,
-                                    current_xyz=curr_ee_xyz,
-                                    xlim=plot_xlim,
-                                    ylim=plot_ylim,
-                                )
-                                reactive_desk_client.send_predictions(
-                                    topk_xyz,
-                                    probs,
-                                    prompt=instruction,
-                                    is_executing=True,
-                                )
-                                print(f"  [TopK] plot saved: {plot_path}")
-                            else:
-                                # 没有画图和kmeans聚类,进入单一预测输出逻辑
-                                pred_action_chunk = _normalize_action_chunk(
-                                    policy_client.infer(request_data)["actions"]
-                                )
-                                # 将action chunk里的joint delta转换为xy传递给reactive desk
-                                robot_state = env.robot.panda.get_state()
-                                q_curr = np.asarray(robot_state.q, dtype=np.float64).reshape(7)
-                                F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
-                                EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
-                                if franka_model is None or franka_frame is None:
-                                    franka_model = env.robot.panda.get_robot().load_model()
-                                    franka_frame = libfranka.Frame.kEndEffector
-                                chunk_xyz = []
-                                for chunk_action in pred_action_chunk:
-                                    q_next, _ = _sanitize_joint_target(args, q_curr, chunk_action[:7])
-                                    pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
-                                    pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
-                                    chunk_xyz.append(pose[:3, 3])
-                                chunk_xyz = np.asarray(chunk_xyz, dtype=np.float32)
-                                chunk_probs = np.full(
-                                    chunk_xyz.shape[0],
-                                    1.0 / max(chunk_xyz.shape[0], 1),
-                                    dtype=np.float32,
-                                )
-                                print("send prediction")
-                                reactive_desk_client.send_predictions(
-                                    chunk_xyz,
-                                    chunk_probs,
-                                    prompt=instruction,
-                                    is_executing=True,
-                                )
+                            policy_result = pending_policy_future.result()
+                        pending_policy_future = None
+                        pred_action_chunk = policy_result.action_chunk
                         pred_action_horizon = pred_action_chunk.shape[0]
+                        actions_from_chunk_completed = 0
+                        franka_model, franka_frame, plot_xlim, plot_ylim = _send_prediction_visualization(
+                            args=args,
+                            env=env,
+                            reactive_desk_client=reactive_desk_client,
+                            instruction=instruction,
+                            result=policy_result,
+                            franka_model=franka_model,
+                            franka_frame=franka_frame,
+                            plot_xlim=plot_xlim,
+                            plot_ylim=plot_ylim,
+                        )
+
+                    effective_horizon = min(args.open_loop_horizon, pred_action_horizon or args.open_loop_horizon)
+                    if pending_policy_future is None and actions_from_chunk_completed >= effective_horizon:
+                        request_data = build_request_data()
+                        rtc_prefix_start = actions_from_chunk_completed
+                        rtc_skip = _attach_rtc_prefix(
+                            request_data,
+                            pred_action_chunk,
+                            rtc_prefix_start,
+                            args.rtc_inference_delay,
+                        )
+                        pending_policy_future = policy_executor.submit(
+                            _run_policy_request,
+                            policy_client,
+                            request_data,
+                            topk_k=topk_k,
+                            topk_draws=topk_draws,
+                            rtc_skip=rtc_skip,
+                        )
+                        pending_switch_step = rtc_prefix_start + rtc_skip
+
+                    if pending_policy_future is not None:
+                        switch_step = min(pending_switch_step, pred_action_horizon)
+                        if actions_from_chunk_completed >= switch_step:
+                            if not pending_policy_future.done():
+                                print("[RTC] waiting for pending policy result")
+                            with prevent_keyboard_interrupt():
+                                policy_result = pending_policy_future.result()
+                            pending_policy_future = None
+                            pred_action_chunk = policy_result.action_chunk
+                            pred_action_horizon = pred_action_chunk.shape[0]
+                            actions_from_chunk_completed = min(policy_result.rtc_skip, max(pred_action_horizon - 1, 0))
+                            franka_model, franka_frame, plot_xlim, plot_ylim = _send_prediction_visualization(
+                                args=args,
+                                env=env,
+                                reactive_desk_client=reactive_desk_client,
+                                instruction=instruction,
+                                result=policy_result,
+                                franka_model=franka_model,
+                                franka_frame=franka_frame,
+                                plot_xlim=plot_xlim,
+                                plot_ylim=plot_ylim,
+                            )
 
                     action = np.asarray(
                         pred_action_chunk[actions_from_chunk_completed],
@@ -555,6 +658,10 @@ def main(args: Args):
                         print(f"[Error] Franka reflex triggered; stopping rollout safely: {msg}")
                         break
                     raise
+
+            if pending_policy_future is not None:
+                pending_policy_future.cancel()
+                pending_policy_future = None
 
             with contextlib.suppress(Exception):
                 _hold_current_joint_position(env, controller)
@@ -630,7 +737,11 @@ def main(args: Args):
         with contextlib.suppress(Exception):
             env.close()
         with contextlib.suppress(Exception):
-            reactive_desk_client.close()
+            if policy_executor is not None:
+                policy_executor.shutdown(wait=False, cancel_futures=True)
+        with contextlib.suppress(Exception):
+            if reactive_desk_client is not None:
+                reactive_desk_client.close()
 
 
 if __name__ == "__main__":

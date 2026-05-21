@@ -1238,6 +1238,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
             use_whisper=True,
             whisper_model_name="openai/whisper-tiny",
+            rtc_train_max_delay=8,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
             # 数据放在openpi的根目录且名称为repo_id
@@ -1259,6 +1260,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
             use_whisper=True,
             whisper_model_name="openai/whisper-tiny",
+            rtc_train_max_delay=8,
         ).get_freeze_filter(),
         ema_decay=None,
     ),

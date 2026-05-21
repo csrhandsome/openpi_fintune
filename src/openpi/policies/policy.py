@@ -20,6 +20,29 @@ from openpi.shared import nnx_utils
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
+_RTC_ACTION_PREFIX_KEYS = ("action_prefix", "rtc/action_prefix", "rtc_action_prefix")
+_RTC_DELAY_KEYS = ("rtc_delay", "rtc/delay", "action_prefix_delay", "delay")
+
+
+def _first_present_flat(data: dict, keys: tuple[str, ...]):
+    flat = flax.traverse_util.flatten_dict(data, sep="/")
+    for key in keys:
+        if key in flat:
+            return flat[key]
+    return None
+
+
+def _contains_flat(data: dict, keys: tuple[str, ...]) -> bool:
+    flat = flax.traverse_util.flatten_dict(data, sep="/")
+    return any(key in flat for key in keys)
+
+
+def _infer_delay_from_prefix(prefix) -> np.ndarray:
+    prefix = np.asarray(prefix)
+    if prefix.ndim < 2:
+        raise ValueError(f"RTC action_prefix must have shape [H, D] or [B, H, D], got {prefix.shape}")
+    return np.asarray(prefix.shape[-2], dtype=np.int32)
+
 
 class Policy(BasePolicy):
     def __init__(
@@ -68,7 +91,16 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        rtc_action_prefix = _first_present_flat(inputs, _RTC_ACTION_PREFIX_KEYS)
+        rtc_delay = _first_present_flat(inputs, _RTC_DELAY_KEYS)
+        if rtc_action_prefix is not None:
+            if not _contains_flat(inputs, ("actions", "action")):
+                inputs["actions"] = rtc_action_prefix
+            if rtc_delay is None:
+                rtc_delay = _infer_delay_from_prefix(rtc_action_prefix)
+
         inputs = self._input_transform(inputs)
+        transformed_action_prefix = inputs.get("actions") if rtc_action_prefix is not None else None
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -80,6 +112,11 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if transformed_action_prefix is not None:
+            if self._is_pytorch_model:
+                raise NotImplementedError("RTC action_prefix inference is only wired for JAX models.")
+            sample_kwargs["action_prefix"] = jnp.asarray(transformed_action_prefix)[None, ...]
+            sample_kwargs["delay"] = jnp.asarray(rtc_delay, dtype=jnp.int32)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

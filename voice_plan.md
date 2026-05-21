@@ -986,3 +986,17 @@ VLM 视觉语言编码器端：图像、语言 token 特征 → 统一作为 K�
   直接打包成可运行的模块！📦实际上双槽到底要怎么样的token维度（现在的token为1一定是错的），现在相当于在采集数
   据的仓库里已经用vr_openpi_lerobot_joint_audio.py把数据采集并vad了，详细见我之前发你的那个数据的.sync.json文
   件。
+
+# 改进点，whisper识别环境音的是不是要改进一下
+Whisper主要强在语音识别，对“咔哒声、摩擦声、液体声、碰撞声”这种非语音事件，可能 AudioMAE、BEATs、PANNs、wav2vec 类模型更合适。
+
+mot来算audio的loss
+
+异步推理的rtc和快传来完成优先可视化
+  1. 当前正在执行老 chunk。
+  2. 执行到 s = open_loop_horizon 时，拿老 chunk 后面即将继续执行的 overlap 段（长度是固定的）作为 action_prefix，异步请求新 chunk。
+  3. 新 chunk 还没回来时，继续执行老 chunk 的 overlap 段。
+  4. 新 chunk 一回来，就切到新 chunk 的 postfix，也就是跳过新 chunk 前面已经由老 chunk 执行过的 prefix。
+  5. 理想情况是 新 chunk 在 overlap 段还没耗尽前回来，这样不会卡顿，也不会把老 chunk 执行完整。
+   
+消融实现asr
