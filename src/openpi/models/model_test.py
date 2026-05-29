@@ -81,6 +81,19 @@ def test_pi0_audio_whisper_baseline_inputs_spec_uses_pooled_feature_dim():
     assert obs_spec.instruction_audio.shape == (2, 384)
 
 
+def test_pi0_audio_guidance_config():
+    config = pi0_audio.Pi0AudioConfig(
+        use_audio_guidance=True,
+        audio_guidance_lambda=2.0,
+    )
+
+    assert config.use_audio_guidance is True
+    assert config.audio_guidance_lambda == 2.0
+
+    with pytest.raises(ValueError, match="audio_guidance_lambda must be >= 0"):
+        pi0_audio.Pi0AudioConfig(audio_guidance_lambda=-0.1)
+
+
 def test_pi0_fast_model():
     key = jax.random.key(0)
     config = pi0_fast.Pi0FASTConfig()
