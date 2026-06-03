@@ -51,6 +51,11 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Use Qwen3-ASR audio encoder instead of Whisper for Pi0Audio configs.
+    qwen: bool = False
+    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
+    qwen_device: str = "auto"
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -89,8 +94,15 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            train_config = _config.get_config(args.policy.config)
+            if args.qwen:
+                train_config = _config.enable_qwen_encoder(
+                    train_config,
+                    qwen_model_name=args.qwen_model_name,
+                    qwen_device=args.qwen_device,
+                )
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                train_config, args.policy.dir, default_prompt=args.default_prompt
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

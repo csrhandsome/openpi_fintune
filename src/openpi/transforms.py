@@ -462,7 +462,9 @@ class ExtractAudioWindow(DataTransformFn):
         if raw_audio is not None:
             sample_rate = _find_first_present(data, self.audio_sample_rate_keys)
             sample_rate = (
-                self.target_sample_rate if sample_rate is None else _as_int(sample_rate, key="ambient_audio_sample_rate")
+                self.target_sample_rate
+                if sample_rate is None
+                else _as_int(sample_rate, key="ambient_audio_sample_rate")
             )
             audio = np.asarray(raw_audio, dtype=np.float32).reshape(-1)
             if sample_rate != self.target_sample_rate:
@@ -704,6 +706,106 @@ class ExtractWhisperAudioEmbedding(DataTransformFn):
         embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if embedding.shape != (expected_dim,):
             raise ValueError(f"Whisper embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
+
+        return {
+            **data,
+            self.audio_key: embedding,
+            self.audio_mask_key: np.True_,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractQwenASRAudioSequence(DataTransformFn):
+    """Encode an audio waveform window into Qwen3-ASR audio-tower features."""
+
+    model_name: str = "Qwen/Qwen3-ASR-0.6B"
+    sample_rate: int = 16_000
+    device: str = "auto"
+    num_frames: int | None = None
+    output_dim: int | None = None
+    audio_key: str = "audio"
+    audio_mask_key: str = "audio_mask"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_audio = data.get(self.audio_key)
+        if raw_audio is None:
+            raise ValueError(f"Qwen ASR sequence extraction requires a `{self.audio_key}` field.")
+
+        raw_mask = data.get(self.audio_mask_key)
+        has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
+        expected_dim = self.output_dim or _audio_tools.infer_qwen_asr_hidden_size(self.model_name)
+        target_num_frames = self.num_frames or _audio_tools.qwen_asr_num_frames_for_duration(
+            int(np.asarray(raw_audio).reshape(-1).shape[0]),
+            sample_rate=self.sample_rate,
+        )
+
+        if not has_audio:
+            return {
+                **data,
+                self.audio_key: np.zeros((target_num_frames, expected_dim), dtype=np.float32),
+                self.audio_mask_key: np.False_,
+            }
+
+        sequence = _audio_tools.compute_qwen_asr_audio_sequence(
+            np.asarray(raw_audio, dtype=np.float32),
+            sample_rate=self.sample_rate,
+            model_name=self.model_name,
+            device=self.device,
+        )
+        sequence = np.asarray(sequence, dtype=np.float32)
+        if sequence.ndim != 2:
+            raise ValueError(f"Qwen ASR sequence must be rank-2, got shape {sequence.shape}")
+        if sequence.shape[-1] != expected_dim:
+            raise ValueError(
+                f"Qwen ASR sequence hidden size mismatch: expected {expected_dim}, got {sequence.shape[-1]}"
+            )
+        sequence = _audio_tools.fit_audio_feature_sequence(sequence, target_num_frames)
+
+        return {
+            **data,
+            self.audio_key: sequence,
+            self.audio_mask_key: np.True_,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractQwenASRAudioEmbedding(DataTransformFn):
+    """Encode an audio waveform window into a pooled Qwen3-ASR embedding."""
+
+    model_name: str = "Qwen/Qwen3-ASR-0.6B"
+    sample_rate: int = 16_000
+    device: str = "auto"
+    pooling: Literal["mean", "first"] = "mean"
+    output_dim: int | None = None
+    audio_key: str = "audio"
+    audio_mask_key: str = "audio_mask"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_audio = data.get(self.audio_key)
+        if raw_audio is None:
+            raise ValueError(f"Qwen ASR embedding extraction requires a `{self.audio_key}` field.")
+
+        raw_mask = data.get(self.audio_mask_key)
+        has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
+        expected_dim = self.output_dim or _audio_tools.infer_qwen_asr_hidden_size(self.model_name)
+
+        if not has_audio:
+            return {
+                **data,
+                self.audio_key: np.zeros((expected_dim,), dtype=np.float32),
+                self.audio_mask_key: np.False_,
+            }
+
+        embedding = _audio_tools.compute_qwen_asr_audio_embedding(
+            np.asarray(raw_audio, dtype=np.float32),
+            sample_rate=self.sample_rate,
+            model_name=self.model_name,
+            device=self.device,
+            pooling=self.pooling,
+        )
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if embedding.shape != (expected_dim,):
+            raise ValueError(f"Qwen ASR embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
 
         return {
             **data,

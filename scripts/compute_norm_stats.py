@@ -86,8 +86,21 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    *,
+    qwen: bool = False,
+    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B",
+    qwen_device: str = "auto",
+):
     config = _config.get_config(config_name)
+    if qwen:
+        config = _config.enable_qwen_encoder(
+            config,
+            qwen_model_name=qwen_model_name,
+            qwen_device=qwen_device,
+        )
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:

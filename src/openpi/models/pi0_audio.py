@@ -78,10 +78,14 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     instruction_audio_num_tokens: int = 24
     audio_resampler_heads: int = 8
     use_whisper: bool = False
+    use_qwen: bool = False
     audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
     whisper_device: str = "cpu"
+    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
+    qwen_output_dim: int | None = None
+    qwen_device: str = "auto"
     use_audio_limoe: bool = False
     audio_limoe_num_experts: int = 4
     audio_limoe_top_k: int = 1
@@ -109,12 +113,16 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("audio_resampler_heads must be > 0")
         if self.audio_tokenizer_type not in ("sequence_resampler", "pooled_baseline"):
             raise ValueError("audio_tokenizer_type must be 'sequence_resampler' or 'pooled_baseline'")
+        if self.use_whisper and self.use_qwen:
+            raise ValueError("use_whisper and use_qwen cannot both be True")
         if self.audio_limoe_num_experts <= 0:
             raise ValueError("audio_limoe_num_experts must be > 0")
         if self.audio_limoe_top_k <= 0:
             raise ValueError("audio_limoe_top_k must be > 0")
         if self.whisper_output_dim is not None and self.whisper_output_dim <= 0:
             raise ValueError("whisper_output_dim must be > 0")
+        if self.qwen_output_dim is not None and self.qwen_output_dim <= 0:
+            raise ValueError("qwen_output_dim must be > 0")
         if self.rtc_train_max_delay < 0:
             raise ValueError("rtc_train_max_delay must be >= 0")
         if self.rtc_train_max_delay >= self.action_horizon:
@@ -128,11 +136,15 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             if self.whisper_output_dim is not None:
                 return self.whisper_output_dim
             return _audio_tools.infer_whisper_hidden_size(self.whisper_model_name)
+        if self.use_qwen:
+            if self.qwen_output_dim is not None:
+                return self.qwen_output_dim
+            return _audio_tools.infer_qwen_asr_hidden_size(self.qwen_model_name)
         return 1
 
     @property
     def ambient_audio_input_shape(self) -> tuple[int, ...]:
-        if self.use_whisper:
+        if self.use_whisper or self.use_qwen:
             if self.audio_tokenizer_type == "pooled_baseline":
                 return (self.audio_feature_dim,)
             return (self.ambient_audio_num_frames, self.audio_feature_dim)
@@ -140,7 +152,7 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def instruction_audio_input_shape(self) -> tuple[int, ...]:
-        if self.use_whisper:
+        if self.use_whisper or self.use_qwen:
             if self.audio_tokenizer_type == "pooled_baseline":
                 return (self.audio_feature_dim,)
             return (self.instruction_audio_num_frames, self.audio_feature_dim)
@@ -152,6 +164,11 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def ambient_audio_num_frames(self) -> int:
+        if self.use_qwen:
+            return _audio_tools.qwen_asr_num_frames_for_duration(
+                self.ambient_audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+            )
         return _audio_tools.whisper_num_frames_for_duration(
             self.ambient_audio_num_samples,
             sample_rate=self.audio_sample_rate,
@@ -159,6 +176,11 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def instruction_audio_num_frames(self) -> int:
+        if self.use_qwen:
+            return _audio_tools.qwen_asr_num_frames_for_duration(
+                self.instruction_audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+            )
         return _audio_tools.whisper_num_frames_for_duration(
             self.instruction_audio_num_samples,
             sample_rate=self.audio_sample_rate,

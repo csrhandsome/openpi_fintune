@@ -6,6 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
+import sys
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -560,10 +561,16 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
                     instruction_audio_num_samples=model_config.instruction_audio_num_samples,
                     audio_sample_rate=model_config.audio_sample_rate,
                     use_whisper=model_config.use_whisper,
+                    use_qwen=model_config.use_qwen,
                     audio_tokenizer_type=model_config.audio_tokenizer_type,
                     whisper_model_name=model_config.whisper_model_name,
                     whisper_output_dim=model_config.audio_feature_dim,
                     whisper_device=model_config.whisper_device,
+                    qwen_model_name=model_config.qwen_model_name,
+                    qwen_output_dim=model_config.audio_feature_dim
+                    if model_config.use_qwen
+                    else model_config.qwen_output_dim,
+                    qwen_device=model_config.qwen_device,
                     dataset_root=dataset_root,
                     audio_fallback_fps=self.audio_fallback_fps,
                     audio_strict=self.audio_strict,
@@ -1337,8 +1344,75 @@ if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
+def enable_qwen_encoder(
+    config: TrainConfig,
+    *,
+    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B",
+    qwen_device: str = "auto",
+    instruction_audio_num_samples: int = 32_000,
+    instruction_audio_num_tokens: int = 24,
+) -> TrainConfig:
+    if not isinstance(config.model, pi0_audio.Pi0AudioConfig):
+        raise TypeError("--qwen can only be used with Pi0AudioConfig-based configs.")
+
+    model = dataclasses.replace(
+        config.model,
+        use_whisper=False,
+        use_qwen=True,
+        qwen_model_name=qwen_model_name,
+        qwen_output_dim=None,
+        qwen_device=qwen_device,
+        instruction_audio_num_samples=instruction_audio_num_samples,
+        instruction_audio_num_tokens=instruction_audio_num_tokens,
+    )
+    return dataclasses.replace(
+        config,
+        model=model,
+        freeze_filter=model.get_freeze_filter(),
+    )
+
+
+def _pop_cli_value(argv: list[str], name: str, default: str) -> str:
+    flag = f"--{name}"
+    for index, arg in enumerate(list(argv)):
+        if arg == flag:
+            if index + 1 >= len(argv):
+                raise ValueError(f"{flag} requires a value")
+            value = argv[index + 1]
+            del argv[index : index + 2]
+            return value
+        if arg.startswith(f"{flag}="):
+            del argv[index]
+            return arg.split("=", 1)[1]
+    return default
+
+
+def _pop_cli_bool(argv: list[str], name: str) -> bool:
+    flag = f"--{name}"
+    for index, arg in enumerate(list(argv)):
+        if arg == flag:
+            del argv[index]
+            return True
+        if arg.startswith(f"{flag}="):
+            del argv[index]
+            value = arg.split("=", 1)[1].lower()
+            return value in ("1", "true", "yes", "on")
+    return False
+
+
 def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+    argv = sys.argv
+    qwen = _pop_cli_bool(argv, "qwen")
+    qwen_model_name = _pop_cli_value(argv, "qwen-model-name", "Qwen/Qwen3-ASR-0.6B")
+    qwen_device = _pop_cli_value(argv, "qwen-device", "auto")
+    config = tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+    if qwen:
+        config = enable_qwen_encoder(
+            config,
+            qwen_model_name=qwen_model_name,
+            qwen_device=qwen_device,
+        )
+    return config
 
 
 def get_config(config_name: str) -> TrainConfig:

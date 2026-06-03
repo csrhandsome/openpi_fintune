@@ -32,6 +32,12 @@ _WHISPER_HIDDEN_SIZES = {
 }
 
 
+_QWEN_ASR_HIDDEN_SIZES = {
+    "Qwen/Qwen3-ASR-0.6B": 1024,
+    "Qwen/Qwen3-ASR-1.7B": 2048,
+}
+
+
 def infer_whisper_hidden_size(model_name: str) -> int:
     try:
         return _WHISPER_HIDDEN_SIZES[model_name]
@@ -39,6 +45,16 @@ def infer_whisper_hidden_size(model_name: str) -> int:
         raise ValueError(
             f"Unsupported Whisper model '{model_name}'. "
             "Set whisper_output_dim explicitly or extend _WHISPER_HIDDEN_SIZES."
+        ) from exc
+
+
+def infer_qwen_asr_hidden_size(model_name: str) -> int:
+    try:
+        return _QWEN_ASR_HIDDEN_SIZES[model_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Qwen ASR model {model_name!r}. "
+            "Set qwen_output_dim explicitly or extend _QWEN_ASR_HIDDEN_SIZES."
         ) from exc
 
 
@@ -67,6 +83,31 @@ def _load_whisper_components(model_name: str, device: str):
     return feature_extractor, model, resolved_device
 
 
+@functools.lru_cache(maxsize=4)
+def _load_qwen_asr_components(model_name: str, device: str):
+    import torch
+
+    try:
+        from qwen_asr.core.transformers_backend import Qwen3ASRForConditionalGeneration
+        from qwen_asr.core.transformers_backend import Qwen3ASRProcessor
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen ASR encoder extraction requires the local `qwen-asr` package. "
+            "Install/sync the third_party/Qwen3-ASR path dependency before running with --qwen."
+        ) from exc
+
+    resolved_device = _resolve_whisper_device(device)
+    dtype = torch.bfloat16 if resolved_device.startswith("cuda") else torch.float32
+    processor = Qwen3ASRProcessor.from_pretrained(model_name)
+    model = Qwen3ASRForConditionalGeneration.from_pretrained(
+        model_name,
+        dtype=dtype,
+    )
+    model.eval()
+    model.to(resolved_device)
+    return processor, model, resolved_device
+
+
 def compute_whisper_audio_embedding(
     audio: np.ndarray,
     *,
@@ -79,9 +120,7 @@ def compute_whisper_audio_embedding(
     if audio.ndim != 1:
         raise ValueError(f"Expected 1D audio, got shape {audio.shape}")
 
-    feature_extractor, model, resolved_device = _load_whisper_components(
-        model_name, device
-    )
+    feature_extractor, model, resolved_device = _load_whisper_components(model_name, device)
 
     import torch
 
@@ -115,9 +154,7 @@ def compute_whisper_audio_sequence(
     if audio.ndim != 1:
         raise ValueError(f"Expected 1D audio, got shape {audio.shape}")
 
-    feature_extractor, model, resolved_device = _load_whisper_components(
-        model_name, device
-    )
+    feature_extractor, model, resolved_device = _load_whisper_components(model_name, device)
 
     import torch
 
@@ -142,6 +179,70 @@ def compute_whisper_audio_sequence(
     return hidden[0, :real_num_frames].to(dtype=torch.float32, device="cpu").numpy()
 
 
+def compute_qwen_asr_audio_sequence(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    model_name: str,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Extract Qwen3-ASR audio-tower features without running text decoding."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.ndim != 1:
+        raise ValueError(f"Expected 1D audio, got shape {audio.shape}")
+
+    processor, model, resolved_device = _load_qwen_asr_components(model_name, device)
+
+    import torch
+
+    inputs = processor.feature_extractor(
+        audio,
+        sampling_rate=sample_rate,
+        padding=True,
+        truncation=False,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    input_features = inputs["input_features"].to(resolved_device)
+    feature_attention_mask = inputs["attention_mask"].to(resolved_device)
+    if resolved_device.startswith("cuda"):
+        input_features = input_features.to(dtype=torch.bfloat16)
+
+    with torch.inference_mode():
+        hidden = model.thinker.get_audio_features(
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+        )
+
+    if hidden.ndim == 3:
+        hidden = hidden[0]
+    if hidden.ndim != 2:
+        raise ValueError(f"Expected Qwen audio features with shape [T, D], got {tuple(hidden.shape)}")
+
+    return hidden.to(dtype=torch.float32, device="cpu").numpy()
+
+
+def compute_qwen_asr_audio_embedding(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    model_name: str,
+    device: str = "cpu",
+    pooling: str = "mean",
+) -> np.ndarray:
+    sequence = compute_qwen_asr_audio_sequence(
+        audio,
+        sample_rate=sample_rate,
+        model_name=model_name,
+        device=device,
+    )
+    if pooling == "mean":
+        return np.mean(sequence, axis=0, dtype=np.float32)
+    if pooling == "first":
+        return np.asarray(sequence[0], dtype=np.float32)
+    raise ValueError(f"Unsupported Qwen ASR pooling {pooling!r}")
+
+
 def whisper_num_frames_for_duration(
     num_samples: int,
     *,
@@ -151,6 +252,28 @@ def whisper_num_frames_for_duration(
     if num_samples <= 0:
         return 1
     return max(1, int(round(float(num_samples) / float(sample_rate) * 50.0)))
+
+
+def qwen_asr_num_frames_for_duration(
+    num_samples: int,
+    *,
+    sample_rate: int,
+) -> int:
+    """Approximate Qwen3-ASR audio-tower output length at 12.5 Hz."""
+    if num_samples <= 0:
+        return 1
+    feature_frames = max(1, round(float(num_samples) / float(sample_rate) * 100.0))
+    return qwen_asr_num_frames_for_feature_frames(feature_frames)
+
+
+def qwen_asr_num_frames_for_feature_frames(num_feature_frames: int) -> int:
+    """Mirror Qwen3-ASR audio feature length calculation."""
+    if num_feature_frames <= 0:
+        return 1
+    residual = num_feature_frames % 100
+    feat_lengths = (residual - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (num_feature_frames // 100) * 13
+    return max(1, output_lengths)
 
 
 def fit_audio_feature_sequence(
@@ -175,9 +298,7 @@ def episode_audio_stem(episode_index: int) -> str:
     return f"episode_{int(episode_index):06d}"
 
 
-def resolve_episode_audio_paths(
-    dataset_root: str | Path, episode_index: int
-) -> tuple[Path, Path]:
+def resolve_episode_audio_paths(dataset_root: str | Path, episode_index: int) -> tuple[Path, Path]:
     audio_dir = Path(dataset_root) / "audio"
     stem = episode_audio_stem(episode_index)
     return audio_dir / f"{stem}.wav", audio_dir / f"{stem}.sync.json"
@@ -240,9 +361,7 @@ def read_wav_mono(path: str | Path) -> tuple[np.ndarray, int]:
     return np.ascontiguousarray(audio, dtype=np.float32), sample_rate
 
 
-def resolve_audio_path_from_sync(
-    dataset_root: str | Path, sync_data: dict | None
-) -> Path | None:
+def resolve_audio_path_from_sync(dataset_root: str | Path, sync_data: dict | None) -> Path | None:
     if not sync_data:
         return None
     raw_audio_path = sync_data.get("audio_path")
@@ -255,9 +374,7 @@ def resolve_audio_path_from_sync(
     return Path(dataset_root) / audio_path
 
 
-def resolve_dataset_path(
-    dataset_root: str | Path, raw_path: str | Path | None
-) -> Path | None:
+def resolve_dataset_path(dataset_root: str | Path, raw_path: str | Path | None) -> Path | None:
     if raw_path is None:
         return None
     path = Path(str(raw_path))
@@ -288,27 +405,15 @@ def frame_range_to_audio_samples(
     fps: float,
 ) -> tuple[int, int]:
     fps_safe = max(float(fps), 1e-6)
-    fallback_start = int(
-        np.clip(
-            round((start_frame_index / fps_safe) * sample_rate), 0, audio_total_samples
-        )
-    )
-    fallback_end = int(
-        np.clip(
-            round((end_frame_index / fps_safe) * sample_rate), 0, audio_total_samples
-        )
-    )
+    fallback_start = int(np.clip(round((start_frame_index / fps_safe) * sample_rate), 0, audio_total_samples))
+    fallback_end = int(np.clip(round((end_frame_index / fps_safe) * sample_rate), 0, audio_total_samples))
 
     if not sync_data:
         return fallback_start, max(fallback_start, fallback_end)
 
     audio_start_ns = _safe_int(sync_data.get("audio_start_monotonic_ns"))
     frame_records = sync_data.get("frame_records")
-    if (
-        audio_start_ns is None
-        or not isinstance(frame_records, list)
-        or not frame_records
-    ):
+    if audio_start_ns is None or not isinstance(frame_records, list) or not frame_records:
         return fallback_start, max(fallback_start, fallback_end)
 
     start_record = get_frame_record(frame_records, start_frame_index)
@@ -318,11 +423,7 @@ def frame_range_to_audio_samples(
         return fallback_start, max(fallback_start, fallback_end)
 
     start_ns = _safe_int(start_record.get("host_frame_monotonic_ns"))
-    end_ns = (
-        _safe_int(next_record.get("host_frame_monotonic_ns"))
-        if next_record is not None
-        else None
-    )
+    end_ns = _safe_int(next_record.get("host_frame_monotonic_ns")) if next_record is not None else None
     if end_ns is None:
         last_ns = _safe_int(end_record.get("host_frame_monotonic_ns"))
         if last_ns is not None:
@@ -348,9 +449,7 @@ def frame_range_to_audio_samples(
     return start_sample, max(start_sample, end_sample)
 
 
-def resample_audio(
-    audio: np.ndarray, orig_sample_rate: int, target_sample_rate: int
-) -> np.ndarray:
+def resample_audio(audio: np.ndarray, orig_sample_rate: int, target_sample_rate: int) -> np.ndarray:
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim != 1:
         raise ValueError(f"Expected mono audio, got shape {audio.shape}")
@@ -359,12 +458,8 @@ def resample_audio(
 
     target_len = max(round(audio.shape[0] * target_sample_rate / orig_sample_rate), 1)
     source_positions = np.arange(audio.shape[0], dtype=np.float32)
-    target_positions = np.linspace(
-        0, audio.shape[0] - 1, num=target_len, dtype=np.float32
-    )
-    return np.ascontiguousarray(
-        np.interp(target_positions, source_positions, audio).astype(np.float32)
-    )
+    target_positions = np.linspace(0, audio.shape[0] - 1, num=target_len, dtype=np.float32)
+    return np.ascontiguousarray(np.interp(target_positions, source_positions, audio).astype(np.float32))
 
 
 def fit_audio_window(audio: np.ndarray, window_num_samples: int) -> np.ndarray:
@@ -407,9 +502,7 @@ def find_latest_completed_vad_segment(
     return latest_segment
 
 
-def block_frames_for_sample_rate(
-    sample_rate: int, *, block_duration_s: float = 0.05
-) -> int:
+def block_frames_for_sample_rate(sample_rate: int, *, block_duration_s: float = 0.05) -> int:
     return max(256, int(round(int(sample_rate) * float(block_duration_s))))
 
 
@@ -477,9 +570,9 @@ def resolve_preferred_input_device() -> int | str | None:
     if isinstance(valid_default, int):
         try:
             default_info = devices[valid_default]
-            if int(
-                default_info.get("max_input_channels", 0)
-            ) > 0 and _looks_like_usb_input_device(default_info.get("name")):
+            if int(default_info.get("max_input_channels", 0)) > 0 and _looks_like_usb_input_device(
+                default_info.get("name")
+            ):
                 return valid_default
         except Exception:
             pass
@@ -577,9 +670,7 @@ def _live_microphone_buffer_worker_main(
     requested_sample_rate = int(sample_rate)
     resolved_sample_rate = int(sample_rate)
     resolved_input_device = _normalize_input_device(input_device)
-    block_frames = block_frames_for_sample_rate(
-        resolved_sample_rate, block_duration_s=block_duration_s
-    )
+    block_frames = block_frames_for_sample_rate(resolved_sample_rate, block_duration_s=block_duration_s)
     default_window_num_samples = int(window_num_samples)
     effective_buffer_num_samples = int(buffer_num_samples)
 
@@ -657,9 +748,7 @@ def _live_microphone_buffer_worker_main(
         window_num_samples_override: int | None = None,
     ) -> tuple[np.ndarray, bool]:
         current_window_num_samples = (
-            default_window_num_samples
-            if window_num_samples_override is None
-            else int(window_num_samples_override)
+            default_window_num_samples if window_num_samples_override is None else int(window_num_samples_override)
         )
         if current_window_num_samples <= 0:
             raise ValueError("window num_samples must be > 0")
@@ -698,9 +787,7 @@ def _live_microphone_buffer_worker_main(
 
         _reset_buffer()
         resolved_input_device = (
-            _normalize_input_device(input_device)
-            if input_device is not None
-            else resolve_preferred_input_device()
+            _normalize_input_device(input_device) if input_device is not None else resolve_preferred_input_device()
         )
         resolved_sample_rate = resolve_supported_input_sample_rate(
             input_device=resolved_input_device,
@@ -721,9 +808,7 @@ def _live_microphone_buffer_worker_main(
                 target_sample_rate=requested_sample_rate,
             ),
         )
-        block_frames = block_frames_for_sample_rate(
-            resolved_sample_rate, block_duration_s=block_duration_s
-        )
+        block_frames = block_frames_for_sample_rate(resolved_sample_rate, block_duration_s=block_duration_s)
         stream_obj = sd.InputStream(
             samplerate=resolved_sample_rate,
             channels=channels,
@@ -758,9 +843,7 @@ def _live_microphone_buffer_worker_main(
                     action = command.get("cmd")
                     if action == "window":
                         try:
-                            conn.send(
-                                _window_response(_requested_window_num_samples(command))
-                            )
+                            conn.send(_window_response(_requested_window_num_samples(command)))
                         except Exception as exc:
                             conn.send({"ok": False, "error": str(exc), **_summary()})
                     elif action == "reset":
@@ -817,9 +900,7 @@ def _live_microphone_buffer_worker_main(
                 conn.send({"ok": True})
                 return
             else:
-                conn.send(
-                    {"ok": False, "error": f"Unknown command: {action}", **_summary()}
-                )
+                conn.send({"ok": False, "error": f"Unknown command: {action}", **_summary()})
     finally:
         _close_stream()
 
@@ -853,9 +934,7 @@ class MultiprocessAudioBuffer:
         self._channels = int(channels)
         self._dtype = np.dtype(dtype)
         if self._dtype.kind not in {"i", "u"}:
-            raise ValueError(
-                "Only integer PCM dtypes are supported for live microphone capture"
-            )
+            raise ValueError("Only integer PCM dtypes are supported for live microphone capture")
         self._window_num_samples = int(window_num_samples)
         self._buffer_num_samples = int(buffer_num_samples)
         self._block_duration_s = float(block_duration_s)
@@ -894,9 +973,7 @@ class MultiprocessAudioBuffer:
         )
 
     def _ensure_worker_started(self) -> None:
-        if self._proc is None or (
-            self._proc.exitcode is not None and not self._proc.is_alive()
-        ):
+        if self._proc is None or (self._proc.exitcode is not None and not self._proc.is_alive()):
             self._spawn_worker()
         if self._proc is None:
             raise RuntimeError("Microphone worker process is not initialized")
@@ -913,9 +990,7 @@ class MultiprocessAudioBuffer:
         try:
             self._parent_conn.send(command)
             if not self._parent_conn.poll(timeout_s):
-                raise RuntimeError(
-                    f"Microphone worker did not respond to {command.get('cmd')}"
-                )
+                raise RuntimeError(f"Microphone worker did not respond to {command.get('cmd')}")
             response = self._parent_conn.recv()
         except Exception:
             self.stop()
@@ -931,9 +1006,7 @@ class MultiprocessAudioBuffer:
     def start(self) -> None:
         response = self._request({"cmd": "start"}, timeout_s=10.0)
         if not response.get("ok", False):
-            raise RuntimeError(
-                str(response.get("error", "Failed to start microphone recording"))
-            )
+            raise RuntimeError(str(response.get("error", "Failed to start microphone recording")))
         self._is_recording = True
 
     def stop(self) -> None:
@@ -971,34 +1044,22 @@ class MultiprocessAudioBuffer:
         _, has_audio = self.read_window()
         return has_audio
 
-    def read_window(
-        self, window_num_samples: int | None = None
-    ) -> tuple[np.ndarray, bool]:
+    def read_window(self, window_num_samples: int | None = None) -> tuple[np.ndarray, bool]:
         if not self._is_recording:
             raise RuntimeError("Microphone recording has not been started.")
-        current_window_num_samples = (
-            self._window_num_samples
-            if window_num_samples is None
-            else int(window_num_samples)
-        )
+        current_window_num_samples = self._window_num_samples if window_num_samples is None else int(window_num_samples)
         if current_window_num_samples <= 0:
             raise ValueError("window_num_samples must be > 0")
-        response = self._request(
-            {"cmd": "window", "num_samples": current_window_num_samples}, timeout_s=5.0
-        )
+        response = self._request({"cmd": "window", "num_samples": current_window_num_samples}, timeout_s=5.0)
         if not response.get("ok", False):
-            raise RuntimeError(
-                str(response.get("error", "Failed to read microphone window"))
-            )
+            raise RuntimeError(str(response.get("error", "Failed to read microphone window")))
         raw_audio = response.get("audio")
         audio = (
             np.zeros((current_window_num_samples,), dtype=np.float32)
             if raw_audio is None
             else np.asarray(raw_audio, dtype=np.float32)
         )
-        return fit_audio_window(audio, current_window_num_samples), bool(
-            response.get("has_audio", False)
-        )
+        return fit_audio_window(audio, current_window_num_samples), bool(response.get("has_audio", False))
 
     def read_window_for_duration(
         self,
@@ -1024,22 +1085,14 @@ def extract_episode_audio_window(
     target_sample_rate: int,
     fallback_fps: float,
 ) -> tuple[np.ndarray, bool]:
-    default_audio_path, sync_path = resolve_episode_audio_paths(
-        dataset_root, episode_index
-    )
+    default_audio_path, sync_path = resolve_episode_audio_paths(dataset_root, episode_index)
     sync_data = load_json(sync_path)
-    audio_path = (
-        resolve_audio_path_from_sync(dataset_root, sync_data) or default_audio_path
-    )
+    audio_path = resolve_audio_path_from_sync(dataset_root, sync_data) or default_audio_path
     if not audio_path.is_file():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     audio, sample_rate = read_wav_mono(audio_path)
-    fps = (
-        float(sync_data.get("control_frequency", fallback_fps))
-        if sync_data
-        else float(fallback_fps)
-    )
+    fps = float(sync_data.get("control_frequency", fallback_fps)) if sync_data else float(fallback_fps)
     _, end_sample = frame_range_to_audio_samples(
         sync_data=sync_data,
         start_frame_index=frame_index,
@@ -1072,25 +1125,17 @@ def extract_episode_instruction_audio(
     target_sample_rate: int,
     fallback_fps: float,
 ) -> tuple[np.ndarray, bool]:
-    default_audio_path, sync_path = resolve_episode_audio_paths(
-        dataset_root, episode_index
-    )
+    default_audio_path, sync_path = resolve_episode_audio_paths(dataset_root, episode_index)
     sync_data = load_json(sync_path)
     if not sync_data:
         return np.zeros((window_num_samples,), dtype=np.float32), False
 
-    audio_path = (
-        resolve_audio_path_from_sync(dataset_root, sync_data) or default_audio_path
-    )
+    audio_path = resolve_audio_path_from_sync(dataset_root, sync_data) or default_audio_path
     if not audio_path.is_file():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     full_audio, sample_rate = read_wav_mono(audio_path)
-    fps = (
-        float(sync_data.get("control_frequency", fallback_fps))
-        if sync_data
-        else float(fallback_fps)
-    )
+    fps = float(sync_data.get("control_frequency", fallback_fps)) if sync_data else float(fallback_fps)
     _, current_end_sample = frame_range_to_audio_samples(
         sync_data=sync_data,
         start_frame_index=frame_index,

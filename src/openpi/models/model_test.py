@@ -61,10 +61,26 @@ def test_pi0_audio_whisper_inputs_spec_uses_feature_dim():
 
     assert config.audio_feature_dim == 384
     assert config.ambient_audio_num_frames == 50
-    assert config.instruction_audio_num_frames == 250
+    assert config.instruction_audio_num_frames == 50
     assert obs_spec.audio.shape == (2, 50, 384)
     assert obs_spec.ambient_audio.shape == (2, 50, 384)
-    assert obs_spec.instruction_audio.shape == (2, 250, 384)
+    assert obs_spec.instruction_audio.shape == (2, 50, 384)
+
+
+def test_pi0_audio_qwen_inputs_spec_uses_feature_dim():
+    config = pi0_audio.Pi0AudioConfig(
+        use_qwen=True,
+        qwen_model_name="Qwen/Qwen3-ASR-0.6B",
+        instruction_audio_num_samples=32_000,
+    )
+    obs_spec, _ = config.inputs_spec(batch_size=2)
+
+    assert config.audio_feature_dim == 1024
+    assert config.ambient_audio_num_frames == 13
+    assert config.instruction_audio_num_frames == 26
+    assert obs_spec.audio.shape == (2, 13, 1024)
+    assert obs_spec.ambient_audio.shape == (2, 13, 1024)
+    assert obs_spec.instruction_audio.shape == (2, 26, 1024)
 
 
 def test_pi0_audio_whisper_baseline_inputs_spec_uses_pooled_feature_dim():

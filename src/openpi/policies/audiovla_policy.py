@@ -5,6 +5,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.shared import audio_tools as _audio_tools
 
 
 def make_audiovla_example() -> dict:
@@ -57,10 +58,14 @@ class AudiovlaInputs(transforms.DataTransformFn):
     instruction_audio_num_samples: int | None = None
     audio_sample_rate: int = 16_000
     use_whisper: bool = False
+    use_qwen: bool = False
     audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
     whisper_device: str = "cpu"
+    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
+    qwen_output_dim: int | None = None
+    qwen_device: str = "auto"
     dataset_root: str | None = None
     audio_fallback_fps: float = 20.0
     audio_strict: bool = True
@@ -154,7 +159,59 @@ class AudiovlaInputs(transforms.DataTransformFn):
             fallback_fps=self.audio_fallback_fps,
             strict=self.audio_strict,
         )(outputs)
-        if not self.use_whisper:
+        if self.use_whisper and self.use_qwen:
+            raise ValueError("use_whisper and use_qwen cannot both be True.")
+        if not self.use_whisper and not self.use_qwen:
+            return outputs
+
+        if self.use_qwen:
+            if self.audio_tokenizer_type == "pooled_baseline":
+                outputs = transforms.ExtractQwenASRAudioEmbedding(
+                    model_name=self.qwen_model_name,
+                    sample_rate=self.audio_sample_rate,
+                    device=self.qwen_device,
+                    output_dim=self.qwen_output_dim,
+                    audio_key="ambient_audio",
+                    audio_mask_key="ambient_audio_mask",
+                )(outputs)
+                outputs = transforms.ExtractQwenASRAudioEmbedding(
+                    model_name=self.qwen_model_name,
+                    sample_rate=self.audio_sample_rate,
+                    device=self.qwen_device,
+                    output_dim=self.qwen_output_dim,
+                    audio_key="instruction_audio",
+                    audio_mask_key="instruction_audio_mask",
+                )(outputs)
+                outputs["audio"] = outputs["ambient_audio"]
+                outputs["audio_mask"] = outputs["ambient_audio_mask"]
+                return outputs
+
+            outputs = transforms.ExtractQwenASRAudioSequence(
+                model_name=self.qwen_model_name,
+                sample_rate=self.audio_sample_rate,
+                device=self.qwen_device,
+                num_frames=_audio_tools.qwen_asr_num_frames_for_duration(
+                    self.audio_num_samples,
+                    sample_rate=self.audio_sample_rate,
+                ),
+                output_dim=self.qwen_output_dim,
+                audio_key="ambient_audio",
+                audio_mask_key="ambient_audio_mask",
+            )(outputs)
+            outputs = transforms.ExtractQwenASRAudioSequence(
+                model_name=self.qwen_model_name,
+                sample_rate=self.audio_sample_rate,
+                device=self.qwen_device,
+                num_frames=_audio_tools.qwen_asr_num_frames_for_duration(
+                    instruction_num_samples,
+                    sample_rate=self.audio_sample_rate,
+                ),
+                output_dim=self.qwen_output_dim,
+                audio_key="instruction_audio",
+                audio_mask_key="instruction_audio_mask",
+            )(outputs)
+            outputs["audio"] = outputs["ambient_audio"]
+            outputs["audio_mask"] = outputs["ambient_audio_mask"]
             return outputs
 
         if self.audio_tokenizer_type == "pooled_baseline":
@@ -182,7 +239,7 @@ class AudiovlaInputs(transforms.DataTransformFn):
             model_name=self.whisper_model_name,
             sample_rate=self.audio_sample_rate,
             device=self.whisper_device,
-            num_frames=transforms._audio_tools.whisper_num_frames_for_duration(
+            num_frames=_audio_tools.whisper_num_frames_for_duration(
                 self.audio_num_samples,
                 sample_rate=self.audio_sample_rate,
             ),
@@ -194,7 +251,7 @@ class AudiovlaInputs(transforms.DataTransformFn):
             model_name=self.whisper_model_name,
             sample_rate=self.audio_sample_rate,
             device=self.whisper_device,
-            num_frames=transforms._audio_tools.whisper_num_frames_for_duration(
+            num_frames=_audio_tools.whisper_num_frames_for_duration(
                 instruction_num_samples,
                 sample_rate=self.audio_sample_rate,
             ),
