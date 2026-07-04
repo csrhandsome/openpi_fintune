@@ -17,15 +17,18 @@ uv run vla-scripts/realworld/franka_droid_main.py \
 
 # joint 推理
 uv run vla-scripts/realworld/franka_joint_main_audio.py \
-    --remote-host 192.168.5.55 \
+    --remote-host 192.168.5.54 \
     --remote-port 8001 \
     --franka-hostname 192.168.1.100 \
     --external-camera-serial 825412070292 \
     --wrist-camera-serial 825412070487 \
     --color-only \
-    --instruction "Place the object into the basket" \
-    --control-frequency-hz 20
-
+    --instruction "Place the object into the bassket" \
+    --control-frequency-hz 13 \
+    --open-loop-horizon 24 --rtc-inference-delay 8 \
+    --max-joint-delta 0.1
+    # rtc_inference_delay < open_loop_horizon
+    # open_loop_horizon + rtc_inference_delay <= action_horizon
 
 # franka 推理 5090
 uv run vla-scripts/realworld/franka_droid_main.py \

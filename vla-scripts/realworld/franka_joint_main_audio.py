@@ -21,6 +21,7 @@ from panda_py import libfranka
 import pandas as pd
 from PIL import Image
 from plot_topk import plot_topk_xy
+from tqdm import tqdm
 import tyro
 
 from openpi.serving.reactive_desk_vla_client import ReactiveDeskVlaClient
@@ -28,6 +29,17 @@ from openpi.serving.reactive_desk_vla_client import ReactiveDeskVlaClient
 DEFAULT_CONTROL_FREQUENCY = 30.0
 GRIPPER_OPEN = 1.0
 GRIPPER_CLOSED = 0.0
+CUSTOM_START_JOINT_POSITION: tuple[float, ...] = (
+    0.00388,
+    -0.45916,
+    -0.15237,
+    -2.47266,
+    -0.06778,
+    1.96442,
+    0.70214,
+)
+
+
 FRANKA_JOINT_LIMITS = np.array(
     [
         [-2.8973, 2.8973],
@@ -177,21 +189,43 @@ def _kmeans_topk(samples: np.ndarray, k: int = 3, iters: int = 20) -> tuple[np.n
 
 
 
+def _rtc_prefix_from_chunk(
+    previous_chunk: np.ndarray | None,
+    prefix_start: int,
+    delay: int,
+) -> np.ndarray | None:
+    if previous_chunk is None or delay <= 0:
+        return None
+    chunk = np.asarray(previous_chunk, dtype=np.float32)
+    if chunk.ndim != 2:
+        return None
+    prefix = chunk[int(prefix_start) : int(prefix_start) + int(delay)]
+    if prefix.shape[0] == 0:
+        return None
+    return prefix
+
+
+def _rtc_skip_for_chunk(
+    previous_chunk: np.ndarray | None,
+    prefix_start: int,
+    delay: int,
+) -> int:
+    prefix = _rtc_prefix_from_chunk(previous_chunk, prefix_start, delay)
+    return 0 if prefix is None else int(prefix.shape[0])
+
+
 def _attach_rtc_prefix(
     request_data: dict,
     previous_chunk: np.ndarray | None,
     prefix_start: int,
     delay: int,
 ) -> int:
-    if previous_chunk is None or delay <= 0:
+    prefix = _rtc_prefix_from_chunk(previous_chunk, prefix_start, delay)
+    if prefix is None:
         return 0
-    chunk = np.asarray(previous_chunk, dtype=np.float32)
-    if chunk.ndim != 2:
-        return 0
-    prefix = chunk[int(prefix_start) : int(prefix_start) + int(delay)]
-    if prefix.shape[0] == 0:
-        return 0
-    request_data["action_prefix"] = prefix
+    padded_prefix = np.zeros_like(np.asarray(previous_chunk, dtype=np.float32))
+    padded_prefix[: prefix.shape[0]] = prefix
+    request_data["action_prefix"] = padded_prefix
     request_data["rtc_delay"] = np.asarray(prefix.shape[0], dtype=np.int32)
     return int(prefix.shape[0])
 
@@ -211,6 +245,12 @@ class _PolicyChunkResult:
     rtc_skip: int
     topk_centers: np.ndarray | None = None
     topk_probs: np.ndarray | None = None
+    # Wall-clock time spent inside policy_client.infer for this request (sum over draws for top-k).
+    infer_time_s: float = 0.0
+    # Number of policy_client.infer calls issued for this request (>1 only for top-k).
+    infer_calls: int = 0
+    # Wall-clock time spent preparing request fields before policy_client.infer.
+    request_build_time_s: float = 0.0
 
 
 def _run_policy_request(
@@ -224,19 +264,92 @@ def _run_policy_request(
     if topk_k and topk_k > 1:
         sample_count = topk_draws if topk_draws is not None else max(4 * topk_k, topk_k + 1)
         sample_count = max(int(sample_count), topk_k)
+        infer_start = time.monotonic()
         action_chunk = _normalize_action_chunk(policy_client.infer(request_data)["actions"])
         sample_index = min(int(rtc_skip), action_chunk.shape[0] - 1)
         samples = [action_chunk[sample_index]]
         for _ in range(sample_count - 1):
             sample_chunk = _normalize_action_chunk(policy_client.infer(request_data)["actions"])
             samples.append(sample_chunk[min(int(rtc_skip), sample_chunk.shape[0] - 1)])
+        infer_time_s = time.monotonic() - infer_start
         centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
-        return _PolicyChunkResult(action_chunk=action_chunk, rtc_skip=int(rtc_skip), topk_centers=centers, topk_probs=probs)
+        return _PolicyChunkResult(
+            action_chunk=action_chunk,
+            rtc_skip=int(rtc_skip),
+            topk_centers=centers,
+            topk_probs=probs,
+            infer_time_s=infer_time_s,
+            infer_calls=int(sample_count),
+        )
 
+    infer_start = time.monotonic()
+    action_chunk = _normalize_action_chunk(policy_client.infer(request_data)["actions"])
+    infer_time_s = time.monotonic() - infer_start
     return _PolicyChunkResult(
-        action_chunk=_normalize_action_chunk(policy_client.infer(request_data)["actions"]),
+        action_chunk=action_chunk,
         rtc_skip=int(rtc_skip),
+        infer_time_s=infer_time_s,
+        infer_calls=1,
     )
+
+
+def _build_request_data_from_observation(
+    args: Args,
+    live_audio: LiveAudioConditioning,
+    instruction: str,
+    curr_obs: dict,
+) -> dict:
+    request = {
+        "observation/exterior_image_1_left": _center_crop_and_resize(curr_obs[f"{args.external_camera}_image"]),
+        "observation/wrist_image_left": _center_crop_and_resize(curr_obs["wrist_image"]),
+        "observation/joint_position": curr_obs["joint_position"],
+        "observation/gripper_position": curr_obs["gripper_position"],
+        "prompt": instruction,
+    }
+    request.update(live_audio.build_request_fields())
+    return request
+
+
+def _run_policy_request_from_observation(
+    policy_client: websocket_client_policy.WebsocketClientPolicy,
+    args: Args,
+    live_audio: LiveAudioConditioning,
+    instruction: str,
+    curr_obs: dict,
+    *,
+    previous_chunk: np.ndarray | None,
+    prefix_start: int,
+    delay: int,
+    topk_k: int,
+    topk_draws: int | None,
+) -> _PolicyChunkResult:
+    build_start = time.monotonic()
+    request_data = _build_request_data_from_observation(args, live_audio, instruction, curr_obs)
+    rtc_skip = _attach_rtc_prefix(request_data, previous_chunk, prefix_start, delay)
+    request_build_time_s = time.monotonic() - build_start
+    result = _run_policy_request(
+        policy_client,
+        request_data,
+        topk_k=topk_k,
+        topk_draws=topk_draws,
+        rtc_skip=rtc_skip,
+    )
+    return dataclasses.replace(result, request_build_time_s=request_build_time_s)
+
+
+def _finish_pending_policy_future(
+    pending_policy_future: concurrent.futures.Future[_PolicyChunkResult] | None,
+) -> None:
+    if pending_policy_future is None:
+        return
+    if pending_policy_future.cancel():
+        return
+    start_time = time.monotonic()
+    print("[RTC] waiting for in-flight policy request before eval prompt")
+    with prevent_keyboard_interrupt():
+        pending_policy_future.result()
+    elapsed_s = time.monotonic() - start_time
+    print(f"[RTC] in-flight policy request finished after {elapsed_s:.2f}s")
 
 
 def _send_prediction_visualization(
@@ -304,7 +417,7 @@ def _send_prediction_visualization(
         chunk_xyz.append(pose[:3, 3])
     chunk_xyz = np.asarray(chunk_xyz, dtype=np.float32)
     chunk_probs = np.full(chunk_xyz.shape[0], 1.0 / max(chunk_xyz.shape[0], 1), dtype=np.float32)
-    print("send prediction")
+    tqdm.write("send prediction")
     reactive_desk_client.send_predictions(
         chunk_xyz,
         chunk_probs,
@@ -312,6 +425,25 @@ def _send_prediction_visualization(
         is_executing=True,
     )
     return franka_model, franka_frame, plot_xlim, plot_ylim
+
+
+def _format_joint_position(qpos: np.ndarray) -> str:
+    return np.array2string(
+        np.asarray(qpos, dtype=np.float64),
+        precision=5,
+        separator=", ",
+        suppress_small=False,
+    )
+
+
+def _move_robot_to_joint_pose(env: FrankaRobotEnv, target_qpos: tuple[float, ...]) -> None:
+    qpos = np.asarray(target_qpos, dtype=np.float64).flatten()
+    if qpos.shape != (7,):
+        raise ValueError(f"target_qpos must be 7D, got shape {qpos.shape}")
+    if getattr(env.robot, "auto_set_default_behavior", False):
+        env.robot.panda.set_default_behavior()
+    print(f"[Control] Moving to custom joint pose: {_format_joint_position(qpos)}")
+    env.robot.panda.move_to_joint_position(qpos, speed_factor=env.robot.joint_speed_factor)
 
 
 def _hold_current_joint_position(env: FrankaRobotEnv, controller) -> np.ndarray:
@@ -424,12 +556,7 @@ def _reset_robot(env: FrankaRobotEnv, controller, *, settle_s: float) -> tuple[o
     with contextlib.suppress(Exception):
         env.robot.panda.stop_controller()
     env.robot.gripper_open()
-    auto_move_to_start = getattr(env.robot, "auto_move_to_start", True)
-    env.robot.auto_move_to_start = True
-    try:
-        env.robot.move_to_start()
-    finally:
-        env.robot.auto_move_to_start = auto_move_to_start
+    _move_robot_to_joint_pose(env, CUSTOM_START_JOINT_POSITION)
     controller = _start_joint_position_controller(env, settle_s=settle_s)
     return controller, GRIPPER_OPEN
 
@@ -502,7 +629,7 @@ def main(args: Args):
             instruction = args.instruction.strip() or input("Enter instruction: ").strip()
             if not instruction:
                 raise ValueError("Instruction must not be empty.")
-            live_audio.reset_instruction()
+            live_audio.reset_instruction(clear_buffer=True)
 
             plot_xlim = None
             plot_ylim = None
@@ -515,11 +642,26 @@ def main(args: Args):
             timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H:%M:%S")  # noqa: DTZ005
             video = []
             steps_completed = 0
+            total_infer_time_s = 0.0
+            total_request_build_time_s = 0.0
+            total_infer_calls = 0
+            last_infer_time_s = 0.0
+            last_request_build_time_s = 0.0
+            last_rtc_skip = 0
             print("Running rollout... press Ctrl+C to stop early.")
+            progress = tqdm(
+                total=args.max_timesteps,
+                desc="rollout",
+                unit="step",
+                dynamic_ncols=True,
+                leave=True,
+            )
 
             while steps_completed < args.max_timesteps:
                 start_time = time.time()
                 try:
+                    # panda-py controllers run asynchronously; surface controller aborts on this thread.
+                    env.robot.panda.raise_error()
                     curr_obs = _extract_observation(
                         args,
                         env,
@@ -534,35 +676,33 @@ def main(args: Args):
                     topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
                     topk_draws = int(args.topk_draws) if args.topk_draws is not None else None
 
-                    def build_request_data() -> dict:
-                        request = {
-                            "observation/exterior_image_1_left": _center_crop_and_resize(
-                                curr_obs[f"{args.external_camera}_image"]
-                            ),
-                            "observation/wrist_image_left": _center_crop_and_resize(curr_obs["wrist_image"]),
-                            "observation/joint_position": curr_obs["joint_position"],
-                            "observation/gripper_position": curr_obs["gripper_position"],
-                            "prompt": instruction,
-                        }
-                        request.update(live_audio.build_request_fields())
-                        return request
-
                     if pred_action_chunk is None:
-                        request_data = build_request_data()
                         pending_policy_future = policy_executor.submit(
-                            _run_policy_request,
+                            _run_policy_request_from_observation,
                             policy_client,
-                            request_data,
+                            args,
+                            live_audio,
+                            instruction,
+                            curr_obs,
+                            previous_chunk=None,
+                            prefix_start=0,
+                            delay=0,
                             topk_k=topk_k,
                             topk_draws=topk_draws,
-                            rtc_skip=0,
                         )
                         with prevent_keyboard_interrupt():
                             policy_result = pending_policy_future.result()
                         pending_policy_future = None
+                        total_infer_time_s += policy_result.infer_time_s
+                        total_request_build_time_s += policy_result.request_build_time_s
+                        total_infer_calls += policy_result.infer_calls
+                        last_infer_time_s = policy_result.infer_time_s
+                        last_request_build_time_s = policy_result.request_build_time_s
+                        last_rtc_skip = policy_result.rtc_skip
                         pred_action_chunk = policy_result.action_chunk
                         pred_action_horizon = pred_action_chunk.shape[0]
                         actions_from_chunk_completed = 0
+                        tqdm.write(f"[chunk] horizon={pred_action_horizon} rtc_skip={policy_result.rtc_skip}")
                         franka_model, franka_frame, plot_xlim, plot_ylim = _send_prediction_visualization(
                             args=args,
                             env=env,
@@ -577,21 +717,24 @@ def main(args: Args):
 
                     effective_horizon = min(args.open_loop_horizon, pred_action_horizon or args.open_loop_horizon)
                     if pending_policy_future is None and actions_from_chunk_completed >= effective_horizon:
-                        request_data = build_request_data()
                         rtc_prefix_start = actions_from_chunk_completed
-                        rtc_skip = _attach_rtc_prefix(
-                            request_data,
+                        rtc_skip = _rtc_skip_for_chunk(
                             pred_action_chunk,
                             rtc_prefix_start,
                             args.rtc_inference_delay,
                         )
                         pending_policy_future = policy_executor.submit(
-                            _run_policy_request,
+                            _run_policy_request_from_observation,
                             policy_client,
-                            request_data,
+                            args,
+                            live_audio,
+                            instruction,
+                            curr_obs,
+                            previous_chunk=pred_action_chunk.copy(),
+                            prefix_start=rtc_prefix_start,
+                            delay=args.rtc_inference_delay,
                             topk_k=topk_k,
                             topk_draws=topk_draws,
-                            rtc_skip=rtc_skip,
                         )
                         pending_switch_step = rtc_prefix_start + rtc_skip
 
@@ -599,13 +742,20 @@ def main(args: Args):
                         switch_step = min(pending_switch_step, pred_action_horizon)
                         if actions_from_chunk_completed >= switch_step:
                             if not pending_policy_future.done():
-                                print("[RTC] waiting for pending policy result")
+                                tqdm.write("[RTC] waiting for pending policy result")
                             with prevent_keyboard_interrupt():
                                 policy_result = pending_policy_future.result()
                             pending_policy_future = None
+                            total_infer_time_s += policy_result.infer_time_s
+                            total_request_build_time_s += policy_result.request_build_time_s
+                            total_infer_calls += policy_result.infer_calls
+                            last_infer_time_s = policy_result.infer_time_s
+                            last_request_build_time_s = policy_result.request_build_time_s
+                            last_rtc_skip = policy_result.rtc_skip
                             pred_action_chunk = policy_result.action_chunk
                             pred_action_horizon = pred_action_chunk.shape[0]
                             actions_from_chunk_completed = min(policy_result.rtc_skip, max(pred_action_horizon - 1, 0))
+                            tqdm.write(f"[chunk] horizon={pred_action_horizon} rtc_skip={policy_result.rtc_skip}")
                             franka_model, franka_frame, plot_xlim, plot_ylim = _send_prediction_visualization(
                                 args=args,
                                 env=env,
@@ -645,9 +795,24 @@ def main(args: Args):
                     else:
                         qvel_ff = np.zeros(7, dtype=np.float64)
                     controller.set_control(q_target, qvel_ff)
+                    env.robot.panda.raise_error()
 
                     steps_completed += 1
                     elapsed_time = time.time() - start_time
+                    progress.update(1)
+                    avg_infer_ms = (total_infer_time_s / total_infer_calls * 1e3) if total_infer_calls else 0.0
+                    progress.set_postfix(
+                        {
+                            "step_ms": f"{elapsed_time * 1e3:.0f}",
+                            "infer_ms": f"{last_infer_time_s * 1e3:.0f}",
+                            "build_ms": f"{last_request_build_time_s * 1e3:.0f}",
+                            "avg_infer_ms": f"{avg_infer_ms:.0f}",
+                            "infers": total_infer_calls,
+                            "horizon": pred_action_horizon,
+                            "rtc_skip": last_rtc_skip,
+                        },
+                        refresh=False,
+                    )
                     if elapsed_time < 1.0 / args.control_frequency_hz:
                         time.sleep(1.0 / args.control_frequency_hz - elapsed_time)
                 except KeyboardInterrupt:
@@ -659,9 +824,17 @@ def main(args: Args):
                         break
                     raise
 
-            if pending_policy_future is not None:
-                pending_policy_future.cancel()
-                pending_policy_future = None
+            _finish_pending_policy_future(pending_policy_future)
+            pending_policy_future = None
+            progress.close()
+            if total_infer_calls:
+                print(
+                    f"[Timing] steps={steps_completed} infers={total_infer_calls} "
+                    f"request_build_total={total_request_build_time_s:.2f}s "
+                    f"avg_build={total_request_build_time_s / total_infer_calls * 1e3:.0f}ms "
+                    f"infer_total={total_infer_time_s:.2f}s "
+                    f"avg_infer={total_infer_time_s / total_infer_calls * 1e3:.0f}ms"
+                )
 
             with contextlib.suppress(Exception):
                 _hold_current_joint_position(env, controller)
@@ -723,6 +896,7 @@ def main(args: Args):
             if input("Do one more eval? (enter y or n) ").lower() != "y":
                 break
             controller, gripper_state = _reset_robot(env, controller, settle_s=args.controller_settle_s)
+            live_audio.reset_instruction(clear_buffer=True)
 
         os.makedirs("results", exist_ok=True)
         controller, gripper_state = _reset_robot(env, controller, settle_s=0.0)

@@ -846,6 +846,9 @@ def _live_microphone_buffer_worker_main(
                             conn.send(_window_response(_requested_window_num_samples(command)))
                         except Exception as exc:
                             conn.send({"ok": False, "error": str(exc), **_summary()})
+                    elif action == "clear":
+                        _reset_buffer()
+                        conn.send({"ok": True, **_summary()})
                     elif action == "reset":
                         is_recording = False
                         _close_stream()
@@ -892,6 +895,9 @@ def _live_microphone_buffer_worker_main(
                     conn.send(_window_response(_requested_window_num_samples(command)))
                 except Exception as exc:
                     conn.send({"ok": False, "error": str(exc), **_summary()})
+            elif action == "clear":
+                _reset_buffer()
+                conn.send({"ok": True, **_summary()})
             elif action == "reset":
                 _reset_buffer()
                 conn.send({"ok": True, **_summary()})
@@ -1033,6 +1039,14 @@ class MultiprocessAudioBuffer:
             self._child_conn = None
         self._proc = None
         self._is_recording = False
+
+    def clear(self) -> None:
+        """Clear buffered microphone samples while keeping recording active."""
+        if not self._is_recording:
+            return
+        response = self._request({"cmd": "clear"}, timeout_s=5.0)
+        if not response.get("ok", False):
+            raise RuntimeError(str(response.get("error", "Failed to clear microphone buffer")))
 
     def wait_until_ready(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + max(float(timeout_s), 0.0)

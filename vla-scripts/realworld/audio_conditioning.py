@@ -24,7 +24,7 @@ class AudioConditioningConfig:
     audio_block_duration_s: float = 0.05
     audio_startup_timeout_s: float = 1.0
     vad_history_num_samples: int = 80_000
-    vad_threshold: float = 0.5
+    vad_threshold: float = 0.3
     vad_neg_threshold: float | None = None
     vad_min_speech_duration_ms: int = 250
     vad_max_speech_duration_s: float = 5.0
@@ -45,9 +45,7 @@ def audio_conditioning_config_from_args(args: Any) -> AudioConditioningConfig:
         audio_startup_timeout_s=float(args.audio_startup_timeout_s),
         vad_history_num_samples=int(args.vad_history_num_samples),
         vad_threshold=float(args.vad_threshold),
-        vad_neg_threshold=(
-            None if args.vad_neg_threshold is None else float(args.vad_neg_threshold)
-        ),
+        vad_neg_threshold=(None if args.vad_neg_threshold is None else float(args.vad_neg_threshold)),
         vad_min_speech_duration_ms=int(args.vad_min_speech_duration_ms),
         vad_max_speech_duration_s=float(args.vad_max_speech_duration_s),
         vad_min_silence_duration_ms=int(args.vad_min_silence_duration_ms),
@@ -74,9 +72,7 @@ def validate_audio_conditioning_config(config: AudioConditioningConfig) -> None:
         raise ValueError("--vad-history-num-samples must be > 0")
     if config.vad_threshold <= 0.0 or config.vad_threshold >= 1.0:
         raise ValueError("--vad-threshold must be in (0, 1)")
-    if config.vad_neg_threshold is not None and (
-        config.vad_neg_threshold <= 0.0 or config.vad_neg_threshold >= 1.0
-    ):
+    if config.vad_neg_threshold is not None and (config.vad_neg_threshold <= 0.0 or config.vad_neg_threshold >= 1.0):
         raise ValueError("--vad-neg-threshold must be in (0, 1)")
     if config.vad_min_speech_duration_ms <= 0:
         raise ValueError("--vad-min-speech-duration-ms must be > 0")
@@ -317,7 +313,9 @@ class LiveAudioConditioning:
             self._audio_buffer = None
         self._instruction_audio_tracker = None
 
-    def reset_instruction(self) -> None:
+    def reset_instruction(self, *, clear_buffer: bool = False) -> None:
+        if clear_buffer and self._audio_buffer is not None:
+            self._audio_buffer.clear()
         if self._instruction_audio_tracker is not None:
             self._instruction_audio_tracker.reset()
 
@@ -339,10 +337,12 @@ class LiveAudioConditioning:
                 target_num_samples=self._instruction_audio_tracker.history_num_samples,
                 target_sample_rate=self._config.audio_sample_rate,
             )
-            instruction_audio, instruction_audio_sample_rate, has_instruction_audio = self._instruction_audio_tracker.update(
-                vad_history_window,
-                sample_rate=self._audio_buffer.sample_rate,
-                has_audio=vad_has_audio,
+            instruction_audio, instruction_audio_sample_rate, has_instruction_audio = (
+                self._instruction_audio_tracker.update(
+                    vad_history_window,
+                    sample_rate=self._audio_buffer.sample_rate,
+                    has_audio=vad_has_audio,
+                )
             )
             request_data["observation/instruction_audio"] = instruction_audio
             request_data["observation/instruction_audio_sample_rate"] = instruction_audio_sample_rate

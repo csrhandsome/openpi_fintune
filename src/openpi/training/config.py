@@ -1197,19 +1197,22 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotFrankaJointDataConfig(
-            repo_id="franka_droid_lerobot_3_8",
+            repo_id="franka_lerobot_6_19_audio_asr",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 # Use locally computed norm stats under assets/<config>/<asset_id>.
-                assets_dir="./assets/pi0_base_droid_joint_lora_finetune",
-                asset_id="franka_droid_lerobot_3_8",
+                # assets_dir="./assets/pi0_base_joint_lora_finetune",
+                # asset_id="franka_lerobot_5_1_audio_mixed_asr",
+                assets_dir="./assets/pi0_base_audio_joint_lora",
+                asset_id="franka_lerobot_6_19_audio",  # 这里为之前compute的产物的地址
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=5_000,
+        num_train_steps=30_000,
         batch_size=5,
         save_interval=1000,
-        keep_period=1000,
+        # 这个是真正的保存的间隔
+        # keep_period=1000,
         freeze_filter=pi0_config.Pi0Config(
             pi05=False,
             action_dim=32,
@@ -1240,37 +1243,37 @@ _CONFIGS = [
         name="pi0_base_audio_joint_lora",
         model=pi0_audio.Pi0AudioConfig(
             action_dim=32,
-            action_horizon=16,
+            action_horizon=32,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_whisper=True,
             whisper_model_name="openai/whisper-tiny",
             rtc_train_max_delay=8,
             use_audio_guidance=False,
-            audio_guidance_lambda=1.0,
+            audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
             # 数据放在openpi的根目录且名称为repo_id
-            repo_id="franka_lerobot_5_1_audio",
+            repo_id="franka_lerobot_6_29_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_5_1_audio",
+                asset_id="franka_lerobot_6_29_audio",  # 这里为之前compute的产物的地址
             ),
         ),
         weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
+        num_train_steps=30_000,
         batch_size=4,
         save_interval=1000,
         freeze_filter=pi0_audio.Pi0AudioConfig(
             action_dim=32,
-            action_horizon=16,
+            action_horizon=32,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             use_whisper=True,
             whisper_model_name="openai/whisper-tiny",
             rtc_train_max_delay=8,
-            use_audio_guidance=False,
+            use_audio_guidance=True,
             audio_guidance_lambda=1.0,
         ).get_freeze_filter(),
         ema_decay=None,

@@ -208,6 +208,11 @@ class RoboticArmControler:
         self._last_velocity_target: np.ndarray | None = None  # 上一次的速度目标
         self._velocity_ramp_start_time: float | None = None  # 梯形斜坡开始时间
 
+        # 流式关节位置控制的持久化状态（JointPosition 控制器，直接吃关节位置目标）
+        self._position_controller: object | None = None
+        self._position_control_lock = threading.Lock()
+        self._last_position_target: np.ndarray | None = None  # 上一次发出的关节位置目标
+
     def move_to_start(self) -> None:
         if self.auto_set_default_behavior:
             self.panda.set_default_behavior()
@@ -585,6 +590,111 @@ class RoboticArmControler:
                 print(f"[Error] Error stopping velocity controller: {e}")
                 raise
 
+    def start_position_streaming(
+        self,
+        stiffness: Sequence[float] | None = None,
+        damping: Sequence[float] | None = None,
+        filter_coeff: float = 1.0,
+    ) -> None:
+        """
+        启动持久化关节位置控制器（JointPosition），用于高频流式调用。
+
+        与速度流式控制不同：JointPosition 直接吃关节位置目标 q_target，控制器内部用
+        关节阻抗跟踪，无需"位置增量→速度→再积分回位置"的绕路，也就没有速度阶跃带来的
+        加速度尖峰（之前 cartesian_reflex 假触发的根因）。
+
+        Args:
+            stiffness: 7维关节刚度（可选，None 用控制器默认值）
+            damping: 7维关节阻尼（可选，None 用控制器默认值）
+            filter_coeff: 位置目标低通滤波系数，范围 (0, 1]。
+                1.0 = 不滤波（直接跟踪目标）；越小越平滑、跟踪越滞后。
+                用于吸收相邻位置目标的跳变，进一步抑制加速度尖峰。
+
+        用法:
+            arm.start_position_streaming(filter_coeff=0.x)
+            try:
+                while ...:
+                    arm.set_joint_position_target(q_target)
+            finally:
+                arm.stop_position_streaming()
+        """
+        if self._position_controller is not None:
+            print("[Warning] Position streaming already started, stopping first...")
+            self.stop_position_streaming()
+        if self._velocity_controller is not None:
+            print("[Warning] Velocity streaming active, stopping it before position streaming...")
+            self.stop_velocity_streaming()
+
+        from panda_py import controllers
+
+        self.panda.stop_controller()
+        self._position_controller = controllers.JointPosition()
+
+        if stiffness is not None:
+            self._position_controller.set_stiffness(np.asarray(stiffness, dtype=np.float64))
+        if damping is not None:
+            self._position_controller.set_damping(np.asarray(damping, dtype=np.float64))
+        if filter_coeff is not None:
+            self._position_controller.set_filter(float(filter_coeff))
+
+        # 以当前关节位置作为初始目标，避免启动瞬间产生位置跳变
+        q_current = np.asarray(self.panda.q, dtype=np.float64).flatten()
+        self._last_position_target = q_current.copy()
+        self.panda.start_controller(self._position_controller)
+        self._position_controller.set_control(q_current, np.zeros(7))
+
+        print(f"[Position] 已启动持续关节位置控制器 (filter_coeff={filter_coeff})")
+
+    def set_joint_position_target(
+        self,
+        q_target: np.ndarray,
+        velocity_feedforward: np.ndarray | None = None,
+    ) -> None:
+        """
+        在流式模式下更新关节位置目标。
+
+        Args:
+            q_target: 7维关节位置目标（rad）
+            velocity_feedforward: 可选的 7维速度前馈（rad/s），跟踪更跟手；默认零前馈
+        """
+        if self._position_controller is None:
+            raise RuntimeError(
+                "Position controller not started. Call start_position_streaming() first."
+            )
+
+        q_target = np.asarray(q_target, dtype=np.float64).flatten()
+        if q_target.shape[0] != 7:
+            raise ValueError(f"Expected 7-DoF joint position target, got {q_target.shape}")
+
+        if velocity_feedforward is None:
+            vff = np.zeros(7, dtype=np.float64)
+        else:
+            vff = np.asarray(velocity_feedforward, dtype=np.float64).flatten()
+            if vff.shape[0] != 7:
+                raise ValueError(f"Expected 7-DoF velocity feedforward, got {vff.shape}")
+
+        with self._position_control_lock:
+            try:
+                self._position_controller.set_control(q_target, vff)
+                self._last_position_target = q_target.copy()
+            except Exception as e:
+                print(f"[Error] Failed to set position command: {e}")
+                raise
+
+    def stop_position_streaming(self) -> None:
+        """停止持久化关节位置控制器"""
+        with self._position_control_lock:
+            if self._position_controller is None:
+                return
+            try:
+                self.panda.stop_controller()
+                self._position_controller = None
+                self._last_position_target = None
+                print("[Position] 已停止持续关节位置控制器")
+            except Exception as e:
+                print(f"[Error] Error stopping position controller: {e}")
+                raise
+
     @property
     def state(self):
         """
@@ -593,7 +703,7 @@ class RoboticArmControler:
         注意：当流式速度控制器运行时，使用 get_state() 返回缓存快照，
         而不是 read_once() 来避免阻塞冲突。
         """
-        if self._velocity_controller is not None:
+        if self._velocity_controller is not None or self._position_controller is not None:
             # 流式控制运行中，用缓存状态
             robot_state = self.panda.get_state()
         else:
