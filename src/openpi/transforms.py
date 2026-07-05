@@ -17,6 +17,11 @@ from openpi.shared import normalize as _normalize
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
 
+ROUTE_LABEL_NAMES = ("straight", "detour", "none")
+ROUTE_LABEL_TO_ID = {name: index for index, name in enumerate(ROUTE_LABEL_NAMES)}
+ROUTE_ID_TO_LABEL = dict(enumerate(ROUTE_LABEL_NAMES))
+INVALID_ROUTE_LABEL = -1
+
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -346,6 +351,263 @@ def _find_first_present(data: DataDict, keys: Sequence[str]):
     return None
 
 
+def route_label_to_id(value) -> int:
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError(f"route label must be scalar, got shape {array.shape}")
+    raw = array.reshape(()).item()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        key = raw.strip().lower()
+        if key in ROUTE_LABEL_TO_ID:
+            return ROUTE_LABEL_TO_ID[key]
+        try:
+            raw = int(key)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported route label {raw!r}; expected one of {ROUTE_LABEL_NAMES}") from exc
+    label_id = int(raw)
+    if label_id == INVALID_ROUTE_LABEL:
+        return INVALID_ROUTE_LABEL
+    if 0 <= label_id < len(ROUTE_LABEL_NAMES):
+        return label_id
+    raise ValueError(f"route label id must be in [0, {len(ROUTE_LABEL_NAMES) - 1}], got {label_id}")
+
+
+def _invalid_route_label(data: DataDict) -> DataDict:
+    return {
+        **data,
+        "route_label": np.int32(INVALID_ROUTE_LABEL),
+        "route_label_mask": np.False_,
+    }
+
+
+def _as_float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value)
+        if array.size != 1:
+            return None
+        raw = array.reshape(()).item()
+        if raw is None:
+            return None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int_or_none(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value)
+        if array.size != 1:
+            return None
+        raw = array.reshape(()).item()
+        if raw is None:
+            return None
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _time_window_from_mapping(value) -> tuple[float, float] | None:
+    if not isinstance(value, Mapping):
+        return None
+    start_sec = _as_float_or_none(value.get("start_sec"))
+    end_sec = _as_float_or_none(value.get("end_sec"))
+    if start_sec is None or end_sec is None or end_sec < start_sec:
+        return None
+    return start_sec, end_sec
+
+
+def _route_label_window_from_sync(sync_data: Mapping[str, object]) -> tuple[float, float] | None:
+    window = _time_window_from_mapping(sync_data)
+    if window is not None:
+        return window
+
+    for key in ("route_label_window", "route_window", "instruction_audio_window"):
+        window = _time_window_from_mapping(sync_data.get(key))
+        if window is not None:
+            return window
+
+    starts: list[float] = []
+    ends: list[float] = []
+    raw_segments = sync_data.get("vad_segments")
+    if isinstance(raw_segments, list):
+        for segment in raw_segments:
+            if not isinstance(segment, Mapping):
+                continue
+            if segment.get("kind") not in (None, "instruction"):
+                continue
+            start_sec = _as_float_or_none(segment.get("start_sec"))
+            end_sec = _as_float_or_none(segment.get("end_sec"))
+            if start_sec is None or end_sec is None or end_sec < start_sec:
+                continue
+            starts.append(start_sec)
+            ends.append(end_sec)
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
+def _frame_time_sec_from_sync(
+    data: DataDict,
+    sync_data: Mapping[str, object],
+    *,
+    frame_index_keys: Sequence[str],
+    time_keys: Sequence[str],
+    fallback_fps: float,
+) -> float | None:
+    raw_time = _find_first_present(data, time_keys)
+    explicit_time = _as_float_or_none(raw_time)
+    if explicit_time is not None:
+        return explicit_time
+
+    raw_frame_index = _find_first_present(data, frame_index_keys)
+    frame_index = _as_int_or_none(raw_frame_index)
+    if frame_index is None:
+        return None
+
+    fps = _as_float_or_none(sync_data.get("control_frequency")) or float(fallback_fps)
+    fps = max(fps, 1e-6)
+    audio_start_ns = _as_int_or_none(sync_data.get("audio_start_monotonic_ns"))
+    frame_records = sync_data.get("frame_records")
+    if audio_start_ns is not None and isinstance(frame_records, list):
+        record = _audio_tools.get_frame_record(frame_records, frame_index)
+        next_record = _audio_tools.get_frame_record(frame_records, frame_index + 1)
+        if record is not None:
+            end_ns = None
+            if next_record is not None:
+                end_ns = _as_int_or_none(next_record.get("host_frame_monotonic_ns"))
+            if end_ns is None:
+                start_ns = _as_int_or_none(record.get("host_frame_monotonic_ns"))
+                if start_ns is not None:
+                    end_ns = start_ns + round(1e9 / fps)
+            if end_ns is not None:
+                return max(0.0, (end_ns - audio_start_ns) / 1e9)
+
+    return (frame_index + 1) / fps
+
+
+def _route_label_mask_from_sync(
+    data: DataDict,
+    sync_data: Mapping[str, object],
+    *,
+    label_id: int,
+    frame_index_keys: Sequence[str],
+    time_keys: Sequence[str],
+    fallback_fps: float,
+    window_epsilon_sec: float,
+) -> bool:
+    if label_id == INVALID_ROUTE_LABEL:
+        return False
+    window = _route_label_window_from_sync(sync_data)
+    if window is None:
+        return False
+    current_time_sec = _frame_time_sec_from_sync(
+        data,
+        sync_data,
+        frame_index_keys=frame_index_keys,
+        time_keys=time_keys,
+        fallback_fps=fallback_fps,
+    )
+    if current_time_sec is None:
+        return False
+    start_sec, end_sec = window
+    return start_sec - window_epsilon_sec <= current_time_sec <= end_sec + window_epsilon_sec
+
+
+_ROUTE_PASSTHROUGH_KEYS: tuple[tuple[str, Sequence[str]], ...] = (
+    ("route_label", ("route_label", "observation/route_label", "label", "observation/label")),
+    ("route_label_mask", ("route_label_mask", "observation/route_label_mask", "label_mask", "observation/label_mask")),
+)
+
+
+def copy_present_route_fields(source: Mapping[str, object], dest: dict) -> dict:
+    for out_key, candidate_keys in _ROUTE_PASSTHROUGH_KEYS:
+        value = _find_first_present(source, candidate_keys)
+        if value is not None:
+            dest[out_key] = value
+    return dest
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractRouteLabel(DataTransformFn):
+    """Materialize a route label id from direct fields or the episode sync sidecar."""
+
+    dataset_root: str | None = None
+    strict: bool = False
+    label_keys: Sequence[str] = ("route_label", "observation/route_label", "label", "observation/label")
+    label_mask_keys: Sequence[str] = (
+        "route_label_mask",
+        "observation/route_label_mask",
+        "label_mask",
+        "observation/label_mask",
+    )
+    episode_index_keys: Sequence[str] = ("episode_index", "observation/episode_index")
+    frame_index_keys: Sequence[str] = ("frame_index", "observation/frame_index")
+    time_keys: Sequence[str] = ("timestamp", "observation/timestamp", "time_sec", "observation/time_sec")
+    fallback_fps: float = 20.0
+    window_epsilon_sec: float = 1e-6
+
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_label = _find_first_present(data, self.label_keys)
+        if raw_label is not None:
+            try:
+                label_id = route_label_to_id(raw_label)
+                raw_mask = _find_first_present(data, self.label_mask_keys)
+                label_mask = label_id != INVALID_ROUTE_LABEL if raw_mask is None else bool(_as_bool(raw_mask))
+            except Exception:
+                if self.strict:
+                    raise
+                return _invalid_route_label(data)
+            return {
+                **data,
+                "route_label": np.int32(label_id),
+                "route_label_mask": np.bool_(label_mask),
+            }
+
+        episode_index = _find_first_present(data, self.episode_index_keys)
+        if episode_index is None or self.dataset_root is None:
+            if self.strict:
+                raise ValueError("Route label extraction requires a label field or dataset_root + episode_index.")
+            return _invalid_route_label(data)
+
+        try:
+            _, sync_path = _audio_tools.resolve_episode_audio_paths(
+                self.dataset_root,
+                _as_int(episode_index, key="episode_index"),
+            )
+            sync_data = _audio_tools.load_json(sync_path)
+            if not sync_data:
+                raise FileNotFoundError(f"Route label sync metadata not found: {sync_path}")
+            raw_label = sync_data.get("route_label", sync_data.get("label"))
+            if raw_label is None:
+                raise KeyError(f"No route label in sync metadata: {sync_path}")
+            label_id = route_label_to_id(raw_label)
+            label_mask = _route_label_mask_from_sync(
+                data,
+                sync_data,
+                label_id=label_id,
+                frame_index_keys=self.frame_index_keys,
+                time_keys=self.time_keys,
+                fallback_fps=self.fallback_fps,
+                window_epsilon_sec=self.window_epsilon_sec,
+            )
+        except Exception:
+            if self.strict:
+                raise
+            return _invalid_route_label(data)
+
+        return {
+            **data,
+            "route_label": np.int32(label_id),
+            "route_label_mask": np.bool_(label_mask),
+        }
+
+
 _AUDIO_PASSTHROUGH_KEYS: tuple[tuple[str, Sequence[str]], ...] = (
     (
         "ambient_audio",
@@ -403,6 +665,74 @@ def copy_present_audio_fields(source: Mapping[str, object], dest: dict) -> dict:
         if value is not None:
             dest[out_key] = value
     return dest
+
+
+_AUDIO_VLA_BASE_MODES = ("full_avla", "audio_action", "image_action")
+_AUDIO_VLA_CONDITIONING_MODES = (*_AUDIO_VLA_BASE_MODES, "mixed_aa_avla")
+
+
+def _stable_index_from_fields(
+    data: DataDict,
+    keys: Sequence[str],
+    *,
+    modulo: int,
+) -> int:
+    if modulo <= 0:
+        raise ValueError("modulo must be > 0")
+    accumulator = 0
+    found = False
+    for key in keys:
+        value = _find_first_present(data, (key,))
+        scalar = _as_int_or_none(value)
+        if scalar is None:
+            continue
+        found = True
+        accumulator = (accumulator * 1_000_003 + scalar) & 0x7FFF_FFFF
+    return int(accumulator % modulo) if found else 0
+
+
+def _set_audio_masks(data: dict, value: bool) -> None:
+    for key in ("audio_mask", "ambient_audio_mask", "instruction_audio_mask"):
+        if key in data:
+            data[key] = np.bool_(value)
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioVLAConditioning(DataTransformFn):
+    """Apply staged AVLA conditioning by masking image or audio tokens."""
+
+    mode: Literal["full_avla", "audio_action", "image_action", "mixed_aa_avla"] = "full_avla"
+    mixed_modes: Sequence[Literal["full_avla", "audio_action", "image_action"]] = ("audio_action", "full_avla")
+    stable_index_keys: Sequence[str] = ("episode_index", "frame_index")
+
+    def __post_init__(self) -> None:
+        if self.mode not in _AUDIO_VLA_CONDITIONING_MODES:
+            raise ValueError(f"Unsupported AVLA conditioning mode: {self.mode}")
+        invalid = [mode for mode in self.mixed_modes if mode not in _AUDIO_VLA_BASE_MODES]
+        if invalid:
+            raise ValueError(f"mixed_modes can only contain {_AUDIO_VLA_BASE_MODES}, got {invalid}")
+        if self.mode == "mixed_aa_avla" and not self.mixed_modes:
+            raise ValueError("mixed_aa_avla requires at least one mixed mode")
+
+    def _resolve_mode(self, data: DataDict) -> str:
+        if self.mode != "mixed_aa_avla":
+            return self.mode
+        index = _stable_index_from_fields(data, self.stable_index_keys, modulo=len(self.mixed_modes))
+        return self.mixed_modes[index]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        mode = self._resolve_mode(data)
+        if mode == "full_avla":
+            return data
+
+        output = dict(data)
+        if mode == "audio_action":
+            output["image_mask"] = {key: np.False_ for key in output.get("image_mask", {})}
+        elif mode == "image_action":
+            _set_audio_masks(output, False)
+        else:
+            raise ValueError(f"Unsupported resolved AVLA conditioning mode: {mode}")
+        return output
 
 
 def _as_int(value, *, key: str) -> int:

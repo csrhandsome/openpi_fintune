@@ -122,7 +122,7 @@ class Pi0AudioWeightLoader(WeightLoader):
         return _merge_params(
             loaded_params,
             params,
-            missing_regex=".*lora.*|.*audio.*|.*whisper.*|.*projector.*",
+            missing_regex=".*lora.*|.*audio.*|.*whisper.*|.*projector.*|.*route.*",
         )
 
 

@@ -27,6 +27,7 @@ import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -37,6 +38,38 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+
+def _freeze_except_trainable(*patterns: str) -> Filter:
+    if not patterns:
+        return nnx.All(nnx.Param)
+    return nnx.All(
+        nnx.Param,
+        nnx.Not(nnx.Any(*(nnx_utils.PathRegex(pattern) for pattern in patterns))),
+    )
+
+
+def _pi0_audio_stage_freeze_filter(
+    *,
+    train_audio: bool,
+    train_route: bool,
+    train_action_side: bool,
+    train_lora: bool = True,
+    train_backbone: bool = False,
+) -> Filter:
+    if train_backbone:
+        return nnx.Nothing
+
+    trainable_patterns: list[str] = []
+    if train_audio:
+        trainable_patterns.append(".*audio.*")
+    if train_route:
+        trainable_patterns.append(".*route.*")
+    if train_action_side:
+        trainable_patterns.extend((".*state_proj.*", ".*action_.*"))
+    if train_lora:
+        trainable_patterns.append(".*lora.*")
+    return _freeze_except_trainable(*trainable_patterns)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -526,6 +559,11 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
 
     audio_fallback_fps: float = 20.0
     audio_strict: bool = True
+    conditioning_mode: Literal["full_avla", "audio_action", "image_action", "mixed_aa_avla"] = "full_avla"
+    mixed_conditioning_modes: Sequence[Literal["full_avla", "audio_action", "image_action"]] = (
+        "audio_action",
+        "full_avla",
+    )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -575,7 +613,11 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
                     audio_fallback_fps=self.audio_fallback_fps,
                     audio_strict=self.audio_strict,
                     model_type=model_config.model_type,
-                )
+                ),
+                _transforms.AudioVLAConditioning(
+                    mode=self.conditioning_mode,
+                    mixed_modes=self.mixed_conditioning_modes,
+                ),
             ],
             outputs=[audiovla_policy.AudiovlaOutputs()],
         )
@@ -1238,7 +1280,7 @@ _CONFIGS = [
         ema_decay=None,
         batch_size=4,
     ),
-    # 声音训练config
+    # 声音训练config baseline
     TrainConfig(
         name="pi0_base_audio_joint_lora",
         model=pi0_audio.Pi0AudioConfig(
@@ -1265,7 +1307,18 @@ _CONFIGS = [
         num_train_steps=30_000,
         batch_size=4,
         save_interval=1000,
-        freeze_filter=pi0_audio.Pi0AudioConfig(
+        freeze_filter=_pi0_audio_stage_freeze_filter(
+            train_audio=True,
+            train_route=False,
+            train_action_side=True,
+            train_lora=True,
+        ),
+        ema_decay=None,
+    ),
+    # four stage training
+    TrainConfig(
+        name="pi0_base_audio_joint_route_warmup_lora",
+        model=pi0_audio.Pi0AudioConfig(
             action_dim=32,
             action_horizon=32,
             paligemma_variant="gemma_2b_lora",
@@ -1273,10 +1326,150 @@ _CONFIGS = [
             use_whisper=True,
             whisper_model_name="openai/whisper-tiny",
             rtc_train_max_delay=8,
-            use_audio_guidance=True,
-            audio_guidance_lambda=1.0,
-        ).get_freeze_filter(),
+            use_route_head=True,
+            route_loss_weight=1.0,
+            action_loss_weight=0.0,
+            use_audio_guidance=False,
+            audio_guidance_lambda=1.5,
+        ),
+        data=LeRobotFrankaJointAudioDataConfig(
+            repo_id="franka_lerobot_6_29_audio",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_audio_joint_lora",
+                asset_id="franka_lerobot_6_29_audio",
+            ),
+            conditioning_mode="audio_action",
+        ),
+        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=5_000,
+        batch_size=4,
+        save_interval=1000,
+        freeze_filter=_pi0_audio_stage_freeze_filter(
+            train_audio=True,
+            train_route=True,
+            train_action_side=False,
+            train_lora=False,
+        ),
         ema_decay=None,
+        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
+    ),
+    TrainConfig(
+        name="pi0_base_audio_joint_audio_action_lora",
+        model=pi0_audio.Pi0AudioConfig(
+            action_dim=32,
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_whisper=True,
+            whisper_model_name="openai/whisper-tiny",
+            rtc_train_max_delay=8,
+            use_route_head=True,
+            route_loss_weight=0.1,
+            action_loss_weight=1.0,
+            use_audio_guidance=False,
+            audio_guidance_lambda=1.5,
+        ),
+        data=LeRobotFrankaJointAudioDataConfig(
+            repo_id="franka_lerobot_6_29_audio",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_audio_joint_lora",
+                asset_id="franka_lerobot_6_29_audio",
+            ),
+            conditioning_mode="audio_action",
+        ),
+        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=4,
+        save_interval=1000,
+        freeze_filter=_pi0_audio_stage_freeze_filter(
+            train_audio=True,
+            train_route=True,
+            train_action_side=True,
+            train_lora=True,
+        ),
+        ema_decay=None,
+        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
+    ),
+    TrainConfig(
+        name="pi0_base_audio_joint_mixed_aa_avla_lora",
+        model=pi0_audio.Pi0AudioConfig(
+            action_dim=32,
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_whisper=True,
+            whisper_model_name="openai/whisper-tiny",
+            rtc_train_max_delay=8,
+            use_route_head=True,
+            route_loss_weight=0.1,
+            action_loss_weight=1.0,
+            use_audio_guidance=False,
+            audio_guidance_lambda=1.5,
+        ),
+        data=LeRobotFrankaJointAudioDataConfig(
+            repo_id="franka_lerobot_6_29_audio",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_audio_joint_lora",
+                asset_id="franka_lerobot_6_29_audio",
+            ),
+            conditioning_mode="mixed_aa_avla",
+            mixed_conditioning_modes=("audio_action", "full_avla"),
+        ),
+        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=4,
+        save_interval=1000,
+        freeze_filter=_pi0_audio_stage_freeze_filter(
+            train_audio=True,
+            train_route=True,
+            train_action_side=True,
+            train_lora=True,
+        ),
+        ema_decay=None,
+        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
+    ),
+    TrainConfig(
+        name="pi0_base_audio_joint_full_avla_lora",
+        model=pi0_audio.Pi0AudioConfig(
+            action_dim=32,
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_whisper=True,
+            whisper_model_name="openai/whisper-tiny",
+            rtc_train_max_delay=8,
+            use_route_head=True,
+            route_loss_weight=0.1,
+            action_loss_weight=1.0,
+            use_audio_guidance=False,
+            audio_guidance_lambda=1.5,
+        ),
+        data=LeRobotFrankaJointAudioDataConfig(
+            repo_id="franka_lerobot_6_29_audio",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi0_base_audio_joint_lora",
+                asset_id="franka_lerobot_6_29_audio",
+            ),
+            conditioning_mode="full_avla",
+        ),
+        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=5e-6, decay_steps=30_000, decay_lr=5e-7),
+        num_train_steps=30_000,
+        batch_size=4,
+        save_interval=1000,
+        freeze_filter=_pi0_audio_stage_freeze_filter(
+            train_audio=True,
+            train_route=True,
+            train_action_side=True,
+            train_lora=True,
+            train_backbone=True,
+        ),
+        ema_decay=None,
+        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

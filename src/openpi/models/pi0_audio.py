@@ -90,6 +90,11 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     audio_limoe_num_experts: int = 4
     audio_limoe_top_k: int = 1
     rtc_train_max_delay: int = 0
+    use_route_head: bool = False
+    route_loss_weight: float = 0.0
+    route_loss_requires_instruction_audio: bool = True
+    action_loss_weight: float = 1.0
+    route_label_names: tuple[str, ...] = ("straight", "detour", "none")
     # Audio-CAG: v = v_no_audio + lambda * (v_audio - v_no_audio).
     # lambda=1.0 keeps the original audio-conditioned velocity; >1.0 amplifies audio.
     use_audio_guidance: bool = False
@@ -127,6 +132,16 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("rtc_train_max_delay must be >= 0")
         if self.rtc_train_max_delay >= self.action_horizon:
             raise ValueError("rtc_train_max_delay must be smaller than action_horizon")
+        if len(self.route_label_names) < 2:
+            raise ValueError("route_label_names must contain at least two labels")
+        if len(set(self.route_label_names)) != len(self.route_label_names):
+            raise ValueError("route_label_names must be unique")
+        if self.route_loss_weight < 0:
+            raise ValueError("route_loss_weight must be >= 0")
+        if self.action_loss_weight < 0:
+            raise ValueError("action_loss_weight must be >= 0")
+        if self.route_loss_weight > 0 and not self.use_route_head:
+            raise ValueError("route_loss_weight requires use_route_head=True")
         if self.audio_guidance_lambda < 0:
             raise ValueError("audio_guidance_lambda must be >= 0")
 
@@ -231,6 +246,8 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
                 ambient_audio_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
                 instruction_audio=jax.ShapeDtypeStruct([batch_size, *self.instruction_audio_input_shape], jnp.float32),
                 instruction_audio_mask=jax.ShapeDtypeStruct([batch_size], jnp.bool_),
+                route_label=(jax.ShapeDtypeStruct([batch_size], jnp.int32) if self.use_route_head else None),
+                route_label_mask=(jax.ShapeDtypeStruct([batch_size], jnp.bool_) if self.use_route_head else None),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -251,6 +268,12 @@ class Pi0Audio(_model.BaseModel):
         self.instruction_audio_num_tokens = config.instruction_audio_num_tokens
         self.audio_tokenizer_type = config.audio_tokenizer_type
         self.rtc_train_max_delay = config.rtc_train_max_delay
+        self.use_route_head = config.use_route_head
+        self.route_loss_weight = config.route_loss_weight
+        self.route_loss_requires_instruction_audio = config.route_loss_requires_instruction_audio
+        self.action_loss_weight = config.action_loss_weight
+        self.route_label_names = tuple(config.route_label_names)
+        self.route_num_classes = len(config.route_label_names)
         self.use_audio_guidance = config.use_audio_guidance
         self.audio_guidance_lambda = config.audio_guidance_lambda
 
@@ -330,6 +353,9 @@ class Pi0Audio(_model.BaseModel):
             self.instruction_audio_kv_norm = None
         self.ambient_audio_out_proj = nnx.Linear(config.audio_projector_dim, paligemma_config.width, rngs=rngs)
         self.instruction_audio_out_proj = nnx.Linear(config.audio_projector_dim, paligemma_config.width, rngs=rngs)
+        self.route_head = (
+            nnx.Linear(paligemma_config.width, self.route_num_classes, rngs=rngs) if self.use_route_head else None
+        )
         if config.use_audio_limoe:
             try:
                 from openpi.models import limoe_simple
@@ -354,7 +380,7 @@ class Pi0Audio(_model.BaseModel):
                     (1, config.audio_limoe_num_experts, paligemma_config.width),
                     dtype=jnp.float32,
                 ),
-                True,
+                deterministic=True,
                 rngs=rngs,
             )
             self.audio_limoe = audio_limoe
@@ -401,7 +427,7 @@ class Pi0Audio(_model.BaseModel):
         else:
             frame_energy = jnp.max(jnp.abs(audio), axis=-1)
             frame_mask = frame_energy > 0
-            frame_mask = jnp.where(audio_mask[:, None], frame_mask, False)
+            frame_mask = jnp.where(audio_mask[:, None], frame_mask, jnp.zeros_like(frame_mask))
         return audio, frame_mask
 
     def _embed_audio_prefix(
@@ -461,7 +487,7 @@ class Pi0Audio(_model.BaseModel):
                 jnp.asarray(audio_mask_value, dtype=jnp.bool_)[:, None],
                 (batch_size, num_tokens),
             )
-        audio_tokens = audio_tokens * audio_mask[..., None].astype(audio_tokens.dtype)
+        audio_tokens = jnp.where(audio_mask[..., None], audio_tokens, 0.0)
         return audio_tokens, audio_mask
 
     def _embed_audio_prefix_baseline(
@@ -487,7 +513,7 @@ class Pi0Audio(_model.BaseModel):
             audio_mask = jnp.ones((audio.shape[0], 1), dtype=jnp.bool_)
         else:
             audio_mask = jnp.asarray(audio_mask_value, dtype=jnp.bool_)[:, None]
-        audio_token = audio_token * audio_mask[..., None].astype(audio_token.dtype)
+        audio_token = jnp.where(audio_mask[..., None], audio_token, 0.0)
         return audio_token, audio_mask
 
     def _apply_audio_limoe(
@@ -526,10 +552,28 @@ class Pi0Audio(_model.BaseModel):
             ambient_audio_mask=None,
             instruction_audio=None,
             instruction_audio_mask=None,
+            route_label=obs.route_label,
+            route_label_mask=obs.route_label_mask,
             tokenized_prompt=obs.tokenized_prompt,
             tokenized_prompt_mask=obs.tokenized_prompt_mask,
             token_ar_mask=obs.token_ar_mask,
             token_loss_mask=obs.token_loss_mask,
+        )
+
+    def _embed_instruction_audio_tokens(
+        self,
+        obs: _model.Observation,
+    ) -> tuple[at.Float[at.Array, "b s emb"] | None, at.Bool[at.Array, "b s"] | None]:
+        return self._embed_audio_prefix(
+            obs.instruction_audio,
+            obs.instruction_audio_mask,
+            in_proj=self.instruction_audio_in_proj,
+            resampler=self.instruction_audio_resampler,
+            query_tokens_param=self.instruction_audio_query_tokens,
+            query_norm=self.instruction_audio_query_norm,
+            kv_norm=self.instruction_audio_kv_norm,
+            out_proj=self.instruction_audio_out_proj,
+            num_tokens=self.instruction_audio_num_tokens,
         )
 
     @at.typecheck
@@ -548,17 +592,7 @@ class Pi0Audio(_model.BaseModel):
             ar_mask += [False] * tokenized_inputs.shape[1]
 
         # 添加audio通过vad识别的指令槽的embed
-        instruction_audio_token, instruction_audio_mask = self._embed_audio_prefix(
-            obs.instruction_audio,
-            obs.instruction_audio_mask,
-            in_proj=self.instruction_audio_in_proj,
-            resampler=self.instruction_audio_resampler,
-            query_tokens_param=self.instruction_audio_query_tokens,
-            query_norm=self.instruction_audio_query_norm,
-            kv_norm=self.instruction_audio_kv_norm,
-            out_proj=self.instruction_audio_out_proj,
-            num_tokens=self.instruction_audio_num_tokens,
-        )
+        instruction_audio_token, instruction_audio_mask = self._embed_instruction_audio_tokens(obs)
         if instruction_audio_token is not None and instruction_audio_mask is not None:
             target_dtype = tokens[0].dtype if tokens else instruction_audio_token.dtype
             instruction_audio_token = instruction_audio_token.astype(target_dtype)
@@ -604,6 +638,55 @@ class Pi0Audio(_model.BaseModel):
             tokens = self._apply_audio_limoe(tokens, input_mask, train=train)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def _predict_route_logits_from_preprocessed(
+        self,
+        obs: _model.Observation,
+    ) -> at.Float[at.Array, "b c"]:
+        if not self.use_route_head or self.route_head is None:
+            raise ValueError("Route head is disabled for this model.")
+
+        instruction_audio_token, instruction_audio_mask = self._embed_instruction_audio_tokens(obs)
+        batch_size = obs.state.shape[0]
+        if instruction_audio_token is None or instruction_audio_mask is None:
+            pooled = jnp.zeros((batch_size, self.route_head.in_features), dtype=jnp.float32)
+        else:
+            token_mask = instruction_audio_mask[..., None].astype(instruction_audio_token.dtype)
+            token_count = jnp.maximum(jnp.sum(token_mask, axis=1), 1.0)
+            pooled = jnp.sum(instruction_audio_token * token_mask, axis=1) / token_count
+        return self.route_head(pooled)
+
+    def predict_route_logits(
+        self,
+        observation: _model.Observation,
+    ) -> at.Float[at.Array, "b c"]:
+        observation = _model.preprocess_observation(None, observation, train=False)
+        return self._predict_route_logits_from_preprocessed(observation)
+
+    def _compute_route_loss(
+        self,
+        obs: _model.Observation,
+        route_logits: at.Float[at.Array, "b c"],
+    ) -> at.Float[at.Array, "b"]:  # noqa: F821
+        if obs.route_label is None:
+            return jnp.zeros((obs.state.shape[0],), dtype=route_logits.dtype)
+
+        labels = jnp.asarray(obs.route_label, dtype=jnp.int32)
+        if obs.route_label_mask is None:
+            valid = labels >= 0
+        else:
+            valid = jnp.asarray(obs.route_label_mask, dtype=jnp.bool_)
+            valid = jnp.logical_and(valid, labels >= 0)
+        if self.route_loss_requires_instruction_audio and obs.instruction_audio_mask is not None:
+            valid = jnp.logical_and(valid, jnp.asarray(obs.instruction_audio_mask, dtype=jnp.bool_))
+
+        clipped_labels = jnp.clip(labels, 0, self.route_num_classes - 1)
+        log_probs = jax.nn.log_softmax(route_logits, axis=-1)
+        ce = -jnp.take_along_axis(log_probs, clipped_labels[:, None], axis=-1)[:, 0]
+        valid_f = valid.astype(ce.dtype)
+        valid_count = jnp.maximum(jnp.sum(valid_f), 1.0)
+        batch_count = jnp.asarray(labels.shape[0], dtype=ce.dtype)
+        return ce * valid_f * (batch_count / valid_count)
 
     def _time_embedding(
         self,
@@ -655,7 +738,7 @@ class Pi0Audio(_model.BaseModel):
         self,
         delay: int | at.Int[at.Array, "..."] | None,
         batch_size: int,
-    ) -> at.Int[at.Array, "b"]:
+    ) -> at.Int[at.Array, "b"]:  # noqa: F821
         if delay is None:
             return jnp.zeros((batch_size,), dtype=jnp.int32)
         delay = jnp.asarray(delay, dtype=jnp.int32)
@@ -765,6 +848,21 @@ class Pi0Audio(_model.BaseModel):
             postfix_count = jnp.sum(postfix_mask, axis=-1, keepdims=True)
             loss_scale = self.action_horizon / jnp.maximum(postfix_count, 1)
             loss = loss * postfix_mask * loss_scale
+
+        if observation.action_loss_mask is not None:
+            action_loss_mask = jnp.asarray(observation.action_loss_mask, dtype=jnp.bool_)
+            action_loss_mask_f = action_loss_mask.astype(loss.dtype)
+            valid_count = jnp.maximum(jnp.sum(action_loss_mask_f), 1.0)
+            batch_count = jnp.asarray(action_loss_mask_f.size, dtype=loss.dtype)
+            loss = loss * action_loss_mask_f[..., None] * (batch_count / valid_count)
+
+        if self.action_loss_weight != 1.0:
+            loss = loss * self.action_loss_weight
+
+        if self.use_route_head and self.route_loss_weight > 0:
+            route_logits = self._predict_route_logits_from_preprocessed(observation)
+            route_loss = self._compute_route_loss(observation, route_logits)
+            loss = loss + self.route_loss_weight * route_loss[..., None]
         return loss
 
     @override

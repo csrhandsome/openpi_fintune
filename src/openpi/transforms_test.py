@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -172,3 +174,97 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_extract_route_label_from_direct_label():
+    output = _transforms.ExtractRouteLabel()({"label": "detour"})
+
+    assert output["route_label"] == np.int32(_transforms.ROUTE_LABEL_TO_ID["detour"])
+    assert output["route_label_mask"] == np.True_
+
+
+def test_extract_route_label_from_sync_sidecar(tmp_path):
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    sync_path = audio_dir / "episode_000003.sync.json"
+    sync_path.write_text(
+        json.dumps({"label": "straight", "instruction_audio_window": {"start_sec": 0.5, "end_sec": 0.6}}),
+        encoding="utf-8",
+    )
+
+    output = _transforms.ExtractRouteLabel(dataset_root=str(tmp_path))(
+        {"episode_index": np.int64(3), "frame_index": np.int64(10)}
+    )
+
+    assert output["route_label"] == np.int32(_transforms.ROUTE_LABEL_TO_ID["straight"])
+    assert output["route_label_mask"] == np.True_
+
+
+def test_extract_route_label_from_sync_sidecar_outside_window_is_masked(tmp_path):
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    sync_path = audio_dir / "episode_000003.sync.json"
+    sync_path.write_text(
+        json.dumps({"label": "detour", "instruction_audio_window": {"start_sec": 0.5, "end_sec": 0.6}}),
+        encoding="utf-8",
+    )
+
+    output = _transforms.ExtractRouteLabel(dataset_root=str(tmp_path))(
+        {"episode_index": np.int64(3), "frame_index": np.int64(20)}
+    )
+
+    assert output["route_label"] == np.int32(_transforms.ROUTE_LABEL_TO_ID["detour"])
+    assert output["route_label_mask"] == np.False_
+
+
+def test_extract_route_label_missing_is_masked():
+    output = _transforms.ExtractRouteLabel()({})
+
+    assert output["route_label"] == np.int32(_transforms.INVALID_ROUTE_LABEL)
+    assert output["route_label_mask"] == np.False_
+
+
+def _audio_vla_conditioning_sample(frame_index: int = 0) -> dict:
+    return {
+        "image_mask": {
+            "base_0_rgb": np.True_,
+            "left_wrist_0_rgb": np.True_,
+            "right_wrist_0_rgb": np.True_,
+        },
+        "audio_mask": np.True_,
+        "ambient_audio_mask": np.True_,
+        "instruction_audio_mask": np.True_,
+        "frame_index": np.int32(frame_index),
+    }
+
+
+def test_audio_vla_conditioning_audio_action_masks_images():
+    output = _transforms.AudioVLAConditioning(mode="audio_action")(_audio_vla_conditioning_sample())
+
+    assert all(mask == np.False_ for mask in output["image_mask"].values())
+    assert output["audio_mask"] == np.True_
+    assert output["ambient_audio_mask"] == np.True_
+    assert output["instruction_audio_mask"] == np.True_
+
+
+def test_audio_vla_conditioning_image_action_nulls_audio():
+    output = _transforms.AudioVLAConditioning(mode="image_action")(_audio_vla_conditioning_sample())
+
+    assert all(mask == np.True_ for mask in output["image_mask"].values())
+    assert output["audio_mask"] == np.False_
+    assert output["ambient_audio_mask"] == np.False_
+    assert output["instruction_audio_mask"] == np.False_
+
+
+def test_audio_vla_conditioning_mixed_uses_stable_frame_index():
+    transform = _transforms.AudioVLAConditioning(
+        mode="mixed_aa_avla",
+        mixed_modes=("audio_action", "full_avla"),
+        stable_index_keys=("frame_index",),
+    )
+
+    audio_action = transform(_audio_vla_conditioning_sample(frame_index=0))
+    full_avla = transform(_audio_vla_conditioning_sample(frame_index=1))
+
+    assert all(mask == np.False_ for mask in audio_action["image_mask"].values())
+    assert all(mask == np.True_ for mask in full_avla["image_mask"].values())

@@ -1,5 +1,8 @@
+import dataclasses
+
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
@@ -108,6 +111,70 @@ def test_pi0_audio_guidance_config():
 
     with pytest.raises(ValueError, match="audio_guidance_lambda must be >= 0"):
         pi0_audio.Pi0AudioConfig(audio_guidance_lambda=-0.1)
+
+
+def test_pi0_audio_route_head_config():
+    config = pi0_audio.Pi0AudioConfig(use_route_head=True, route_loss_weight=0.1)
+    obs_spec, _ = config.inputs_spec(batch_size=2)
+
+    assert obs_spec.route_label.shape == (2,)
+    assert obs_spec.route_label_mask.shape == (2,)
+    assert config.route_label_names == ("straight", "detour", "none")
+    assert config.action_loss_weight == 1.0
+
+    with pytest.raises(ValueError, match="route_loss_weight requires use_route_head=True"):
+        pi0_audio.Pi0AudioConfig(route_loss_weight=0.1)
+    with pytest.raises(ValueError, match="action_loss_weight must be >= 0"):
+        pi0_audio.Pi0AudioConfig(action_loss_weight=-0.1)
+
+
+def test_pi0_audio_route_head_dummy_model():
+    key = jax.random.key(0)
+    config = pi0_audio.Pi0AudioConfig(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=8,
+        action_horizon=4,
+        max_token_len=16,
+        audio_projector_dim=8,
+        ambient_audio_num_tokens=2,
+        instruction_audio_num_tokens=2,
+        audio_resampler_heads=2,
+        use_route_head=True,
+        route_loss_weight=0.1,
+    )
+    model = config.create(key)
+    obs, act = config.fake_obs(2), config.fake_act(2)
+
+    logits = nnx_utils.module_jit(model.predict_route_logits)(obs)
+    assert logits.shape == (2, 3)
+
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+    assert loss.shape == (2, config.action_horizon)
+
+
+def test_pi0_audio_action_loss_mask_dummy_model():
+    key = jax.random.key(1)
+    config = pi0_audio.Pi0AudioConfig(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=8,
+        action_horizon=4,
+        max_token_len=16,
+        audio_projector_dim=8,
+        ambient_audio_num_tokens=2,
+        instruction_audio_num_tokens=2,
+        audio_resampler_heads=2,
+    )
+    model = config.create(key)
+    obs, act = config.fake_obs(2), config.fake_act(2)
+    obs = dataclasses.replace(obs, action_loss_mask=jnp.array([True, False]))
+
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+
+    assert loss.shape == (2, config.action_horizon)
+    assert jnp.all(loss[1] == 0)
+    assert jnp.any(loss[0] != 0)
 
 
 def test_pi0_fast_model():

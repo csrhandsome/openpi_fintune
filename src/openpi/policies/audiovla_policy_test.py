@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 
 from openpi.policies import audiovla_policy
@@ -242,3 +244,37 @@ def test_audiovla_inputs_loads_instruction_audio_from_vad_sidecar(monkeypatch):
 
     assert np.allclose(outputs["instruction_audio"], np.array([9.0, 8.0, 7.0, 6.0], dtype=np.float32))
     assert outputs["instruction_audio_mask"] == np.True_
+
+
+def test_audiovla_inputs_loads_route_label_from_sync_sidecar(tmp_path):
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    sync_path = audio_dir / "episode_000003.sync.json"
+    sync_path.write_text(
+        json.dumps({"label": "detour", "instruction_audio_window": {"start_sec": 0.5, "end_sec": 0.6}}),
+        encoding="utf-8",
+    )
+
+    transform = audiovla_policy.AudiovlaInputs(
+        action_dim=32,
+        audio_num_samples=6,
+        instruction_audio_num_samples=4,
+        audio_sample_rate=16_000,
+        dataset_root=str(tmp_path),
+        audio_strict=False,
+    )
+    outputs = transform(
+        {
+            "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/wrist_image_left": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/joint_position": np.zeros((7,), dtype=np.float32),
+            "observation/gripper_position": np.ones((1,), dtype=np.float32),
+            "episode_index": np.int64(3),
+            "frame_index": np.int64(11),
+            "actions": np.zeros((50, 8), dtype=np.float32),
+            "prompt": "test",
+        }
+    )
+
+    assert outputs["route_label"] == np.int32(1)
+    assert outputs["route_label_mask"] == np.True_

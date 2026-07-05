@@ -72,6 +72,9 @@ IMAGE_RESOLUTION = (224, 224)
 #     "ambient_audio_mask": bool[*b],  # Optional ambient audio validity mask
 #     "instruction_audio": float32[*b, ...],  # Optional VAD-selected instruction audio representation
 #     "instruction_audio_mask": bool[*b],  # Optional instruction audio validity mask
+#     "route_label": int32[*b],  # Optional route label id for audio supervision
+#     "route_label_mask": bool[*b],  # Optional route-label validity mask
+#     "action_loss_mask": bool[*b],  # Optional action suffix loss validity mask
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
@@ -114,6 +117,12 @@ class Observation(Generic[ArrayT]):
     instruction_audio: at.Float[ArrayT, "..."] | None = None
     # Optional instruction audio validity mask.
     instruction_audio_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional route label id, e.g. straight / detour / none after transform mapping.
+    route_label: at.Int[ArrayT, "*b"] | None = None
+    # Optional route-label validity mask. Invalid labels are ignored by auxiliary losses.
+    route_label_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional action suffix loss validity mask. False samples keep auxiliary losses but skip action BC.
+    action_loss_mask: at.Bool[ArrayT, "*b"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -139,6 +148,8 @@ class Observation(Generic[ArrayT]):
             raise ValueError("ambient_audio_mask cannot be provided without ambient_audio or audio.")
         if "instruction_audio_mask" in data and "instruction_audio" not in data:
             raise ValueError("instruction_audio_mask cannot be provided without instruction_audio.")
+        if "route_label_mask" in data and "route_label" not in data:
+            raise ValueError("route_label_mask cannot be provided without route_label.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -164,12 +175,16 @@ class Observation(Generic[ArrayT]):
             data.get("instruction_audio_mask"),
         )
 
+        route_label = data.get("route_label")
+        route_label_mask = data.get("route_label_mask")
+        if route_label is not None and route_label_mask is None:
+            if isinstance(route_label, torch.Tensor):
+                route_label_mask = torch.ones(route_label.shape, dtype=torch.bool, device=route_label.device)
+            else:
+                route_label_mask = np.ones(np.asarray(route_label).shape, dtype=np.bool_)
+
         audio = ambient_audio if ambient_audio is not None else data.get("audio")
-        audio_mask = (
-            ambient_audio_mask
-            if ambient_audio_mask is not None
-            else data.get("audio_mask")
-        )
+        audio_mask = ambient_audio_mask if ambient_audio_mask is not None else data.get("audio_mask")
         audio_mask = _default_audio_mask(audio, audio_mask)
 
         return cls(
@@ -182,6 +197,9 @@ class Observation(Generic[ArrayT]):
             ambient_audio_mask=ambient_audio_mask,
             instruction_audio=instruction_audio,
             instruction_audio_mask=instruction_audio_mask,
+            route_label=route_label,
+            route_label_mask=route_label_mask,
+            action_loss_mask=data.get("action_loss_mask"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -265,15 +283,14 @@ def preprocess_observation(
         image_masks=out_masks,
         state=observation.state,
         audio=observation.audio if observation.audio is not None else observation.ambient_audio,
-        audio_mask=(
-            observation.audio_mask
-            if observation.audio_mask is not None
-            else observation.ambient_audio_mask
-        ),
+        audio_mask=(observation.audio_mask if observation.audio_mask is not None else observation.ambient_audio_mask),
         ambient_audio=observation.ambient_audio,
         ambient_audio_mask=observation.ambient_audio_mask,
         instruction_audio=observation.instruction_audio,
         instruction_audio_mask=observation.instruction_audio_mask,
+        route_label=observation.route_label,
+        route_label_mask=observation.route_label_mask,
+        action_loss_mask=observation.action_loss_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

@@ -77,6 +77,9 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._predict_route_logits = None
+        route_label_names = getattr(model, "route_label_names", None)
+        self._route_label_names = tuple(route_label_names) if route_label_names is not None else None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -85,6 +88,8 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            if getattr(model, "use_route_head", False):
+                self._predict_route_logits = nnx_utils.module_jit(model.predict_route_logits)
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -126,6 +131,15 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        route_outputs = {}
+        if self._predict_route_logits is not None:
+            route_logits = self._predict_route_logits(observation)
+            route_probabilities = jax.nn.softmax(route_logits, axis=-1)
+            route_outputs = {
+                "route_logits": route_logits,
+                "route_probabilities": route_probabilities,
+                "route_label": jnp.argmax(route_probabilities, axis=-1),
+            }
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
@@ -135,8 +149,14 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+            route_outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), route_outputs)
 
         outputs = self._output_transform(outputs)
+        outputs.update(route_outputs)
+        if self._route_label_names is not None and "route_label" in outputs:
+            route_index = int(np.asarray(outputs["route_label"]).reshape(()).item())
+            if 0 <= route_index < len(self._route_label_names):
+                outputs["route_label_name"] = self._route_label_names[route_index]
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

@@ -1,4 +1,6 @@
+import json
 import types
+import wave
 
 import numpy as np
 import torch
@@ -11,6 +13,44 @@ def test_fit_audio_window_handles_empty_audio():
 
     assert output.shape == (4,)
     assert np.allclose(output, np.zeros((4,), dtype=np.float32))
+
+
+def test_extract_episode_instruction_audio_uses_active_instruction_window(tmp_path):
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    wav_path = audio_dir / "episode_000003.wav"
+    samples = np.array([0, 1000, 2000, 3000, 4000, 5000], dtype=np.int16)
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(10)
+        wav_file.writeframes(samples.tobytes())
+
+    sync_path = audio_dir / "episode_000003.sync.json"
+    sync_path.write_text(
+        json.dumps(
+            {
+                "label": "detour",
+                "control_frequency": 10.0,
+                "instruction_audio_window": {"start_sec": 0.2, "end_sec": 0.5, "audio_valid": True},
+                "vad_segments": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    audio, has_audio = audio_tools.extract_episode_instruction_audio(
+        dataset_root=tmp_path,
+        episode_index=3,
+        frame_index=2,
+        window_num_samples=4,
+        target_sample_rate=10,
+        fallback_fps=10.0,
+    )
+
+    assert has_audio is True
+    assert audio.shape == (4,)
+    assert np.allclose(audio[-3:], samples[2:5].astype(np.float32) / np.iinfo(np.int16).max)
 
 
 def test_pcm16_bytes_to_mono_float32_stereo_average():

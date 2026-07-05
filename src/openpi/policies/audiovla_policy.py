@@ -69,10 +69,14 @@ class AudiovlaInputs(transforms.DataTransformFn):
     dataset_root: str | None = None
     audio_fallback_fps: float = 20.0
     audio_strict: bool = True
+    route_label_strict: bool = False
     model_type: _model.ModelType = _model.ModelType.PI0_AUDIO
 
     def __call__(self, data: dict) -> dict:
-        mask_padding = self.model_type in (_model.ModelType.PI0, _model.ModelType.PI0_AUDIO)
+        mask_padding = self.model_type in (
+            _model.ModelType.PI0,
+            _model.ModelType.PI0_AUDIO,
+        )
         instruction_num_samples = (
             self.audio_num_samples if self.instruction_audio_num_samples is None else self.instruction_audio_num_samples
         )
@@ -145,13 +149,19 @@ class AudiovlaInputs(transforms.DataTransformFn):
             inputs["prompt"] = prompt
 
         inputs = transforms.copy_present_audio_fields(data, inputs)
+        inputs = transforms.copy_present_route_fields(data, inputs)
+        outputs = transforms.ExtractRouteLabel(
+            dataset_root=self.dataset_root,
+            strict=self.route_label_strict,
+            fallback_fps=self.audio_fallback_fps,
+        )(inputs)
         outputs = transforms.ExtractAudioWindow(
             window_num_samples=self.audio_num_samples,
             target_sample_rate=self.audio_sample_rate,
             dataset_root=self.dataset_root,
             fallback_fps=self.audio_fallback_fps,
             strict=self.audio_strict,
-        )(inputs)
+        )(outputs)
         outputs = transforms.ExtractInstructionAudioWindow(
             window_num_samples=instruction_num_samples,
             target_sample_rate=self.audio_sample_rate,

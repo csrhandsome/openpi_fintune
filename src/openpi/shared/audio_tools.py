@@ -251,7 +251,7 @@ def whisper_num_frames_for_duration(
     """Approximate Whisper encoder output length at 20 ms resolution."""
     if num_samples <= 0:
         return 1
-    return max(1, int(round(float(num_samples) / float(sample_rate) * 50.0)))
+    return max(1, round(float(num_samples) / float(sample_rate) * 50.0))
 
 
 def qwen_asr_num_frames_for_duration(
@@ -503,7 +503,7 @@ def find_latest_completed_vad_segment(
 
 
 def block_frames_for_sample_rate(sample_rate: int, *, block_duration_s: float = 0.05) -> int:
-    return max(256, int(round(int(sample_rate) * float(block_duration_s))))
+    return max(256, round(int(sample_rate) * float(block_duration_s)))
 
 
 def pcm_array_to_mono_float32(audio: np.ndarray) -> np.ndarray:
@@ -612,7 +612,7 @@ def resolve_supported_input_sample_rate(
 
     try:
         device_info = sd.query_devices(input_device)
-        fallback_rate = int(round(float(device_info["default_samplerate"])))
+        fallback_rate = round(float(device_info["default_samplerate"]))
     except Exception:
         sd.check_input_settings(
             device=input_device,
@@ -693,14 +693,10 @@ def _live_microphone_buffer_worker_main(
         nonlocal stream
         if stream is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             stream.stop()
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             stream.close()
-        except Exception:
-            pass
         stream = None
 
     def _reset_buffer() -> None:
@@ -754,10 +750,7 @@ def _live_microphone_buffer_worker_main(
             raise ValueError("window num_samples must be > 0")
         if not chunks:
             return np.zeros((current_window_num_samples,), dtype=np.float32), False
-        if len(chunks) == 1:
-            audio = np.array(chunks[0], copy=True)
-        else:
-            audio = np.concatenate(tuple(chunks), axis=0)
+        audio = np.array(chunks[0], copy=True) if len(chunks) == 1 else np.concatenate(tuple(chunks), axis=0)
         return fit_audio_window(audio, current_window_num_samples), True
 
     def _window_response(window_num_samples_override: int | None = None) -> dict:
@@ -895,10 +888,7 @@ def _live_microphone_buffer_worker_main(
                     conn.send(_window_response(_requested_window_num_samples(command)))
                 except Exception as exc:
                     conn.send({"ok": False, "error": str(exc), **_summary()})
-            elif action == "clear":
-                _reset_buffer()
-                conn.send({"ok": True, **_summary()})
-            elif action == "reset":
+            elif action in ("clear", "reset"):
                 _reset_buffer()
                 conn.send({"ok": True, **_summary()})
             elif action == "shutdown":
@@ -1081,7 +1071,7 @@ class MultiprocessAudioBuffer:
         target_num_samples: int,
         target_sample_rate: int,
     ) -> tuple[np.ndarray, bool]:
-        # 麦的采样率假如更高的话就录更多的样本，动态的调整需要的样本的数量，比如说麦的采样率16k->48k了，那么这里就根据这个函数把16000的样本数量到48000的样本数量了
+        # Scale the raw microphone window to match the requested target-sample-rate duration.
         current_window_num_samples = _audio_util.window_num_samples_for_duration(
             target_num_samples,
             sample_rate=self._sample_rate,
@@ -1159,6 +1149,27 @@ def extract_episode_instruction_audio(
         fps=fps,
     )
     current_time_sec = float(current_end_sample) / float(sample_rate)
+
+    instruction_window = sync_data.get("instruction_audio_window")
+    if isinstance(instruction_window, dict):
+        start_sec = _safe_float(instruction_window.get("start_sec"))
+        end_sec = _safe_float(instruction_window.get("end_sec"))
+        audio_valid = bool(instruction_window.get("audio_valid", True))
+        if (
+            audio_valid
+            and start_sec is not None
+            and end_sec is not None
+            and start_sec <= current_time_sec <= end_sec
+            and end_sec >= start_sec
+        ):
+            start_sample = int(np.clip(round(start_sec * sample_rate), 0, full_audio.shape[0]))
+            end_sample = int(np.clip(round(end_sec * sample_rate), start_sample, full_audio.shape[0]))
+            segment_audio = np.ascontiguousarray(full_audio[start_sample:end_sample], dtype=np.float32)
+            if segment_audio.size > 0:
+                if sample_rate != target_sample_rate:
+                    segment_audio = resample_audio(segment_audio, sample_rate, target_sample_rate)
+                return fit_audio_window(segment_audio, window_num_samples), True
+
     segment = find_latest_completed_vad_segment(
         sync_data,
         current_time_sec=current_time_sec,
