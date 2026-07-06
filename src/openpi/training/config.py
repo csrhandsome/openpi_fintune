@@ -66,7 +66,7 @@ def _pi0_audio_stage_freeze_filter(
     if train_route:
         trainable_patterns.append(".*route.*")
     if train_action_side:
-        trainable_patterns.extend((".*state_proj.*", ".*action_.*"))
+        trainable_patterns.extend((".*state_proj.*", ".*action_.*", ".*norm_1.*Dense.*"))
     if train_lora:
         trainable_patterns.append(".*lora.*")
     return _freeze_except_trainable(*trainable_patterns)
@@ -1333,18 +1333,18 @@ _CONFIGS = [
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_6_29_audio",
+            repo_id="franka_lerobot_7_5_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_6_29_audio",
+                asset_id="franka_lerobot_7_5_audio",
             ),
             conditioning_mode="audio_action",
         ),
         weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=5_000,
+        num_train_steps=500,
         batch_size=4,
-        save_interval=1000,
+        save_interval=300,
         freeze_filter=_pi0_audio_stage_freeze_filter(
             train_audio=True,
             train_route=True,
@@ -1367,15 +1367,16 @@ _CONFIGS = [
             use_route_head=True,
             route_loss_weight=0.1,
             action_loss_weight=1.0,
+            use_audio_adaln_gate=True,
             use_audio_guidance=False,
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_6_29_audio",
+            repo_id="franka_lerobot_7_5_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_6_29_audio",
+                asset_id="franka_lerobot_7_5_audio",
             ),
             conditioning_mode="audio_action",
         ),
@@ -1405,15 +1406,16 @@ _CONFIGS = [
             use_route_head=True,
             route_loss_weight=0.1,
             action_loss_weight=1.0,
+            use_audio_adaln_gate=True,
             use_audio_guidance=False,
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_6_29_audio",
+            repo_id="franka_lerobot_7_5_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_6_29_audio",
+                asset_id="franka_lerobot_7_5_audio",
             ),
             conditioning_mode="mixed_aa_avla",
             mixed_conditioning_modes=("audio_action", "full_avla"),
@@ -1444,15 +1446,16 @@ _CONFIGS = [
             use_route_head=True,
             route_loss_weight=0.1,
             action_loss_weight=1.0,
+            use_audio_adaln_gate=True,
             use_audio_guidance=False,
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_6_29_audio",
+            repo_id="franka_lerobot_7_5_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_6_29_audio",
+                asset_id="franka_lerobot_7_5_audio",
             ),
             conditioning_mode="full_avla",
         ),

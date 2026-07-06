@@ -164,3 +164,14 @@ def test_audio_curriculum_freeze_filters_match_stage_roles():
     assert aa.trainable_filter(("action_out_proj", "kernel"), param)
     assert aa.trainable_filter(("PaliGemma", "llm", "layers_1", "lora", "kernel"), param)
     assert full.trainable_filter(("PaliGemma", "llm", "layers", "attn", "kernel"), param)
+
+
+def test_qwen_override_preserves_audio_curriculum_freeze_filter():
+    param = nnx.Param(jnp.array(0.0))
+    route = _config.enable_qwen_encoder(_config.get_config("pi0_base_audio_joint_route_warmup_lora"))
+
+    assert route.model.use_qwen
+    assert not route.model.use_whisper
+    assert route.trainable_filter(("route_head", "kernel"), param)
+    assert route.trainable_filter(("instruction_audio_resampler", "query", "kernel"), param)
+    assert not route.trainable_filter(("action_out_proj", "kernel"), param)

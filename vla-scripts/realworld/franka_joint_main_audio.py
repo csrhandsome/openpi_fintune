@@ -136,7 +136,7 @@ class Args:
 
     # Online Silero-VAD parameters for extracting the latest completed instruction utterance.
     vad_history_num_samples: int = 80_000
-    vad_threshold: float = 0.5
+    vad_threshold: float = 0.3
     vad_neg_threshold: float | None = None
     vad_min_speech_duration_ms: int = 250
     vad_max_speech_duration_s: float = 5.0
@@ -186,7 +186,6 @@ def _kmeans_topk(samples: np.ndarray, k: int = 3, iters: int = 20) -> tuple[np.n
     probs = probs / np.clip(probs.sum(), 1.0, None)
     order = np.argsort(-probs)
     return centers[order], probs[order]
-
 
 
 def _rtc_prefix_from_chunk(

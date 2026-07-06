@@ -95,6 +95,7 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     route_loss_requires_instruction_audio: bool = True
     action_loss_weight: float = 1.0
     route_label_names: tuple[str, ...] = ("straight", "detour", "none")
+    use_audio_adaln_gate: bool = False
     # Audio-CAG: v = v_no_audio + lambda * (v_audio - v_no_audio).
     # lambda=1.0 keeps the original audio-conditioned velocity; >1.0 amplifies audio.
     use_audio_guidance: bool = False
@@ -140,6 +141,8 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("route_loss_weight must be >= 0")
         if self.action_loss_weight < 0:
             raise ValueError("action_loss_weight must be >= 0")
+        if self.use_audio_adaln_gate and self.audio_tokenizer_type != "sequence_resampler":
+            raise ValueError("use_audio_adaln_gate currently requires audio_tokenizer_type='sequence_resampler'")
         if self.route_loss_weight > 0 and not self.use_route_head:
             raise ValueError("route_loss_weight requires use_route_head=True")
         if self.audio_guidance_lambda < 0:
@@ -274,6 +277,7 @@ class Pi0Audio(_model.BaseModel):
         self.action_loss_weight = config.action_loss_weight
         self.route_label_names = tuple(config.route_label_names)
         self.route_num_classes = len(config.route_label_names)
+        self.use_audio_adaln_gate = config.use_audio_adaln_gate
         self.use_audio_guidance = config.use_audio_guidance
         self.audio_guidance_lambda = config.audio_guidance_lambda
 
@@ -290,7 +294,7 @@ class Pi0Audio(_model.BaseModel):
         llm.lazy_init(
             rngs=rngs,
             method="init",
-            use_adarms=[False, True] if config.pi05 else [False, False],
+            use_adarms=[False, True] if config.pi05 or config.use_audio_adaln_gate else [False, False],
         )
         img = nnx_bridge.ToNNX(
             _siglip.Module(
@@ -353,6 +357,17 @@ class Pi0Audio(_model.BaseModel):
             self.instruction_audio_kv_norm = None
         self.ambient_audio_out_proj = nnx.Linear(config.audio_projector_dim, paligemma_config.width, rngs=rngs)
         self.instruction_audio_out_proj = nnx.Linear(config.audio_projector_dim, paligemma_config.width, rngs=rngs)
+        self.instruction_audio_pool_dim = paligemma_config.width
+        self.audio_adaln_mlp_in = (
+            nnx.Linear(paligemma_config.width, action_expert_config.width, rngs=rngs)
+            if self.use_audio_adaln_gate
+            else None
+        )
+        self.audio_adaln_mlp_out = (
+            nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if self.use_audio_adaln_gate
+            else None
+        )
         self.route_head = (
             nnx.Linear(paligemma_config.width, self.route_num_classes, rngs=rngs) if self.use_route_head else None
         )
@@ -639,6 +654,48 @@ class Pi0Audio(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    def _pool_instruction_audio(
+        self,
+        obs: _model.Observation,
+    ) -> at.Float[at.Array, "b emb"]:
+        instruction_audio_token, instruction_audio_mask = self._embed_instruction_audio_tokens(obs)
+        batch_size = obs.state.shape[0]
+        if instruction_audio_token is None or instruction_audio_mask is None:
+            return jnp.zeros((batch_size, self.instruction_audio_pool_dim), dtype=jnp.float32)
+
+        token_mask = instruction_audio_mask[..., None].astype(instruction_audio_token.dtype)
+        token_count = jnp.maximum(jnp.sum(token_mask, axis=1), 1.0)
+        return jnp.sum(instruction_audio_token * token_mask, axis=1) / token_count
+
+    def _audio_adaln_cond_from_preprocessed(
+        self,
+        obs: _model.Observation,
+    ) -> at.Float[at.Array, "b emb"] | None:
+        if not self.use_audio_adaln_gate:
+            return None
+        if self.audio_adaln_mlp_in is None or self.audio_adaln_mlp_out is None:
+            raise ValueError("AudioAdaLN gate modules are not initialized.")
+
+        audio_cond = self._pool_instruction_audio(obs)
+        audio_cond = self.audio_adaln_mlp_in(audio_cond)
+        audio_cond = nnx.swish(audio_cond)
+        return self.audio_adaln_mlp_out(audio_cond)
+
+    def _merge_adarms_cond(
+        self,
+        base_cond: at.Float[at.Array, "b ..."] | None,
+        audio_cond: at.Float[at.Array, "b emb"] | None,
+    ) -> at.Float[at.Array, "b ..."] | None:
+        if audio_cond is None:
+            return base_cond
+        if base_cond is None:
+            return audio_cond
+        if base_cond.ndim == audio_cond.ndim + 1:
+            audio_cond = audio_cond[:, None, :]
+        elif base_cond.ndim != audio_cond.ndim:
+            raise ValueError(f"Cannot merge adarms cond shapes {base_cond.shape} and {audio_cond.shape}")
+        return base_cond + audio_cond.astype(base_cond.dtype)
+
     def _predict_route_logits_from_preprocessed(
         self,
         obs: _model.Observation,
@@ -646,15 +703,7 @@ class Pi0Audio(_model.BaseModel):
         if not self.use_route_head or self.route_head is None:
             raise ValueError("Route head is disabled for this model.")
 
-        instruction_audio_token, instruction_audio_mask = self._embed_instruction_audio_tokens(obs)
-        batch_size = obs.state.shape[0]
-        if instruction_audio_token is None or instruction_audio_mask is None:
-            pooled = jnp.zeros((batch_size, self.route_head.in_features), dtype=jnp.float32)
-        else:
-            token_mask = instruction_audio_mask[..., None].astype(instruction_audio_token.dtype)
-            token_count = jnp.maximum(jnp.sum(token_mask, axis=1), 1.0)
-            pooled = jnp.sum(instruction_audio_token * token_mask, axis=1) / token_count
-        return self.route_head(pooled)
+        return self.route_head(self._pool_instruction_audio(obs))
 
     def predict_route_logits(
         self,
@@ -793,6 +842,8 @@ class Pi0Audio(_model.BaseModel):
             action_time_tokens = self.action_time_mlp_out(action_time_tokens)
             action_expert_tokens = action_time_tokens
             adarms_cond = None
+        audio_adaln_cond = self._audio_adaln_cond_from_preprocessed(obs)
+        adarms_cond = self._merge_adarms_cond(adarms_cond, audio_adaln_cond)
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         ar_mask += [True] + ([False] * (self.action_horizon - 1))

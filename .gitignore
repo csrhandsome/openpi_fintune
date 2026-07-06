@@ -178,4 +178,13 @@ cython_debug/
 
 franka_lerobot_4_9_audio
 franka_lerobot_5_1_audio
+franka_lerobot_5_1_audio_asr
+franka_lerobot_5_1_audio_mixed
+franka_lerobot_6_19_audio
+franka_lerobot_6_19_audio_asr
+franka_lerobot_6_24_audio
+franka_lerobot_6_28_audio
+franka_lerobot_6_29_audio
+franka_lerobot_7_5_audio
+franka_lerobot_7_6_audio
 *.mp4
