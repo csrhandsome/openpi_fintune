@@ -36,6 +36,8 @@ dependencies = [
     "treescope>=0.1.7",
     "transformers==4.57.6",
     "qwen-asr",
+    "qwen-tts",
+    "modelscope>=1.38.1",
     "rich>=14.0.0",
     "polars>=1.30.0",
     "matplotlib>=3.10.3",
@@ -75,6 +77,7 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74","av>=16.0.0"]
 [tool.uv.sources]
 openpi-client = { workspace = true }
 qwen-asr = { path = "third_party/Qwen3-ASR", editable = true }
+qwen-tts = { path = "third_party/Qwen3-TTS", editable = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 

@@ -10,15 +10,67 @@ import tqdm
 import tyro
 
 import openpi.models.model as _model
+from openpi.policies import audiovla_policy
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
 
 
+class AudioNormStatsInputs(transforms.DataTransformFn):
+    """Build only the fields needed for state/action norm stats."""
+
+    def __init__(self, action_dim: int):
+        self._action_dim = action_dim
+
+    def __call__(self, data: dict) -> dict:
+        joint_position = data.get("observation/joint_position", data.get("joint_position"))
+        gripper_position = data.get("observation/gripper_position", data.get("gripper_position"))
+        if joint_position is not None and gripper_position is not None:
+            gripper_position = np.asarray(gripper_position, dtype=np.float32)
+            if gripper_position.ndim == 0:
+                gripper_position = gripper_position[np.newaxis]
+            state = np.concatenate(
+                [
+                    np.asarray(joint_position, dtype=np.float32),
+                    gripper_position,
+                ],
+                axis=-1,
+            )
+        else:
+            state = data.get("observation/state", data.get("state"))
+            if state is None:
+                raise KeyError("Missing state fields for norm stats.")
+
+        output = {"state": transforms.pad_to_dim(np.asarray(state, dtype=np.float32), self._action_dim)}
+
+        actions = data.get("actions", data.get("action"))
+        if actions is not None:
+            output["actions"] = transforms.pad_to_dim(np.asarray(actions, dtype=np.float32), self._action_dim)
+        return output
+
+
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+def _norm_stats_transforms(data_config: _config.DataConfig) -> list[transforms.DataTransformFn]:
+    data_transforms = []
+    for transform in data_config.data_transforms.inputs:
+        if isinstance(transform, audiovla_policy.AudiovlaInputs):
+            data_transforms.append(AudioNormStatsInputs(transform.action_dim))
+        elif isinstance(transform, transforms.AudioVLAConditioning):
+            continue
+        else:
+            data_transforms.append(transform)
+
+    return [
+        *data_config.repack_transforms.inputs,
+        *data_transforms,
+        # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+        RemoveStrings(),
+    ]
 
 
 def create_torch_dataloader(
@@ -32,15 +84,7 @@ def create_torch_dataloader(
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = _data_loader.TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
-    )
+    dataset = _data_loader.TransformedDataset(dataset, _norm_stats_transforms(data_config))
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True
@@ -66,12 +110,7 @@ def create_rlds_dataloader(
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
+        _norm_stats_transforms(data_config),
         is_batched=True,
     )
     if max_frames is not None and max_frames < len(dataset):
