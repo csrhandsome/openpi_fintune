@@ -51,10 +51,13 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
-    # Use Qwen3-ASR audio encoder instead of Whisper for Pi0Audio configs.
+    # Use an alternate audio encoder instead of Whisper for Pi0Audio configs.
     qwen: bool = False
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
     qwen_device: str = "auto"
+    usad: bool = False
+    usad_model_name: str = "MIT-SLS/USAD2-Large"
+    usad_device: str = "auto"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -95,11 +98,19 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             train_config = _config.get_config(args.policy.config)
+            if args.qwen and args.usad:
+                raise ValueError("--qwen and --usad cannot both be enabled.")
             if args.qwen:
                 train_config = _config.enable_qwen_encoder(
                     train_config,
                     qwen_model_name=args.qwen_model_name,
                     qwen_device=args.qwen_device,
+                )
+            if args.usad:
+                train_config = _config.enable_usad_encoder(
+                    train_config,
+                    usad_model_name=args.usad_model_name,
+                    usad_device=args.usad_device,
                 )
             return _policy_config.create_trained_policy(
                 train_config, args.policy.dir, default_prompt=args.default_prompt

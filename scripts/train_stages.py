@@ -35,6 +35,9 @@ class StagedTrainArgs:
     qwen: bool = False
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
     qwen_device: str = "auto"
+    usad: bool = False
+    usad_model_name: str = "MIT-SLS/USAD2-Large"
+    usad_device: str = "auto"
     num_train_steps: tuple[int, ...] = ()
     save_interval: tuple[int, ...] = ()
 
@@ -81,11 +84,19 @@ def _build_stage_config(
     previous_params_path: pathlib.Path | None,
 ) -> _config.TrainConfig:
     config = _config.get_config(config_name)
+    if args.qwen and args.usad:
+        raise ValueError("--qwen and --usad cannot both be enabled.")
     if args.qwen:
         config = _config.enable_qwen_encoder(
             config,
             qwen_model_name=args.qwen_model_name,
             qwen_device=args.qwen_device,
+        )
+    if args.usad:
+        config = _config.enable_usad_encoder(
+            config,
+            usad_model_name=args.usad_model_name,
+            usad_device=args.usad_device,
         )
 
     updates = {

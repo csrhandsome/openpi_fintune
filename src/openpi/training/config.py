@@ -26,8 +26,8 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
-import openpi.shared.normalize as _normalize
 import openpi.shared.nnx_utils as nnx_utils
+import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -600,6 +600,7 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
                     audio_sample_rate=model_config.audio_sample_rate,
                     use_whisper=model_config.use_whisper,
                     use_qwen=model_config.use_qwen,
+                    use_usad=model_config.use_usad,
                     audio_tokenizer_type=model_config.audio_tokenizer_type,
                     whisper_model_name=model_config.whisper_model_name,
                     whisper_output_dim=model_config.audio_feature_dim,
@@ -609,6 +610,11 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
                     if model_config.use_qwen
                     else model_config.qwen_output_dim,
                     qwen_device=model_config.qwen_device,
+                    usad_model_name=model_config.usad_model_name,
+                    usad_output_dim=model_config.audio_feature_dim
+                    if model_config.use_usad
+                    else model_config.usad_output_dim,
+                    usad_device=model_config.usad_device,
                     dataset_root=dataset_root,
                     audio_fallback_fps=self.audio_fallback_fps,
                     audio_strict=self.audio_strict,
@@ -1558,6 +1564,7 @@ def enable_qwen_encoder(
         config.model,
         use_whisper=False,
         use_qwen=True,
+        use_usad=False,
         qwen_model_name=qwen_model_name,
         qwen_output_dim=None,
         qwen_device=qwen_device,
@@ -1567,7 +1574,34 @@ def enable_qwen_encoder(
     return dataclasses.replace(
         config,
         model=model,
-        freeze_filter=model.get_freeze_filter(),
+    )
+
+
+def enable_usad_encoder(
+    config: TrainConfig,
+    *,
+    usad_model_name: str = "MIT-SLS/USAD2-Large",
+    usad_device: str = "auto",
+    instruction_audio_num_samples: int = 32_000,
+    instruction_audio_num_tokens: int = 24,
+) -> TrainConfig:
+    if not isinstance(config.model, pi0_audio.Pi0AudioConfig):
+        raise TypeError("--usad can only be used with Pi0AudioConfig-based configs.")
+
+    model = dataclasses.replace(
+        config.model,
+        use_whisper=False,
+        use_qwen=False,
+        use_usad=True,
+        usad_model_name=usad_model_name,
+        usad_output_dim=None,
+        usad_device=usad_device,
+        instruction_audio_num_samples=instruction_audio_num_samples,
+        instruction_audio_num_tokens=instruction_audio_num_tokens,
+    )
+    return dataclasses.replace(
+        config,
+        model=model,
     )
 
 
@@ -1602,14 +1636,25 @@ def _pop_cli_bool(argv: list[str], name: str) -> bool:
 def cli() -> TrainConfig:
     argv = sys.argv
     qwen = _pop_cli_bool(argv, "qwen")
+    usad = _pop_cli_bool(argv, "usad")
+    if qwen and usad:
+        raise ValueError("--qwen and --usad cannot both be enabled.")
     qwen_model_name = _pop_cli_value(argv, "qwen-model-name", "Qwen/Qwen3-ASR-0.6B")
     qwen_device = _pop_cli_value(argv, "qwen-device", "auto")
+    usad_model_name = _pop_cli_value(argv, "usad-model-name", "MIT-SLS/USAD2-Large")
+    usad_device = _pop_cli_value(argv, "usad-device", "auto")
     config = tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
     if qwen:
         config = enable_qwen_encoder(
             config,
             qwen_model_name=qwen_model_name,
             qwen_device=qwen_device,
+        )
+    if usad:
+        config = enable_usad_encoder(
+            config,
+            usad_model_name=usad_model_name,
+            usad_device=usad_device,
         )
     return config
 

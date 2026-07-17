@@ -86,6 +86,22 @@ def test_pi0_audio_qwen_inputs_spec_uses_feature_dim():
     assert obs_spec.instruction_audio.shape == (2, 26, 1024)
 
 
+def test_pi0_audio_usad_inputs_spec_uses_feature_dim():
+    config = pi0_audio.Pi0AudioConfig(
+        use_usad=True,
+        usad_model_name="MIT-SLS/USAD2-Large",
+        instruction_audio_num_samples=32_000,
+    )
+    obs_spec, _ = config.inputs_spec(batch_size=2)
+
+    assert config.audio_feature_dim == 1024
+    assert config.ambient_audio_num_frames == 50
+    assert config.instruction_audio_num_frames == 100
+    assert obs_spec.audio.shape == (2, 50, 1024)
+    assert obs_spec.ambient_audio.shape == (2, 50, 1024)
+    assert obs_spec.instruction_audio.shape == (2, 100, 1024)
+
+
 def test_pi0_audio_whisper_baseline_inputs_spec_uses_pooled_feature_dim():
     config = pi0_audio.Pi0AudioConfig(
         use_whisper=True,

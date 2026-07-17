@@ -691,7 +691,7 @@ def _stable_index_from_fields(
     return int(accumulator % modulo) if found else 0
 
 
-def _set_audio_masks(data: dict, value: bool) -> None:
+def _set_audio_masks(data: dict, *, value: bool) -> None:
     for key in ("audio_mask", "ambient_audio_mask", "instruction_audio_mask"):
         if key in data:
             data[key] = np.bool_(value)
@@ -727,9 +727,9 @@ class AudioVLAConditioning(DataTransformFn):
 
         output = dict(data)
         if mode == "audio_action":
-            output["image_mask"] = {key: np.False_ for key in output.get("image_mask", {})}
+            output["image_mask"] = dict.fromkeys(output.get("image_mask", {}), np.False_)
         elif mode == "image_action":
-            _set_audio_masks(output, False)
+            _set_audio_masks(output, value=False)
         else:
             raise ValueError(f"Unsupported resolved AVLA conditioning mode: {mode}")
         return output
@@ -1136,6 +1136,105 @@ class ExtractQwenASRAudioEmbedding(DataTransformFn):
         embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if embedding.shape != (expected_dim,):
             raise ValueError(f"Qwen ASR embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
+
+        return {
+            **data,
+            self.audio_key: embedding,
+            self.audio_mask_key: np.True_,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractUSADAudioSequence(DataTransformFn):
+    """Encode an audio waveform window into USAD encoder features."""
+
+    model_name: str = "MIT-SLS/USAD2-Large"
+    sample_rate: int = 16_000
+    device: str = "auto"
+    num_frames: int | None = None
+    output_dim: int | None = None
+    audio_key: str = "audio"
+    audio_mask_key: str = "audio_mask"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_audio = data.get(self.audio_key)
+        if raw_audio is None:
+            raise ValueError(f"USAD sequence extraction requires a `{self.audio_key}` field.")
+
+        raw_mask = data.get(self.audio_mask_key)
+        has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
+        expected_dim = self.output_dim or _audio_tools.infer_usad_hidden_size(self.model_name)
+        target_num_frames = self.num_frames or _audio_tools.usad_num_frames_for_duration(
+            int(np.asarray(raw_audio).reshape(-1).shape[0]),
+            sample_rate=self.sample_rate,
+            model_name=self.model_name,
+        )
+
+        if not has_audio:
+            return {
+                **data,
+                self.audio_key: np.zeros((target_num_frames, expected_dim), dtype=np.float32),
+                self.audio_mask_key: np.False_,
+            }
+
+        sequence = _audio_tools.compute_usad_audio_sequence(
+            np.asarray(raw_audio, dtype=np.float32),
+            sample_rate=self.sample_rate,
+            model_name=self.model_name,
+            device=self.device,
+        )
+        sequence = np.asarray(sequence, dtype=np.float32)
+        if sequence.ndim != 2:
+            raise ValueError(f"USAD sequence must be rank-2, got shape {sequence.shape}")
+        if sequence.shape[-1] != expected_dim:
+            raise ValueError(f"USAD sequence hidden size mismatch: expected {expected_dim}, got {sequence.shape[-1]}")
+        sequence = _audio_tools.fit_audio_feature_sequence(sequence, target_num_frames)
+
+        return {
+            **data,
+            self.audio_key: sequence,
+            self.audio_mask_key: np.True_,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractUSADAudioEmbedding(DataTransformFn):
+    """Encode an audio waveform window into a pooled USAD embedding."""
+
+    model_name: str = "MIT-SLS/USAD2-Large"
+    sample_rate: int = 16_000
+    device: str = "auto"
+    pooling: Literal["mean", "first"] = "mean"
+    output_dim: int | None = None
+    audio_key: str = "audio"
+    audio_mask_key: str = "audio_mask"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        raw_audio = data.get(self.audio_key)
+        if raw_audio is None:
+            raise ValueError(f"USAD embedding extraction requires a `{self.audio_key}` field.")
+
+        raw_mask = data.get(self.audio_mask_key)
+        has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
+        expected_dim = self.output_dim or _audio_tools.infer_usad_hidden_size(self.model_name)
+
+        if not has_audio:
+            return {
+                **data,
+                self.audio_key: np.zeros((expected_dim,), dtype=np.float32),
+                self.audio_mask_key: np.False_,
+            }
+
+        embedding = _audio_tools.compute_usad_audio_embedding(
+            np.asarray(raw_audio, dtype=np.float32),
+            sample_rate=self.sample_rate,
+            model_name=self.model_name,
+            device=self.device,
+            pooling=self.pooling,
+        )
+        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if embedding.shape != (expected_dim,):
+            raise ValueError(f"USAD embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
 
         return {
             **data,

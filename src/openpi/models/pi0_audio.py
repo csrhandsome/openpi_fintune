@@ -79,6 +79,7 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     audio_resampler_heads: int = 8
     use_whisper: bool = False
     use_qwen: bool = False
+    use_usad: bool = False
     audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
@@ -86,6 +87,9 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
     qwen_output_dim: int | None = None
     qwen_device: str = "auto"
+    usad_model_name: str = "MIT-SLS/USAD2-Large"
+    usad_output_dim: int | None = None
+    usad_device: str = "auto"
     use_audio_limoe: bool = False
     audio_limoe_num_experts: int = 4
     audio_limoe_top_k: int = 1
@@ -119,8 +123,8 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("audio_resampler_heads must be > 0")
         if self.audio_tokenizer_type not in ("sequence_resampler", "pooled_baseline"):
             raise ValueError("audio_tokenizer_type must be 'sequence_resampler' or 'pooled_baseline'")
-        if self.use_whisper and self.use_qwen:
-            raise ValueError("use_whisper and use_qwen cannot both be True")
+        if sum((self.use_whisper, self.use_qwen, self.use_usad)) > 1:
+            raise ValueError("Only one of use_whisper, use_qwen, and use_usad can be True")
         if self.audio_limoe_num_experts <= 0:
             raise ValueError("audio_limoe_num_experts must be > 0")
         if self.audio_limoe_top_k <= 0:
@@ -129,6 +133,8 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("whisper_output_dim must be > 0")
         if self.qwen_output_dim is not None and self.qwen_output_dim <= 0:
             raise ValueError("qwen_output_dim must be > 0")
+        if self.usad_output_dim is not None and self.usad_output_dim <= 0:
+            raise ValueError("usad_output_dim must be > 0")
         if self.rtc_train_max_delay < 0:
             raise ValueError("rtc_train_max_delay must be >= 0")
         if self.rtc_train_max_delay >= self.action_horizon:
@@ -158,11 +164,15 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             if self.qwen_output_dim is not None:
                 return self.qwen_output_dim
             return _audio_tools.infer_qwen_asr_hidden_size(self.qwen_model_name)
+        if self.use_usad:
+            if self.usad_output_dim is not None:
+                return self.usad_output_dim
+            return _audio_tools.infer_usad_hidden_size(self.usad_model_name)
         return 1
 
     @property
     def ambient_audio_input_shape(self) -> tuple[int, ...]:
-        if self.use_whisper or self.use_qwen:
+        if self.use_whisper or self.use_qwen or self.use_usad:
             if self.audio_tokenizer_type == "pooled_baseline":
                 return (self.audio_feature_dim,)
             return (self.ambient_audio_num_frames, self.audio_feature_dim)
@@ -170,7 +180,7 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def instruction_audio_input_shape(self) -> tuple[int, ...]:
-        if self.use_whisper or self.use_qwen:
+        if self.use_whisper or self.use_qwen or self.use_usad:
             if self.audio_tokenizer_type == "pooled_baseline":
                 return (self.audio_feature_dim,)
             return (self.instruction_audio_num_frames, self.audio_feature_dim)
@@ -187,6 +197,12 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
                 self.ambient_audio_num_samples,
                 sample_rate=self.audio_sample_rate,
             )
+        if self.use_usad:
+            return _audio_tools.usad_num_frames_for_duration(
+                self.ambient_audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+                model_name=self.usad_model_name,
+            )
         return _audio_tools.whisper_num_frames_for_duration(
             self.ambient_audio_num_samples,
             sample_rate=self.audio_sample_rate,
@@ -198,6 +214,12 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             return _audio_tools.qwen_asr_num_frames_for_duration(
                 self.instruction_audio_num_samples,
                 sample_rate=self.audio_sample_rate,
+            )
+        if self.use_usad:
+            return _audio_tools.usad_num_frames_for_duration(
+                self.instruction_audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+                model_name=self.usad_model_name,
             )
         return _audio_tools.whisper_num_frames_for_duration(
             self.instruction_audio_num_samples,

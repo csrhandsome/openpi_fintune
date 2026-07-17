@@ -132,13 +132,24 @@ def main(
     qwen: bool = False,
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B",
     qwen_device: str = "auto",
+    usad: bool = False,
+    usad_model_name: str = "MIT-SLS/USAD2-Large",
+    usad_device: str = "auto",
 ):
     config = _config.get_config(config_name)
+    if qwen and usad:
+        raise ValueError("--qwen and --usad cannot both be enabled.")
     if qwen:
         config = _config.enable_qwen_encoder(
             config,
             qwen_model_name=qwen_model_name,
             qwen_device=qwen_device,
+        )
+    if usad:
+        config = _config.enable_usad_encoder(
+            config,
+            usad_model_name=usad_model_name,
+            usad_device=usad_device,
         )
     data_config = config.data.create(config.assets_dirs, config.model)
 

@@ -3,9 +3,9 @@ import importlib.util
 import pathlib
 import sys
 
+from flax import nnx
 import jax
 import jax.numpy as jnp
-from flax import nnx
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -15,7 +15,8 @@ from openpi.training import data_loader as _data_loader
 def _load_train_stages_module():
     module_path = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "train_stages.py"
     spec = importlib.util.spec_from_file_location("train_stages_for_test", module_path)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -171,6 +172,18 @@ def test_qwen_override_preserves_audio_curriculum_freeze_filter():
     route = _config.enable_qwen_encoder(_config.get_config("pi0_base_audio_joint_route_warmup_lora"))
 
     assert route.model.use_qwen
+    assert not route.model.use_whisper
+    assert route.trainable_filter(("route_head", "kernel"), param)
+    assert route.trainable_filter(("instruction_audio_resampler", "query", "kernel"), param)
+    assert not route.trainable_filter(("action_out_proj", "kernel"), param)
+
+
+def test_usad_override_preserves_audio_curriculum_freeze_filter():
+    param = nnx.Param(jnp.array(0.0))
+    route = _config.enable_usad_encoder(_config.get_config("pi0_base_audio_joint_route_warmup_lora"))
+
+    assert route.model.use_usad
+    assert not route.model.use_qwen
     assert not route.model.use_whisper
     assert route.trainable_filter(("route_head", "kernel"), param)
     assert route.trainable_filter(("instruction_audio_resampler", "query", "kernel"), param)

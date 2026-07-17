@@ -37,6 +37,14 @@ _QWEN_ASR_HIDDEN_SIZES = {
     "Qwen/Qwen3-ASR-1.7B": 2048,
 }
 
+_USAD_HIDDEN_SIZES = {
+    "MIT-SLS/USAD2-Large": 1024,
+}
+
+_USAD_ENCODER_FRAME_RATES = {
+    "MIT-SLS/USAD2-Large": 50.0,
+}
+
 
 def infer_whisper_hidden_size(model_name: str) -> int:
     try:
@@ -55,6 +63,25 @@ def infer_qwen_asr_hidden_size(model_name: str) -> int:
         raise ValueError(
             f"Unsupported Qwen ASR model {model_name!r}. "
             "Set qwen_output_dim explicitly or extend _QWEN_ASR_HIDDEN_SIZES."
+        ) from exc
+
+
+def infer_usad_hidden_size(model_name: str) -> int:
+    try:
+        return _USAD_HIDDEN_SIZES[model_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported USAD model {model_name!r}. Set usad_output_dim explicitly or extend _USAD_HIDDEN_SIZES."
+        ) from exc
+
+
+def infer_usad_encoder_frame_rate(model_name: str) -> float:
+    try:
+        return _USAD_ENCODER_FRAME_RATES[model_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported USAD model {model_name!r}. "
+            "Set the frame count explicitly or extend _USAD_ENCODER_FRAME_RATES."
         ) from exc
 
 
@@ -106,6 +133,36 @@ def _load_qwen_asr_components(model_name: str, device: str):
     model.eval()
     model.to(resolved_device)
     return processor, model, resolved_device
+
+
+def _get_model_attr(model, names: tuple[str, ...], default):
+    config = getattr(model, "config", None)
+    for source in (model, config):
+        if source is None:
+            continue
+        for name in names:
+            value = getattr(source, name, None)
+            if value is not None:
+                return value
+    return default
+
+
+@functools.lru_cache(maxsize=4)
+def _load_usad_components(model_name: str, device: str):
+    from transformers import AutoModel
+
+    resolved_device = _resolve_whisper_device(device)
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model.eval()
+    model.to(resolved_device)
+    sample_rate = int(_get_model_attr(model, ("sample_rate", "sampling_rate"), 16_000))
+    encoder_dim = int(
+        _get_model_attr(model, ("encoder_dim", "hidden_size", "d_model"), infer_usad_hidden_size(model_name))
+    )
+    encoder_frame_rate = float(
+        _get_model_attr(model, ("encoder_frame_rate", "frame_rate"), infer_usad_encoder_frame_rate(model_name))
+    )
+    return model, resolved_device, sample_rate, encoder_dim, encoder_frame_rate
 
 
 def compute_whisper_audio_embedding(
@@ -243,6 +300,116 @@ def compute_qwen_asr_audio_embedding(
     raise ValueError(f"Unsupported Qwen ASR pooling {pooling!r}")
 
 
+def _call_usad_model(model, audio, audio_lengths):
+    call_errors = []
+    for call in (
+        lambda: model(audio, audio_lengths),
+        lambda: model(audio=audio, audio_lengths=audio_lengths),
+        lambda: model(wavs=audio, wavs_len=audio_lengths),
+        lambda: model(input_values=audio, input_lengths=audio_lengths),
+    ):
+        try:
+            return call()
+        except TypeError as exc:
+            call_errors.append(exc)
+    raise TypeError("Could not call USAD model with a supported audio/length signature.") from call_errors[-1]
+
+
+def _get_output_value(outputs, names: tuple[str, ...]):
+    if isinstance(outputs, dict):
+        for name in names:
+            if name in outputs and outputs[name] is not None:
+                return outputs[name]
+    for name in names:
+        value = getattr(outputs, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def compute_usad_audio_sequence(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    model_name: str,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Extract USAD encoder hidden states without running text decoding."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if audio.ndim != 1:
+        raise ValueError(f"Expected 1D audio, got shape {audio.shape}")
+
+    model, resolved_device, model_sample_rate, _, _ = _load_usad_components(model_name, device)
+
+    import torch
+
+    waveform = torch.from_numpy(audio).to(device=resolved_device, dtype=torch.float32)[None, :]
+    if int(sample_rate) != int(model_sample_rate):
+        try:
+            import torchaudio.functional as torchaudio_functional
+        except ImportError as exc:
+            raise ImportError("USAD audio resampling requires torchaudio.") from exc
+        waveform = torchaudio_functional.resample(
+            waveform,
+            orig_freq=int(sample_rate),
+            new_freq=int(model_sample_rate),
+        )
+
+    audio_lengths = torch.tensor([waveform.shape[-1]], dtype=torch.long, device=resolved_device)
+    with torch.inference_mode():
+        outputs = _call_usad_model(model, waveform, audio_lengths)
+
+    hidden = _get_output_value(outputs, ("x", "last_hidden_state", "hidden_states"))
+    if hidden is None and isinstance(outputs, tuple) and outputs:
+        hidden = outputs[0]
+    if hidden is None:
+        raise ValueError("USAD model output did not contain `x` or hidden states.")
+
+    lengths = _get_output_value(outputs, ("x_lengths", "lengths", "audio_lengths"))
+    padding_mask = _get_output_value(outputs, ("x_padding_mask", "padding_mask"))
+
+    if hidden.ndim == 3:
+        sequence = hidden[0]
+    elif hidden.ndim == 2:
+        sequence = hidden
+    else:
+        raise ValueError(f"Expected USAD audio features with shape [T, D] or [B, T, D], got {tuple(hidden.shape)}")
+
+    if lengths is not None:
+        real_num_frames = int(lengths.reshape(-1)[0].item())
+        sequence = sequence[: max(1, min(real_num_frames, int(sequence.shape[0])))]
+    elif padding_mask is not None:
+        mask = padding_mask[0] if padding_mask.ndim == 2 else padding_mask
+        if mask.dtype == torch.bool:
+            real_num_frames = int((~mask).to(dtype=torch.int64).sum().item())
+        else:
+            real_num_frames = int(mask.to(dtype=torch.int64).sum().item())
+        sequence = sequence[: max(1, min(real_num_frames, int(sequence.shape[0])))]
+
+    return sequence.to(dtype=torch.float32, device="cpu").numpy()
+
+
+def compute_usad_audio_embedding(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    model_name: str,
+    device: str = "cpu",
+    pooling: str = "mean",
+) -> np.ndarray:
+    sequence = compute_usad_audio_sequence(
+        audio,
+        sample_rate=sample_rate,
+        model_name=model_name,
+        device=device,
+    )
+    if pooling == "mean":
+        return np.mean(sequence, axis=0, dtype=np.float32)
+    if pooling == "first":
+        return np.asarray(sequence[0], dtype=np.float32)
+    raise ValueError(f"Unsupported USAD pooling {pooling!r}")
+
+
 def whisper_num_frames_for_duration(
     num_samples: int,
     *,
@@ -274,6 +441,19 @@ def qwen_asr_num_frames_for_feature_frames(num_feature_frames: int) -> int:
     feat_lengths = (residual - 1) // 2 + 1
     output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (num_feature_frames // 100) * 13
     return max(1, output_lengths)
+
+
+def usad_num_frames_for_duration(
+    num_samples: int,
+    *,
+    sample_rate: int,
+    model_name: str = "MIT-SLS/USAD2-Large",
+) -> int:
+    """Approximate USAD encoder output length from the model encoder frame rate."""
+    if num_samples <= 0:
+        return 1
+    frame_rate = infer_usad_encoder_frame_rate(model_name)
+    return max(1, round(float(num_samples) / float(sample_rate) * frame_rate))
 
 
 def fit_audio_feature_sequence(

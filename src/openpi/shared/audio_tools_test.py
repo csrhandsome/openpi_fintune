@@ -114,3 +114,31 @@ def test_compute_whisper_audio_sequence_pads_for_encoder_and_keeps_real_prefix(m
     }
     assert output.shape == (50, 1)
     assert np.allclose(output[:, 0], np.arange(50, dtype=np.float32))
+
+
+def test_compute_usad_audio_sequence_uses_output_lengths(monkeypatch):
+    calls = {}
+
+    class FakeUSADModel:
+        def __call__(self, audio, audio_lengths):
+            calls["audio_shape"] = tuple(audio.shape)
+            calls["audio_lengths"] = audio_lengths.detach().cpu().numpy().tolist()
+            hidden = torch.arange(20, dtype=torch.float32).reshape(1, 5, 4)
+            return {"x": hidden, "x_lengths": torch.tensor([3], dtype=torch.long)}
+
+    monkeypatch.setattr(
+        audio_tools,
+        "_load_usad_components",
+        lambda model_name, device: (FakeUSADModel(), "cpu", 16_000, 4, 50.0),
+    )
+
+    output = audio_tools.compute_usad_audio_sequence(
+        np.ones((16_000,), dtype=np.float32),
+        sample_rate=16_000,
+        model_name="MIT-SLS/USAD2-Large",
+        device="cpu",
+    )
+
+    assert calls == {"audio_shape": (1, 16_000), "audio_lengths": [16_000]}
+    assert output.shape == (3, 4)
+    assert np.allclose(output, np.arange(12, dtype=np.float32).reshape(3, 4))

@@ -59,6 +59,7 @@ class AudiovlaInputs(transforms.DataTransformFn):
     audio_sample_rate: int = 16_000
     use_whisper: bool = False
     use_qwen: bool = False
+    use_usad: bool = False
     audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
@@ -66,6 +67,9 @@ class AudiovlaInputs(transforms.DataTransformFn):
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
     qwen_output_dim: int | None = None
     qwen_device: str = "auto"
+    usad_model_name: str = "MIT-SLS/USAD2-Large"
+    usad_output_dim: int | None = None
+    usad_device: str = "auto"
     dataset_root: str | None = None
     audio_fallback_fps: float = 20.0
     audio_strict: bool = True
@@ -169,9 +173,62 @@ class AudiovlaInputs(transforms.DataTransformFn):
             fallback_fps=self.audio_fallback_fps,
             strict=self.audio_strict,
         )(outputs)
-        if self.use_whisper and self.use_qwen:
-            raise ValueError("use_whisper and use_qwen cannot both be True.")
-        if not self.use_whisper and not self.use_qwen:
+        encoder_count = sum((self.use_whisper, self.use_qwen, self.use_usad))
+        if encoder_count > 1:
+            raise ValueError("Only one of use_whisper, use_qwen, and use_usad can be True.")
+        if encoder_count == 0:
+            return outputs
+
+        if self.use_usad:
+            if self.audio_tokenizer_type == "pooled_baseline":
+                outputs = transforms.ExtractUSADAudioEmbedding(
+                    model_name=self.usad_model_name,
+                    sample_rate=self.audio_sample_rate,
+                    device=self.usad_device,
+                    output_dim=self.usad_output_dim,
+                    audio_key="ambient_audio",
+                    audio_mask_key="ambient_audio_mask",
+                )(outputs)
+                outputs = transforms.ExtractUSADAudioEmbedding(
+                    model_name=self.usad_model_name,
+                    sample_rate=self.audio_sample_rate,
+                    device=self.usad_device,
+                    output_dim=self.usad_output_dim,
+                    audio_key="instruction_audio",
+                    audio_mask_key="instruction_audio_mask",
+                )(outputs)
+                outputs["audio"] = outputs["ambient_audio"]
+                outputs["audio_mask"] = outputs["ambient_audio_mask"]
+                return outputs
+
+            outputs = transforms.ExtractUSADAudioSequence(
+                model_name=self.usad_model_name,
+                sample_rate=self.audio_sample_rate,
+                device=self.usad_device,
+                num_frames=_audio_tools.usad_num_frames_for_duration(
+                    self.audio_num_samples,
+                    sample_rate=self.audio_sample_rate,
+                    model_name=self.usad_model_name,
+                ),
+                output_dim=self.usad_output_dim,
+                audio_key="ambient_audio",
+                audio_mask_key="ambient_audio_mask",
+            )(outputs)
+            outputs = transforms.ExtractUSADAudioSequence(
+                model_name=self.usad_model_name,
+                sample_rate=self.audio_sample_rate,
+                device=self.usad_device,
+                num_frames=_audio_tools.usad_num_frames_for_duration(
+                    instruction_num_samples,
+                    sample_rate=self.audio_sample_rate,
+                    model_name=self.usad_model_name,
+                ),
+                output_dim=self.usad_output_dim,
+                audio_key="instruction_audio",
+                audio_mask_key="instruction_audio_mask",
+            )(outputs)
+            outputs["audio"] = outputs["ambient_audio"]
+            outputs["audio_mask"] = outputs["ambient_audio_mask"]
             return outputs
 
         if self.use_qwen:

@@ -166,6 +166,51 @@ def test_audiovla_inputs_extract_qwen_sequence(monkeypatch):
     assert outputs["instruction_audio_mask"] == np.False_
 
 
+def test_audiovla_inputs_extract_usad_sequence(monkeypatch):
+    def fake_usad_sequence(audio, *, sample_rate, model_name, device):
+        assert audio.shape in ((6,), (4,))
+        assert sample_rate == 16_000
+        assert model_name == "MIT-SLS/USAD2-Large"
+        assert device == "auto"
+        return np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+
+    monkeypatch.setattr(audio_tools, "compute_usad_audio_sequence", fake_usad_sequence)
+
+    transform = audiovla_policy.AudiovlaInputs(
+        action_dim=32,
+        audio_num_samples=6,
+        instruction_audio_num_samples=4,
+        audio_sample_rate=16_000,
+        use_usad=True,
+        usad_model_name="MIT-SLS/USAD2-Large",
+        usad_output_dim=4,
+        usad_device="auto",
+        audio_strict=False,
+    )
+    outputs = transform(
+        {
+            "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/wrist_image_left": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/joint_position": np.zeros((7,), dtype=np.float32),
+            "observation/gripper_position": np.ones((1,), dtype=np.float32),
+            "observation/audio": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+            "observation/audio_sample_rate": np.int32(16_000),
+            "actions": np.zeros((50, 8), dtype=np.float32),
+            "prompt": "test",
+        }
+    )
+
+    assert outputs["audio"].shape == (1, 4)
+    assert outputs["ambient_audio"].shape == (1, 4)
+    assert outputs["instruction_audio"].shape == (1, 4)
+    assert np.allclose(outputs["audio"], np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32))
+    assert np.allclose(outputs["ambient_audio"], np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32))
+    assert np.allclose(outputs["instruction_audio"], np.zeros((1, 4), dtype=np.float32))
+    assert outputs["audio_mask"] == np.True_
+    assert outputs["ambient_audio_mask"] == np.True_
+    assert outputs["instruction_audio_mask"] == np.False_
+
+
 def test_audiovla_inputs_extract_whisper_embedding_baseline(monkeypatch):
     def fake_whisper_embedding(audio, *, sample_rate, model_name, device, pooling):
         assert audio.shape in ((6,), (4,))

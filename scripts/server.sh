@@ -6,22 +6,22 @@ uv run scripts/serve_policy.py policy:checkpoint \
 # pi0 的 server 启动脚本  可以在server_policy里面修改端口号
 uv run scripts/serve_policy.py policy:checkpoint \
   --policy.config=pi0_base_audio_joint_lora \
-  --policy.dir=checkpoints/pi0_base_audio_joint_lora/pi0_audio_6_1_qwen/19999
+  --policy.dir=checkpoints/pi0_base_audio_joint_lora/pi0_audio_6_1_usad/19999
 
-# qwen版本的
+# USAD2-Large 版本
 export HF_LEROBOT_HOME="$(pwd)"
 export HF_HUB_OFFLINE=1
-uv run scripts/serve_policy.py --qwen --qwen-device cpu policy:checkpoint \
+uv run scripts/serve_policy.py --usad --usad-device cpu policy:checkpoint \
   --policy.config=pi0_base_audio_joint_lora \
   --policy.dir=checkpoints/pi0_base_audio_joint_lora/franka_lerobot_6_29_audio_32chunk/29999
 
 # 4stage版本的
 export HF_LEROBOT_HOME="$(pwd)"
 export HF_HUB_OFFLINE=1
-uv run scripts/serve_policy.py --qwen --qwen-device cpu policy:checkpoint \
+uv run scripts/serve_policy.py --usad --usad-device cpu policy:checkpoint \
   --policy.config=pi0_base_audio_joint_full_avla_lora \
   --policy.dir=checkpoints/pi0_base_audio_joint_full_avla_lora/final_avla/15000
-uv run scripts/serve_policy.py --qwen --qwen-device cpu policy:checkpoint \
+uv run scripts/serve_policy.py --usad --usad-device cpu policy:checkpoint \
   --policy.config=pi0_base_audio_joint_mixed_aa_avla_lora \
   --policy.dir=checkpoints/pi0_base_audio_joint_mixed_aa_avla_lora/ckpt_mixed_avla/29999
 # 传递到5090(ssh)
