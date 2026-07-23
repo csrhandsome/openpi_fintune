@@ -104,19 +104,29 @@ class AudiovlaInputs(transforms.DataTransformFn):
                 axis=-1,
             )
         else:
-            state_raw = _get_first_present(data, ("observation/state", "state"))
+            state_raw = _get_first_present(data, ("observation/state", "state", "observation.state"))
         state = transforms.pad_to_dim(np.asarray(state_raw, dtype=np.float32), self.action_dim)
 
         base_image = _parse_image(
             _get_first_present(
                 data,
-                ("observation/exterior_image_1_left", "image", "observation.image"),
+                (
+                    "observation/exterior_image_1_left",
+                    "observation/image",
+                    "image",
+                    "observation.image",
+                ),
             )
         )
         left_wrist_image = _parse_image(
             _get_first_present(
                 data,
-                ("observation/wrist_image_left", "wrist_image_left", "wrist_image"),
+                (
+                    "observation/wrist_image_left",
+                    "observation/wrist_image",
+                    "wrist_image_left",
+                    "wrist_image",
+                ),
             )
         )
 

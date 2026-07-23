@@ -570,9 +570,18 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
         if not isinstance(model_config, pi0_audio.Pi0AudioConfig):
             raise TypeError("LeRobotFrankaJointAudioDataConfig requires Pi0AudioConfig.")
 
-        dataset_root = self.repo_id if self.repo_id is not tyro.MISSING else None
-        if dataset_root is None:
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        if repo_id is None:
             raise ValueError("repo_id is required for Franka audio datasets with sidecar WAV files.")
+
+        # Prefer an explicit on-disk path; otherwise resolve via LeRobot home.
+        repo_path = pathlib.Path(repo_id)
+        if repo_path.is_dir():
+            dataset_root = str(repo_path)
+        else:
+            from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+
+            dataset_root = str(HF_LEROBOT_HOME / repo_id)
 
         repack_transform = _transforms.Group(
             inputs=[
@@ -632,6 +641,111 @@ class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
             inputs=[_transforms.DeltaActions(delta_action_mask)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
         )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoAudioDataConfig(DataConfigFactory):
+    """LIBERO / OmniAction-LIBERO LeRobot dataset with episode audio sidecars.
+
+    Expects LeRobot keys ``image`` / ``wrist_image`` / ``state`` / ``actions`` plus
+    ``audio/episode_XXXXXX.{wav,sync.json}`` under the dataset root (see
+    ``examples/omniaction_libero/convert_omniaction_to_lerobot.py``).
+    """
+
+    audio_fallback_fps: float = 10.0
+    audio_strict: bool = True
+    extra_delta_transform: bool = False
+    conditioning_mode: Literal["full_avla", "audio_action", "image_action", "mixed_aa_avla"] = "full_avla"
+    mixed_conditioning_modes: Sequence[Literal["full_avla", "audio_action", "image_action"]] = (
+        "audio_action",
+        "full_avla",
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not isinstance(model_config, pi0_audio.Pi0AudioConfig):
+            raise TypeError("LeRobotLiberoAudioDataConfig requires Pi0AudioConfig.")
+
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        if repo_id is None:
+            raise ValueError("repo_id is required for LIBERO audio datasets with sidecar WAV files.")
+
+        # Prefer an explicit on-disk path; otherwise resolve via LeRobot home (convert default).
+        repo_path = pathlib.Path(repo_id)
+        if repo_path.is_dir():
+            dataset_root = str(repo_path)
+        else:
+            from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+
+            dataset_root = str(HF_LEROBOT_HOME / repo_id)
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # Match eval_omniaction_libero / Libero key layout for serving.
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                audiovla_policy.AudiovlaInputs(
+                    action_dim=model_config.action_dim,
+                    audio_num_samples=model_config.audio_num_samples,
+                    instruction_audio_num_samples=model_config.instruction_audio_num_samples,
+                    audio_sample_rate=model_config.audio_sample_rate,
+                    use_whisper=model_config.use_whisper,
+                    use_qwen=model_config.use_qwen,
+                    use_usad=model_config.use_usad,
+                    audio_tokenizer_type=model_config.audio_tokenizer_type,
+                    whisper_model_name=model_config.whisper_model_name,
+                    whisper_output_dim=model_config.audio_feature_dim,
+                    whisper_device=model_config.whisper_device,
+                    qwen_model_name=model_config.qwen_model_name,
+                    qwen_output_dim=model_config.audio_feature_dim
+                    if model_config.use_qwen
+                    else model_config.qwen_output_dim,
+                    qwen_device=model_config.qwen_device,
+                    usad_model_name=model_config.usad_model_name,
+                    usad_output_dim=model_config.audio_feature_dim
+                    if model_config.use_usad
+                    else model_config.usad_output_dim,
+                    usad_device=model_config.usad_device,
+                    dataset_root=dataset_root,
+                    audio_fallback_fps=self.audio_fallback_fps,
+                    audio_strict=self.audio_strict,
+                    model_type=model_config.model_type,
+                ),
+                _transforms.AudioVLAConditioning(
+                    mode=self.conditioning_mode,
+                    mixed_modes=self.mixed_conditioning_modes,
+                ),
+            ],
+            # LIBERO EE+gripper action is 7-D (not Franka's 8-D).
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
@@ -1245,19 +1359,19 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotFrankaJointDataConfig(
-            repo_id="franka_lerobot_6_19_audio_asr",
+            repo_id="data/realworld/franka_lerobot_7_6_audio_asr",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 # Use locally computed norm stats under assets/<config>/<asset_id>.
                 # assets_dir="./assets/pi0_base_joint_lora_finetune",
                 # asset_id="franka_lerobot_5_1_audio_mixed_asr",
-                assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_6_19_audio",  # 这里为之前compute的产物的地址
+                assets_dir="./assets/pi0_base_joint_lora_finetune",
+                asset_id="franka_lerobot_7_6_audio_asr",  # 这里为之前compute的产物的地址
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
-        batch_size=5,
+        batch_size=4,
         save_interval=1000,
         # 这个是真正的保存的间隔
         # keep_period=1000,
@@ -1301,12 +1415,12 @@ _CONFIGS = [
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            # 数据放在openpi的根目录且名称为repo_id
-            repo_id="franka_lerobot_6_29_audio",
+            # 数据放在 data/realworld/<name>，HF_LEROBOT_HOME 指向仓库根目录
+            repo_id="data/realworld/franka_lerobot_7_6_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_6_29_audio",  # 这里为之前compute的产物的地址
+                asset_id="franka_lerobot_7_6_audio",  # 这里为之前compute的产物的地址
             ),
         ),
         weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
@@ -1339,11 +1453,11 @@ _CONFIGS = [
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_5_audio",
+            repo_id="data/realworld/franka_lerobot_7_6_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_5_audio",
+                asset_id="franka_lerobot_7_6_audio",
             ),
             conditioning_mode="audio_action",
         ),
@@ -1378,11 +1492,11 @@ _CONFIGS = [
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_5_audio",
+            repo_id="data/realworld/franka_lerobot_7_6_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_5_audio",
+                asset_id="franka_lerobot_7_6_audio",
             ),
             conditioning_mode="audio_action",
         ),
@@ -1417,17 +1531,17 @@ _CONFIGS = [
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_5_audio",
+            repo_id="data/realworld/franka_lerobot_7_6_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_5_audio",
+                asset_id="franka_lerobot_7_6_audio",
             ),
             conditioning_mode="mixed_aa_avla",
             mixed_conditioning_modes=("audio_action", "full_avla"),
         ),
         weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=10_000,
         batch_size=4,
         save_interval=1000,
         freeze_filter=_pi0_audio_stage_freeze_filter(
@@ -1457,11 +1571,11 @@ _CONFIGS = [
             audio_guidance_lambda=1.5,
         ),
         data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_5_audio",
+            repo_id="data/realworld/franka_lerobot_7_6_audio",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_5_audio",
+                asset_id="franka_lerobot_7_6_audio",
             ),
             conditioning_mode="full_avla",
         ),
@@ -1480,6 +1594,60 @@ _CONFIGS = [
         ema_decay=None,
         policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
     ),
+    # OmniAction-LIBERO finetune (one TrainConfig per suite; convert via
+    # examples/omniaction_libero/convert_omniaction_to_lerobot.py).
+    # suite key -> (config_suffix, repo_id); "10" matches RoboOmni's omniaction_libero10.
+    *[
+        TrainConfig(
+            name=f"pi0_audio_omniaction_libero{suffix}",
+            model=pi0_audio.Pi0AudioConfig(
+                action_dim=32,
+                action_horizon=10,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+                use_whisper=True,
+                whisper_model_name="openai/whisper-tiny",
+                rtc_train_max_delay=8,
+                use_route_head=True,
+                route_loss_weight=0.1,
+                action_loss_weight=1.0,
+                use_audio_adaln_gate=True,
+                use_audio_guidance=False,
+                audio_guidance_lambda=1.5,
+            ),
+            data=LeRobotLiberoAudioDataConfig(
+                repo_id=repo_id,
+                # task field is empty; prompt stays blank so intent comes from audio.
+                base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(
+                    assets_dir=f"./assets/pi0_audio_{repo_id}",
+                    asset_id=repo_id,
+                ),
+                conditioning_mode="full_avla",
+                audio_fallback_fps=10.0,
+            ),
+            weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=5e-6, decay_steps=30_000, decay_lr=5e-7),
+            num_train_steps=30_000,
+            batch_size=4,
+            save_interval=1000,
+            freeze_filter=_pi0_audio_stage_freeze_filter(
+                train_audio=True,
+                train_route=True,
+                train_action_side=True,
+                train_lora=True,
+                train_backbone=True,
+            ),
+            ema_decay=None,
+            policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
+        )
+        for suffix, repo_id in (
+            ("_spatial", "omniaction_libero_spatial"),
+            ("_object", "omniaction_libero_object"),
+            ("_goal", "omniaction_libero_goal"),
+            ("10", "omniaction_libero10"),
+        )
+    ],
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

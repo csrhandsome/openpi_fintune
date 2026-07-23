@@ -176,6 +176,8 @@ cython_debug/
 # vscode
 .vscode/
 
+# Realworld Franka LeRobot datasets (live under data/realworld/)
+data/realworld/
 franka_lerobot_4_9_audio
 franka_lerobot_5_1_audio
 franka_lerobot_5_1_audio_asr
@@ -187,6 +189,7 @@ franka_lerobot_6_28_audio
 franka_lerobot_6_29_audio
 franka_lerobot_7_5_audio
 franka_lerobot_7_6_audio
+franka_lerobot_7_6_audio_asr
 *.mp4
 
 # Local model weights
