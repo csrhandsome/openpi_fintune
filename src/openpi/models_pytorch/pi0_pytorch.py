@@ -25,12 +25,19 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Compute sine-cosine embeddings for per-example or per-action timesteps.
+
+    ``time`` is normally ``[B]`` for standard PI0 and ``[B, H]`` when the
+    timestep is conditioned per action token (for example, real-time
+    conditioning). Flattening the leading dimensions keeps the numerical
+    computation identical in both cases and restores the original shape at
+    the end.
+    """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor is expected to have shape `[B]` or `[B, H]`.")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -38,8 +45,11 @@ def create_sinusoidal_pos_embedding(
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    time_shape = time.shape
+    flat_time = time.reshape(-1)
+    sin_input = scaling_factor[None, :] * flat_time[:, None]
+    embedding = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    return embedding.reshape(*time_shape, dimension)
 
 
 def sample_beta(alpha, beta, bsize, device):
@@ -108,6 +118,17 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        model_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
+        self.action_in_proj.to(dtype=model_dtype)
+        self.action_out_proj.to(dtype=model_dtype)
+        if self.pi05:
+            self.time_mlp_in.to(dtype=model_dtype)
+            self.time_mlp_out.to(dtype=model_dtype)
+        else:
+            self.state_proj.to(dtype=model_dtype)
+            self.action_time_mlp_in.to(dtype=model_dtype)
+            self.action_time_mlp_out.to(dtype=model_dtype)
+
         torch.set_float32_matmul_precision("high")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
@@ -169,12 +190,12 @@ class PI0Pytorch(nn.Module):
             observation.state,
         )
 
-    def sample_noise(self, shape, device):
+    def sample_noise(self, shape, device, dtype=torch.float32):
         return torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
-            dtype=torch.float32,
+            dtype=dtype,
             device=device,
         )
 
@@ -182,6 +203,24 @@ class PI0Pytorch(nn.Module):
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
+
+    def _prepare_timestep(self, timestep, batch_size, device):
+        """Normalize a scalar, ``[B]`` or ``[B, H]`` timestep to ``[B, H]``."""
+        if timestep.ndim == 0:
+            timestep = timestep.expand(batch_size, self.config.action_horizon)
+        elif timestep.ndim == 1:
+            if timestep.shape[0] != batch_size:
+                raise ValueError(
+                    f"timestep batch size {timestep.shape[0]} does not match actions batch size {batch_size}"
+                )
+            timestep = timestep[:, None].expand(batch_size, self.config.action_horizon)
+        elif timestep.ndim == 2:
+            expected_shape = (batch_size, self.config.action_horizon)
+            if tuple(timestep.shape) != expected_shape:
+                raise ValueError(f"Expected timestep shape {expected_shape}, got {tuple(timestep.shape)}")
+        else:
+            raise ValueError(f"timestep must be scalar, [B], or [B, H], got shape {tuple(timestep.shape)}")
+        return timestep.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -197,7 +236,8 @@ class PI0Pytorch(nn.Module):
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                vision_dtype = next(self.paligemma_with_expert.paligemma.model.vision_tower.parameters()).dtype
+                return self.paligemma_with_expert.embed_image(img.to(dtype=vision_dtype))
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
@@ -241,8 +281,7 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         if not self.pi05:
-            if self.state_proj.weight.dtype == torch.float32:
-                state = state.to(torch.float32)
+            state = state.to(dtype=self.state_proj.weight.dtype)
 
             # Embed state
             def state_proj_func(state):
@@ -268,12 +307,18 @@ class PI0Pytorch(nn.Module):
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
+            return self.action_in_proj(noisy_actions.to(dtype=self.action_in_proj.weight.dtype))
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            if time_emb.ndim == 2:
+                time_emb = time_emb[:, None, :].expand_as(action_emb)
+            elif time_emb.ndim != 3 or time_emb.shape[:2] != action_emb.shape[:2]:
+                raise ValueError(
+                    f"Expected timestep embedding shape [B, H, D] compatible with actions, got {tuple(time_emb.shape)}"
+                )
+            time_emb = time_emb.to(dtype=action_emb.dtype)
             action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
             # Apply MLP layers
@@ -287,6 +332,7 @@ class PI0Pytorch(nn.Module):
         else:
             # time MLP (for adaRMS)
             def time_mlp_func(time_emb):
+                time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
                 x = self.time_mlp_in(time_emb)
                 x = F.silu(x)  # swish == silu
                 x = self.time_mlp_out(x)
@@ -319,12 +365,13 @@ class PI0Pytorch(nn.Module):
         # 开始flow matching
         # 对任意 noise、任意 t,当前位置应该往哪走,所以训练应该是每次都是随机的noise
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            noise = self.sample_noise(actions.shape, actions.device, dtype=actions.dtype)
 
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        time_expanded = time[:, None, None]
+        time = self._prepare_timestep(time, actions.shape[0], actions.device)
+        time_expanded = time[..., None]
         # t=0,x_t为actions,t=1,x_t为完全的noise
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         # 最快的速度,就是上述的actions直线到noise到距离(flow matching就是学习速度)
@@ -369,16 +416,15 @@ class PI0Pytorch(nn.Module):
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
 
         # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
+            return self.action_out_proj(suffix_out.to(dtype=self.action_out_proj.weight.dtype))
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         # 和u_t算loss,想算出最快的动作
-        return F.mse_loss(u_t, v_t, reduction="none")
+        return F.mse_loss(u_t.float(), v_t.float(), reduction="none")
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -388,7 +434,7 @@ class PI0Pytorch(nn.Module):
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             # 随机一个噪音
-            noise = self.sample_noise(actions_shape, device)
+            noise = self.sample_noise(actions_shape, device, dtype=self.action_in_proj.weight.dtype)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
@@ -415,7 +461,7 @@ class PI0Pytorch(nn.Module):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         # 从 t=1 开始不断的往 t=0 走,因为之前学到的是这个这个方向,因此要在这个方向循环几次到达最终的action
         while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+            expanded_time = time.expand(bsize, self.config.action_horizon)
             # 通过action expert的运算得到flow matching得到最终的速度
             v_t = self.denoise_step(
                 state,
@@ -472,5 +518,4 @@ class PI0Pytorch(nn.Module):
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        return self.action_out_proj(suffix_out.to(dtype=self.action_out_proj.weight.dtype))

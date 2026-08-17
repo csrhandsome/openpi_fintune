@@ -56,31 +56,56 @@ class PaliGemmaWithExpertModel(nn.Module):
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        self.gemma_expert.model.embed_tokens = None
 
-        self.to_bfloat16_for_selected_params(precision)
+        self.to_precision(precision)
 
-    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+    def to_precision(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+        """Cast the full policy to the training dtype.
+
+        Embodied PI0 relies on the training framework to choose the model
+        dtype. RMSNorm and attention keep their numerically sensitive
+        intermediate calculations in float32 where needed; parameters are not
+        selectively upcast here.
+        """
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
         elif precision == "float32":
             self.to(dtype=torch.float32)
-            return
         else:
             raise ValueError(f"Invalid precision: {precision}")
 
-        params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
-            "input_layernorm",
-            "post_attention_layernorm",
-            "model.norm",
-        ]
+    # Keep the old method name for callers that construct this module directly.
+    def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
+        self.to_precision(precision)
 
-        for name, param in self.named_parameters():
-            if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
+    def remove_unused_expert_modules(self):
+        """Remove action-expert token embedding and language-model head.
+
+        PI0 always supplies ``inputs_embeds`` and reads the hidden state
+        directly, so these modules are never executed. Removing them before
+        wrapping the model saves their parameters from optimizer/distributed
+        state, matching the embodied training path.
+        """
+        if getattr(self.gemma_expert.model, "embed_tokens", None) is not None:
+            del self.gemma_expert.model.embed_tokens
+        if getattr(self.gemma_expert, "lm_head", None) is not None:
+            del self.gemma_expert.lm_head
+
+    def freeze_embodied_last_layer(self):
+        """Freeze the action expert tail used by the embodied memory-saving setup."""
+        expert = self.gemma_expert.model
+        last_layer = expert.layers[-1]
+        for module in (
+            last_layer.input_layernorm,
+            last_layer.post_attention_layernorm,
+            last_layer.self_attn.q_proj,
+            last_layer.self_attn.o_proj,
+            last_layer.mlp.gate_proj,
+            last_layer.mlp.up_proj,
+            last_layer.mlp.down_proj,
+            expert.norm,
+        ):
+            module.requires_grad_(requires_grad=False)
 
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
@@ -177,8 +202,12 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    query_state = (
+                        layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2).to(dtype=torch.float32)
+                    )
+                    key_state = (
+                        layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2).to(dtype=torch.float32)
+                    )
                     value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
                     query_states.append(query_state)

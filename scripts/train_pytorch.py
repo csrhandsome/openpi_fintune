@@ -128,6 +128,19 @@ def build_datasets(config: _config.TrainConfig):
     return data_loader, data_loader.data_config()
 
 
+def move_tree_to_device_dtype(tree, device, dtype):
+    """Move a batch to a device and cast floating tensors to the model dtype."""
+
+    def move_value(value):
+        if not isinstance(value, torch.Tensor):
+            return value
+        if value.is_floating_point():
+            return value.to(device=device, dtype=dtype)
+        return value.to(device=device)
+
+    return jax.tree.map(move_value, tree)
+
+
 def get_model_state_dict(model):
     """Get state dict from model, handling DDP wrapper."""
     return (
@@ -188,6 +201,10 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         tmp_ckpt_dir.rename(final_ckpt_dir)
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+        del model_to_save
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Log checkpoint to wandb
         if config.wandb_enabled:
@@ -221,7 +238,13 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            missing_keys, unexpected_keys = safetensors.torch.load_model(
+                model_to_load, safetensors_path, strict=False, device=str(device)
+            )
+            if missing_keys or unexpected_keys:
+                logging.warning(
+                    f"Checkpoint key mismatch: missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+                )
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -406,7 +429,15 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    weight_dtype = torch.bfloat16 if config.pytorch_training_precision == "bfloat16" else torch.float32
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(
+        device=device, dtype=weight_dtype
+    )
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -416,16 +447,34 @@ def train_loop(config: _config.TrainConfig):
         enable_gradient_checkpointing = False
         logging.info("Gradient checkpointing is not supported for this model")
 
-    # Log initial memory usage after model creation
+    # Load pretrained weights before removing unused modules. This keeps old
+    # checkpoints with expert embed_tokens/lm_head compatible with fine-tuning.
+    if config.pytorch_weight_path is not None:
+        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        missing_keys, unexpected_keys = safetensors.torch.load_model(
+            model, model_path, strict=False, device=str(device)
+        )
+        if missing_keys or unexpected_keys:
+            logging.warning(
+                f"Pretrained key mismatch: missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+            )
+        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
+    # Match the embodied PI0 memory layout before DDP/optimizer construction.
+    if hasattr(model, "future_teacher"):
+        del model.future_teacher
+    model.paligemma_with_expert.remove_unused_expert_modules()
+    model.paligemma_with_expert.freeze_embodied_last_layer()
+
+    # Log initial memory usage after model creation and cleanup.
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
 
-    # Enable memory optimizations for large-scale training
+    # Keep the allocator tuning for large jobs, while TF32 is enabled above for
+    # every CUDA run as in the embodied training path.
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
@@ -433,20 +482,10 @@ def train_loop(config: _config.TrainConfig):
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            static_graph=world_size >= 8,
         )
-
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -455,8 +494,9 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -494,7 +534,8 @@ def train_loop(config: _config.TrainConfig):
             f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
         )
         logging.info(
-            f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
+            f"Optimizer: {type(config.optimizer).__name__}, trainable_params={len(trainable_parameters)}, "
+            f"weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
@@ -517,9 +558,8 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            observation = move_tree_to_device_dtype(observation, device, weight_dtype)  # noqa: PLW2901
+            actions = actions.to(device=device, dtype=weight_dtype)  # noqa: PLW2901
 
             # Update LR
             for pg in optim.param_groups:
@@ -543,14 +583,14 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
-            for param in model.parameters():
+            for param in trainable_parameters:
                 if param.grad is not None:
                     param.grad.detach_()
                     param.grad = None

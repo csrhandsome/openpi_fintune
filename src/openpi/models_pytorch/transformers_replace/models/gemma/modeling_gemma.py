@@ -86,9 +86,14 @@ class GemmaRMSNorm(nn.Module):
         
         #self.dense.to(dtype=torch.bfloat16).to(dtype=torch.float32)
         modulation = self.dense(cond)
-        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features]
-        if len(x.shape) == 3:  # [batch, seq, features]
-            modulation = modulation.unsqueeze(1)
+        # A batch-level condition broadcasts over all tokens; a [B, H, D]
+        # condition keeps per-action-token conditioning for RTC.
+        if modulation.ndim == x.ndim - 1:
+            modulation = modulation.unsqueeze(-2)
+        elif modulation.ndim != x.ndim:
+            raise ValueError(
+                f"Expected condition rank {x.ndim - 1} or {x.ndim}, got {modulation.ndim}"
+            )
         
         scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
         
@@ -245,7 +250,7 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()

@@ -474,6 +474,33 @@ def fit_audio_feature_sequence(
     return padded
 
 
+def qwen_instruction_feature_cache_dir(dataset_root: str | Path) -> Path:
+    """Default cache root for per-episode Qwen instruction features."""
+    return Path(dataset_root) / "qwen_instruction_features"
+
+
+def usad_instruction_feature_cache_dir(dataset_root: str | Path) -> Path:
+    """Default cache root for per-episode USAD instruction features."""
+    return Path(dataset_root) / "usad_instruction_features"
+
+
+def whisper_instruction_feature_cache_dir(dataset_root: str | Path) -> Path:
+    """Default cache root for per-episode Whisper instruction features."""
+    return Path(dataset_root) / "whisper_instruction_features"
+
+
+def instruction_feature_cache_dir(dataset_root: str | Path, encoder: str) -> Path:
+    """Default cache root for per-episode instruction features of ``encoder``."""
+    encoder_key = str(encoder).strip().lower()
+    if encoder_key == "qwen":
+        return qwen_instruction_feature_cache_dir(dataset_root)
+    if encoder_key == "usad":
+        return usad_instruction_feature_cache_dir(dataset_root)
+    if encoder_key == "whisper":
+        return whisper_instruction_feature_cache_dir(dataset_root)
+    raise ValueError(f"Unsupported instruction-feature encoder {encoder!r}. Expected qwen/usad/whisper.")
+
+
 def episode_audio_stem(episode_index: int) -> str:
     return f"episode_{int(episode_index):06d}"
 
