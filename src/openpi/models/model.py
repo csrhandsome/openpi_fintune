@@ -135,6 +135,12 @@ class Observation(Generic[ArrayT]):
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+    # Dialogue answer tokens use a causal prefix-LM mask. These fields are
+    # consumed by Pi0Audio's optional Talker text-loss branch.
+    dialogue_token_ids: at.Int[ArrayT, "*b l"] | None = None
+    dialogue_token_mask: at.Bool[ArrayT, "*b l"] | None = None
+    dialogue_token_ar_mask: at.Bool[ArrayT, "*b l"] | None = None
+    dialogue_token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -142,6 +148,15 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        dialogue_fields = (
+            "dialogue_token_ids",
+            "dialogue_token_mask",
+            "dialogue_token_ar_mask",
+            "dialogue_token_loss_mask",
+        )
+        present_dialogue_fields = [field in data for field in dialogue_fields]
+        if any(present_dialogue_fields) and not all(present_dialogue_fields):
+            raise ValueError(f"Dialogue token fields must be provided together: {dialogue_fields}")
         if "audio_mask" in data and "audio" not in data and "ambient_audio" not in data:
             raise ValueError("audio_mask cannot be provided without audio or ambient_audio.")
         if "ambient_audio_mask" in data and "ambient_audio" not in data and "audio" not in data:
@@ -204,6 +219,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            dialogue_token_ids=data.get("dialogue_token_ids"),
+            dialogue_token_mask=data.get("dialogue_token_mask"),
+            dialogue_token_ar_mask=data.get("dialogue_token_ar_mask"),
+            dialogue_token_loss_mask=data.get("dialogue_token_loss_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -295,6 +314,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        dialogue_token_ids=observation.dialogue_token_ids,
+        dialogue_token_mask=observation.dialogue_token_mask,
+        dialogue_token_ar_mask=observation.dialogue_token_ar_mask,
+        dialogue_token_loss_mask=observation.dialogue_token_loss_mask,
     )
 
 

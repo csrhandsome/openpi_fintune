@@ -79,7 +79,6 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     audio_resampler_heads: int = 8
     use_whisper: bool = False
     use_qwen: bool = False
-    use_usad: bool = False
     audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
@@ -87,9 +86,11 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
     qwen_output_dim: int | None = None
     qwen_device: str = "auto"
-    usad_model_name: str = "MIT-SLS/USAD2-Large"
-    usad_output_dim: int | None = None
-    usad_device: str = "auto"
+    use_usad2: bool = False
+    usad2_model_name: str = "MIT-SLS/USAD2-Large-Plus"
+    usad2_output_dim: int | None = None
+    usad2_device: str = "auto"
+    usad2_target_layer: int | None = None
     use_audio_limoe: bool = False
     audio_limoe_num_experts: int = 4
     audio_limoe_top_k: int = 1
@@ -98,6 +99,12 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
     route_loss_weight: float = 0.0
     route_loss_requires_instruction_audio: bool = True
     action_loss_weight: float = 1.0
+    # Optional causal text (Talker) supervision. The continuous action expert
+    # remains unchanged; text uses the PaliGemma language expert and tied vocab
+    # projection.
+    enable_text_loss: bool = False
+    text_loss_weight: float = 0.1
+    text_max_new_tokens: int = 48
     route_label_names: tuple[str, ...] = ("straight", "detour", "none")
     use_audio_adaln_gate: bool = False
     # Audio-CAG: v = v_no_audio + lambda * (v_audio - v_no_audio).
@@ -123,8 +130,8 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("audio_resampler_heads must be > 0")
         if self.audio_tokenizer_type not in ("sequence_resampler", "pooled_baseline"):
             raise ValueError("audio_tokenizer_type must be 'sequence_resampler' or 'pooled_baseline'")
-        if sum((self.use_whisper, self.use_qwen, self.use_usad)) > 1:
-            raise ValueError("Only one of use_whisper, use_qwen, and use_usad can be True")
+        if sum([self.use_whisper, self.use_qwen, self.use_usad2]) > 1:
+            raise ValueError("At most one of use_whisper / use_qwen / use_usad2 may be True")
         if self.audio_limoe_num_experts <= 0:
             raise ValueError("audio_limoe_num_experts must be > 0")
         if self.audio_limoe_top_k <= 0:
@@ -133,8 +140,10 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("whisper_output_dim must be > 0")
         if self.qwen_output_dim is not None and self.qwen_output_dim <= 0:
             raise ValueError("qwen_output_dim must be > 0")
-        if self.usad_output_dim is not None and self.usad_output_dim <= 0:
-            raise ValueError("usad_output_dim must be > 0")
+        if self.usad2_output_dim is not None and self.usad2_output_dim <= 0:
+            raise ValueError("usad2_output_dim must be > 0")
+        if self.usad2_target_layer is not None and self.usad2_target_layer <= 0:
+            raise ValueError("usad2_target_layer must be > 0")
         if self.rtc_train_max_delay < 0:
             raise ValueError("rtc_train_max_delay must be >= 0")
         if self.rtc_train_max_delay >= self.action_horizon:
@@ -147,12 +156,20 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             raise ValueError("route_loss_weight must be >= 0")
         if self.action_loss_weight < 0:
             raise ValueError("action_loss_weight must be >= 0")
+        if self.text_loss_weight < 0:
+            raise ValueError("text_loss_weight must be >= 0")
+        if self.text_max_new_tokens <= 0:
+            raise ValueError("text_max_new_tokens must be > 0")
         if self.use_audio_adaln_gate and self.audio_tokenizer_type != "sequence_resampler":
             raise ValueError("use_audio_adaln_gate currently requires audio_tokenizer_type='sequence_resampler'")
         if self.route_loss_weight > 0 and not self.use_route_head:
             raise ValueError("route_loss_weight requires use_route_head=True")
         if self.audio_guidance_lambda < 0:
             raise ValueError("audio_guidance_lambda must be >= 0")
+
+    @property
+    def uses_audio_encoder(self) -> bool:
+        return self.use_whisper or self.use_qwen or self.use_usad2
 
     @property
     def audio_feature_dim(self) -> int:
@@ -164,15 +181,15 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
             if self.qwen_output_dim is not None:
                 return self.qwen_output_dim
             return _audio_tools.infer_qwen_asr_hidden_size(self.qwen_model_name)
-        if self.use_usad:
-            if self.usad_output_dim is not None:
-                return self.usad_output_dim
-            return _audio_tools.infer_usad_hidden_size(self.usad_model_name)
+        if self.use_usad2:
+            if self.usad2_output_dim is not None:
+                return self.usad2_output_dim
+            return _audio_tools.infer_usad2_hidden_size(self.usad2_model_name)
         return 1
 
     @property
     def ambient_audio_input_shape(self) -> tuple[int, ...]:
-        if self.use_whisper or self.use_qwen or self.use_usad:
+        if self.uses_audio_encoder:
             if self.audio_tokenizer_type == "pooled_baseline":
                 return (self.audio_feature_dim,)
             return (self.ambient_audio_num_frames, self.audio_feature_dim)
@@ -180,7 +197,7 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def instruction_audio_input_shape(self) -> tuple[int, ...]:
-        if self.use_whisper or self.use_qwen or self.use_usad:
+        if self.uses_audio_encoder:
             if self.audio_tokenizer_type == "pooled_baseline":
                 return (self.audio_feature_dim,)
             return (self.instruction_audio_num_frames, self.audio_feature_dim)
@@ -192,16 +209,16 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def ambient_audio_num_frames(self) -> int:
+        if self.use_usad2:
+            return _audio_tools.usad2_num_frames_for_duration(
+                self.ambient_audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+                frame_rate=_audio_tools.infer_usad2_frame_rate(self.usad2_model_name),
+            )
         if self.use_qwen:
             return _audio_tools.qwen_asr_num_frames_for_duration(
                 self.ambient_audio_num_samples,
                 sample_rate=self.audio_sample_rate,
-            )
-        if self.use_usad:
-            return _audio_tools.usad_num_frames_for_duration(
-                self.ambient_audio_num_samples,
-                sample_rate=self.audio_sample_rate,
-                model_name=self.usad_model_name,
             )
         return _audio_tools.whisper_num_frames_for_duration(
             self.ambient_audio_num_samples,
@@ -210,16 +227,16 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
 
     @property
     def instruction_audio_num_frames(self) -> int:
+        if self.use_usad2:
+            return _audio_tools.usad2_num_frames_for_duration(
+                self.instruction_audio_num_samples,
+                sample_rate=self.audio_sample_rate,
+                frame_rate=_audio_tools.infer_usad2_frame_rate(self.usad2_model_name),
+            )
         if self.use_qwen:
             return _audio_tools.qwen_asr_num_frames_for_duration(
                 self.instruction_audio_num_samples,
                 sample_rate=self.audio_sample_rate,
-            )
-        if self.use_usad:
-            return _audio_tools.usad_num_frames_for_duration(
-                self.instruction_audio_num_samples,
-                sample_rate=self.audio_sample_rate,
-                model_name=self.usad_model_name,
             )
         return _audio_tools.whisper_num_frames_for_duration(
             self.instruction_audio_num_samples,
@@ -275,6 +292,10 @@ class Pi0AudioConfig(pi0_config.Pi0Config):
                 route_label_mask=(jax.ShapeDtypeStruct([batch_size], jnp.bool_) if self.use_route_head else None),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                dialogue_token_ids=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+                dialogue_token_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                dialogue_token_ar_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                dialogue_token_loss_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
         return observation_spec, action_spec
@@ -297,6 +318,9 @@ class Pi0Audio(_model.BaseModel):
         self.route_loss_weight = config.route_loss_weight
         self.route_loss_requires_instruction_audio = config.route_loss_requires_instruction_audio
         self.action_loss_weight = config.action_loss_weight
+        self.enable_text_loss = config.enable_text_loss
+        self.text_loss_weight = config.text_loss_weight
+        self.text_max_new_tokens = config.text_max_new_tokens
         self.route_label_names = tuple(config.route_label_names)
         self.route_num_classes = len(config.route_label_names)
         self.use_audio_adaln_gate = config.use_audio_adaln_gate
@@ -595,6 +619,10 @@ class Pi0Audio(_model.BaseModel):
             tokenized_prompt_mask=obs.tokenized_prompt_mask,
             token_ar_mask=obs.token_ar_mask,
             token_loss_mask=obs.token_loss_mask,
+            dialogue_token_ids=obs.dialogue_token_ids,
+            dialogue_token_mask=obs.dialogue_token_mask,
+            dialogue_token_ar_mask=obs.dialogue_token_ar_mask,
+            dialogue_token_loss_mask=obs.dialogue_token_loss_mask,
         )
 
     def _embed_instruction_audio_tokens(
@@ -675,6 +703,147 @@ class Pi0Audio(_model.BaseModel):
             tokens = self._apply_audio_limoe(tokens, input_mask, train=train)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def _embed_talker_prefix(
+        self,
+        obs: _model.Observation,
+        *,
+        train: bool = False,
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, "b s"]]:
+        """Embed multimodal context, followed by a causal robot-dialogue span."""
+        if obs.dialogue_token_ids is None or obs.dialogue_token_mask is None or obs.dialogue_token_ar_mask is None:
+            raise ValueError("Talker requires dialogue_token_ids, dialogue_token_mask, and dialogue_token_ar_mask.")
+
+        tokens = []
+        input_masks = []
+        ar_masks = []
+
+        instruction_tokens, instruction_mask = self._embed_instruction_audio_tokens(obs)
+        if instruction_tokens is not None and instruction_mask is not None:
+            tokens.append(instruction_tokens)
+            input_masks.append(instruction_mask)
+            ar_masks.append(jnp.zeros(instruction_mask.shape, dtype=jnp.bool_))
+
+        for name in obs.images:
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_mask = einops.repeat(obs.image_masks[name], "b -> b s", s=image_tokens.shape[1])
+            tokens.append(image_tokens)
+            input_masks.append(image_mask)
+            ar_masks.append(jnp.zeros(image_mask.shape, dtype=jnp.bool_))
+
+        ambient_tokens, ambient_mask = self._embed_audio_prefix(
+            obs.ambient_audio if obs.ambient_audio is not None else obs.audio,
+            obs.ambient_audio_mask if obs.ambient_audio_mask is not None else obs.audio_mask,
+            in_proj=self.ambient_audio_in_proj,
+            resampler=self.ambient_audio_resampler,
+            query_tokens_param=self.ambient_audio_query_tokens,
+            query_norm=self.ambient_audio_query_norm,
+            kv_norm=self.ambient_audio_kv_norm,
+            out_proj=self.ambient_audio_out_proj,
+            num_tokens=self.ambient_audio_num_tokens,
+        )
+        if ambient_tokens is not None and ambient_mask is not None:
+            tokens.append(ambient_tokens)
+            input_masks.append(ambient_mask)
+            ar_masks.append(jnp.zeros(ambient_mask.shape, dtype=jnp.bool_))
+
+        dialogue_tokens = self.PaliGemma.llm(obs.dialogue_token_ids, method="embed")
+        tokens.append(dialogue_tokens)
+        input_masks.append(jnp.asarray(obs.dialogue_token_mask, dtype=jnp.bool_))
+        ar_masks.append(jnp.asarray(obs.dialogue_token_ar_mask, dtype=jnp.bool_))
+
+        target_dtype = dialogue_tokens.dtype
+        merged_tokens = jnp.concatenate([token.astype(target_dtype) for token in tokens], axis=1)
+        merged_input_mask = jnp.concatenate(input_masks, axis=1)
+        if self.audio_limoe:
+            merged_tokens = self._apply_audio_limoe(merged_tokens, merged_input_mask, train=train)
+        return merged_tokens, merged_input_mask, jnp.concatenate(ar_masks, axis=1)
+
+    def _compute_text_loss(
+        self,
+        obs: _model.Observation,
+        *,
+        train: bool,
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute prefix-LM next-token loss for robot dialogue targets."""
+        batch_size = obs.state.shape[0]
+        if (
+            not self.enable_text_loss
+            or obs.dialogue_token_ids is None
+            or obs.dialogue_token_mask is None
+            or obs.dialogue_token_ar_mask is None
+            or obs.dialogue_token_loss_mask is None
+        ):
+            return jnp.zeros((batch_size,), dtype=jnp.float32)
+
+        talker_tokens, talker_mask, talker_ar_mask = self._embed_talker_prefix(obs, train=train)
+        attn_mask = make_attn_mask(talker_mask, talker_ar_mask)
+        positions = jnp.cumsum(talker_mask, axis=1) - 1
+        (talker_out, _), _ = self.PaliGemma.llm(
+            [talker_tokens, None],
+            mask=attn_mask,
+            positions=positions,
+        )
+
+        dialogue_len = obs.dialogue_token_ids.shape[1]
+        dialogue_out = talker_out[:, -dialogue_len:]
+        logits = self.PaliGemma.llm(dialogue_out[:, :-1], method="decode").astype(jnp.float32)
+        target_ids = jnp.asarray(obs.dialogue_token_ids[:, 1:], dtype=jnp.int32)
+        target_mask = jnp.asarray(obs.dialogue_token_loss_mask[:, 1:], dtype=jnp.bool_)
+
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        token_log_probs = jnp.take_along_axis(log_probs, target_ids[..., None], axis=-1)[..., 0]
+        target_mask_f = target_mask.astype(token_log_probs.dtype)
+        token_count = jnp.sum(target_mask_f, axis=-1)
+        loss = -jnp.sum(token_log_probs * target_mask_f, axis=-1) / jnp.maximum(token_count, 1.0)
+        return jnp.where(token_count > 0, loss, 0.0)
+
+    def generate_text_tokens(self, observation: _model.Observation) -> at.Int[at.Array, "b t"]:
+        """Greedily decode a robot response using the PaliGemma language expert.
+
+        This intentionally uses a small Python decoding loop rather than the
+        JITted action sampler: the key/value cache grows one text token at a
+        time, while the action sampler has a fixed continuous suffix.  Text is
+        generated only at dialogue boundaries, so this tradeoff is appropriate.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        talker_tokens, talker_mask, talker_ar_mask = self._embed_talker_prefix(observation, train=False)
+        attn_mask = make_attn_mask(talker_mask, talker_ar_mask)
+        positions = jnp.cumsum(talker_mask, axis=1) - 1
+        (talker_out, _), kv_cache = self.PaliGemma.llm(
+            [talker_tokens, None],
+            mask=attn_mask,
+            positions=positions,
+        )
+
+        batch_size = talker_mask.shape[0]
+        prefix_lengths = jnp.sum(talker_mask, axis=-1).astype(jnp.int32)
+        token_positions = jnp.arange(talker_mask.shape[1])[None, :]
+        last_indices = jnp.max(jnp.where(talker_mask, token_positions, -1), axis=-1)
+        last_indices = jnp.maximum(last_indices, 0)
+        last_hidden = jnp.take_along_axis(talker_out, last_indices[:, None, None], axis=1)
+        logits = self.PaliGemma.llm(last_hidden, method="decode")
+        eos_token = jnp.asarray(1, dtype=jnp.int32)
+        finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+        generated = []
+        for step_index in range(self.text_max_new_tokens):
+            sampled = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+            token = jnp.where(finished, eos_token, sampled)
+            generated.append(token)
+            finished = jnp.logical_or(finished, token == eos_token)
+
+            token_emb = self.PaliGemma.llm(token[:, None], method="embed")
+            generated_key_mask = jnp.ones((batch_size, 1, step_index + 1), dtype=jnp.bool_)
+            step_mask = jnp.concatenate([talker_mask[:, None, :], generated_key_mask], axis=-1)
+            step_positions = prefix_lengths[:, None] + step_index
+            (step_out, _), kv_cache = self.PaliGemma.llm(
+                [token_emb, None],
+                mask=step_mask,
+                positions=step_positions,
+                kv_cache=kv_cache,
+            )
+            logits = self.PaliGemma.llm(step_out, method="decode")
+        return jnp.stack(generated, axis=1)
 
     def _pool_instruction_audio(
         self,
@@ -931,6 +1100,10 @@ class Pi0Audio(_model.BaseModel):
 
         if self.action_loss_weight != 1.0:
             loss = loss * self.action_loss_weight
+
+        if self.enable_text_loss and self.text_loss_weight > 0:
+            text_loss = self._compute_text_loss(observation, train=train)
+            loss = loss + self.text_loss_weight * text_loss[..., None]
 
         if self.use_route_head and self.route_loss_weight > 0:
             route_logits = self._predict_route_logits_from_preprocessed(observation)

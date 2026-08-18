@@ -1,4 +1,6 @@
 import dataclasses
+import functools
+from pathlib import Path
 
 import einops
 import numpy as np
@@ -49,6 +51,34 @@ def _as_gripper_position(value) -> np.ndarray:
     return gripper_position
 
 
+@functools.lru_cache(maxsize=4096)
+def _load_cached_qwen_instruction_feature(
+    cache_dir: str,
+    episode_index: int,
+    expected_num_frames: int,
+    expected_dim: int,
+) -> np.ndarray:
+    feature_path = Path(cache_dir).expanduser() / f"episode_{episode_index:06d}.npy"
+    if not feature_path.is_file():
+        raise FileNotFoundError(
+            f"Cached Qwen instruction feature not found: {feature_path}. "
+            "Run scripts/precompute_omniaction_qwen_features.py first or remove --cashed."
+        )
+
+    feature = np.load(feature_path, allow_pickle=False)
+    expected_shape = (expected_num_frames, expected_dim)
+    if feature.shape != expected_shape:
+        raise ValueError(
+            f"Cached Qwen instruction feature shape mismatch in {feature_path}: "
+            f"expected {expected_shape}, got {feature.shape}."
+        )
+
+    # Keep the training input dtype identical to the online Qwen extraction path.
+    feature = np.asarray(feature, dtype=np.float32)
+    feature.setflags(write=False)
+    return feature
+
+
 @dataclasses.dataclass(frozen=True)
 class AudiovlaInputs(transforms.DataTransformFn):
     """Prepare real-robot observations for pi0 audio checkpoints."""
@@ -59,7 +89,6 @@ class AudiovlaInputs(transforms.DataTransformFn):
     audio_sample_rate: int = 16_000
     use_whisper: bool = False
     use_qwen: bool = False
-    use_usad: bool = False
     audio_tokenizer_type: str = "sequence_resampler"
     whisper_model_name: str = "openai/whisper-tiny"
     whisper_output_dim: int | None = None
@@ -67,9 +96,12 @@ class AudiovlaInputs(transforms.DataTransformFn):
     qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
     qwen_output_dim: int | None = None
     qwen_device: str = "auto"
-    usad_model_name: str = "MIT-SLS/USAD2-Large"
-    usad_output_dim: int | None = None
-    usad_device: str = "auto"
+    qwen_instruction_feature_cache_dir: str | None = None
+    use_usad2: bool = False
+    usad2_model_name: str = "MIT-SLS/USAD2-Large-Plus"
+    usad2_output_dim: int | None = None
+    usad2_device: str = "auto"
+    usad2_target_layer: int | None = None
     dataset_root: str | None = None
     audio_fallback_fps: float = 20.0
     audio_strict: bool = True
@@ -104,29 +136,19 @@ class AudiovlaInputs(transforms.DataTransformFn):
                 axis=-1,
             )
         else:
-            state_raw = _get_first_present(data, ("observation/state", "state", "observation.state"))
+            state_raw = _get_first_present(data, ("observation/state", "state"))
         state = transforms.pad_to_dim(np.asarray(state_raw, dtype=np.float32), self.action_dim)
 
         base_image = _parse_image(
             _get_first_present(
                 data,
-                (
-                    "observation/exterior_image_1_left",
-                    "observation/image",
-                    "image",
-                    "observation.image",
-                ),
+                ("observation/exterior_image_1_left", "observation/image", "image", "observation.image"),
             )
         )
         left_wrist_image = _parse_image(
             _get_first_present(
                 data,
-                (
-                    "observation/wrist_image_left",
-                    "observation/wrist_image",
-                    "wrist_image_left",
-                    "wrist_image",
-                ),
+                ("observation/wrist_image_left", "observation/wrist_image", "wrist_image_left", "wrist_image"),
             )
         )
 
@@ -155,6 +177,9 @@ class AudiovlaInputs(transforms.DataTransformFn):
         actions_value = _get_first_present(data, ("actions", "action"), required=False)
         if actions_value is not None:
             inputs["actions"] = transforms.pad_to_dim(np.asarray(actions_value, dtype=np.float32), self.action_dim)
+        action_loss_mask = _get_first_present(data, ("action_loss_mask",), required=False)
+        if action_loss_mask is not None:
+            inputs["action_loss_mask"] = np.asarray(action_loss_mask, dtype=np.bool_)
 
         prompt = _get_first_present(data, ("prompt",), required=False)
         if prompt is not None:
@@ -164,6 +189,7 @@ class AudiovlaInputs(transforms.DataTransformFn):
 
         inputs = transforms.copy_present_audio_fields(data, inputs)
         inputs = transforms.copy_present_route_fields(data, inputs)
+        inputs = transforms.copy_present_dialogue_fields(data, inputs)
         outputs = transforms.ExtractRouteLabel(
             dataset_root=self.dataset_root,
             strict=self.route_label_strict,
@@ -176,34 +202,73 @@ class AudiovlaInputs(transforms.DataTransformFn):
             fallback_fps=self.audio_fallback_fps,
             strict=self.audio_strict,
         )(outputs)
-        outputs = transforms.ExtractInstructionAudioWindow(
-            window_num_samples=instruction_num_samples,
-            target_sample_rate=self.audio_sample_rate,
-            dataset_root=self.dataset_root,
-            fallback_fps=self.audio_fallback_fps,
-            strict=self.audio_strict,
-        )(outputs)
-        encoder_count = sum((self.use_whisper, self.use_qwen, self.use_usad))
-        if encoder_count > 1:
-            raise ValueError("Only one of use_whisper, use_qwen, and use_usad can be True.")
-        if encoder_count == 0:
+
+        # Cached OmniAction features encode the complete dialogue. Dialogue
+        # supervision samples instead expose only audio through the current
+        # turn, so they must run the online encoder to avoid future-turn
+        # leakage.
+        is_dialogue_supervision = _get_first_present(data, ("dialogue_target",), required=False) is not None
+        use_cached_qwen_instruction = (
+            self.qwen_instruction_feature_cache_dir is not None and not is_dialogue_supervision
+        )
+        if use_cached_qwen_instruction:
+            if not self.use_qwen:
+                raise ValueError("Cached instruction features currently require use_qwen=True.")
+            if self.audio_tokenizer_type != "sequence_resampler":
+                raise ValueError(
+                    "Cached instruction features currently require audio_tokenizer_type='sequence_resampler'."
+                )
+
+            episode_index_value = outputs.get("episode_index")
+            if episode_index_value is None:
+                raise ValueError("Cached instruction features require an episode_index field.")
+            episode_index = int(np.asarray(episode_index_value).reshape(()).item())
+            expected_num_frames = _audio_tools.qwen_asr_num_frames_for_duration(
+                instruction_num_samples,
+                sample_rate=self.audio_sample_rate,
+            )
+            expected_dim = self.qwen_output_dim or _audio_tools.infer_qwen_asr_hidden_size(self.qwen_model_name)
+            outputs = {
+                **outputs,
+                "instruction_audio": _load_cached_qwen_instruction_feature(
+                    self.qwen_instruction_feature_cache_dir,
+                    episode_index,
+                    expected_num_frames,
+                    expected_dim,
+                ),
+                "instruction_audio_mask": np.True_,
+            }
+        else:
+            outputs = transforms.ExtractInstructionAudioWindow(
+                window_num_samples=instruction_num_samples,
+                target_sample_rate=self.audio_sample_rate,
+                dataset_root=self.dataset_root,
+                fallback_fps=self.audio_fallback_fps,
+                strict=self.audio_strict,
+            )(outputs)
+        if sum([self.use_whisper, self.use_qwen, self.use_usad2]) > 1:
+            raise ValueError("At most one of use_whisper / use_qwen / use_usad2 may be True.")
+        if not self.use_whisper and not self.use_qwen and not self.use_usad2:
             return outputs
 
-        if self.use_usad:
+        if self.use_usad2:
+            usad2_frame_rate = _audio_tools.infer_usad2_frame_rate(self.usad2_model_name)
             if self.audio_tokenizer_type == "pooled_baseline":
-                outputs = transforms.ExtractUSADAudioEmbedding(
-                    model_name=self.usad_model_name,
+                outputs = transforms.ExtractUsad2AudioEmbedding(
+                    model_name=self.usad2_model_name,
                     sample_rate=self.audio_sample_rate,
-                    device=self.usad_device,
-                    output_dim=self.usad_output_dim,
+                    device=self.usad2_device,
+                    target_layer=self.usad2_target_layer,
+                    output_dim=self.usad2_output_dim,
                     audio_key="ambient_audio",
                     audio_mask_key="ambient_audio_mask",
                 )(outputs)
-                outputs = transforms.ExtractUSADAudioEmbedding(
-                    model_name=self.usad_model_name,
+                outputs = transforms.ExtractUsad2AudioEmbedding(
+                    model_name=self.usad2_model_name,
                     sample_rate=self.audio_sample_rate,
-                    device=self.usad_device,
-                    output_dim=self.usad_output_dim,
+                    device=self.usad2_device,
+                    target_layer=self.usad2_target_layer,
+                    output_dim=self.usad2_output_dim,
                     audio_key="instruction_audio",
                     audio_mask_key="instruction_audio_mask",
                 )(outputs)
@@ -211,29 +276,31 @@ class AudiovlaInputs(transforms.DataTransformFn):
                 outputs["audio_mask"] = outputs["ambient_audio_mask"]
                 return outputs
 
-            outputs = transforms.ExtractUSADAudioSequence(
-                model_name=self.usad_model_name,
+            outputs = transforms.ExtractUsad2AudioSequence(
+                model_name=self.usad2_model_name,
                 sample_rate=self.audio_sample_rate,
-                device=self.usad_device,
-                num_frames=_audio_tools.usad_num_frames_for_duration(
+                device=self.usad2_device,
+                target_layer=self.usad2_target_layer,
+                num_frames=_audio_tools.usad2_num_frames_for_duration(
                     self.audio_num_samples,
                     sample_rate=self.audio_sample_rate,
-                    model_name=self.usad_model_name,
+                    frame_rate=usad2_frame_rate,
                 ),
-                output_dim=self.usad_output_dim,
+                output_dim=self.usad2_output_dim,
                 audio_key="ambient_audio",
                 audio_mask_key="ambient_audio_mask",
             )(outputs)
-            outputs = transforms.ExtractUSADAudioSequence(
-                model_name=self.usad_model_name,
+            outputs = transforms.ExtractUsad2AudioSequence(
+                model_name=self.usad2_model_name,
                 sample_rate=self.audio_sample_rate,
-                device=self.usad_device,
-                num_frames=_audio_tools.usad_num_frames_for_duration(
+                device=self.usad2_device,
+                target_layer=self.usad2_target_layer,
+                num_frames=_audio_tools.usad2_num_frames_for_duration(
                     instruction_num_samples,
                     sample_rate=self.audio_sample_rate,
-                    model_name=self.usad_model_name,
+                    frame_rate=usad2_frame_rate,
                 ),
-                output_dim=self.usad_output_dim,
+                output_dim=self.usad2_output_dim,
                 audio_key="instruction_audio",
                 audio_mask_key="instruction_audio_mask",
             )(outputs)
@@ -275,18 +342,19 @@ class AudiovlaInputs(transforms.DataTransformFn):
                 audio_key="ambient_audio",
                 audio_mask_key="ambient_audio_mask",
             )(outputs)
-            outputs = transforms.ExtractQwenASRAudioSequence(
-                model_name=self.qwen_model_name,
-                sample_rate=self.audio_sample_rate,
-                device=self.qwen_device,
-                num_frames=_audio_tools.qwen_asr_num_frames_for_duration(
-                    instruction_num_samples,
+            if not use_cached_qwen_instruction:
+                outputs = transforms.ExtractQwenASRAudioSequence(
+                    model_name=self.qwen_model_name,
                     sample_rate=self.audio_sample_rate,
-                ),
-                output_dim=self.qwen_output_dim,
-                audio_key="instruction_audio",
-                audio_mask_key="instruction_audio_mask",
-            )(outputs)
+                    device=self.qwen_device,
+                    num_frames=_audio_tools.qwen_asr_num_frames_for_duration(
+                        instruction_num_samples,
+                        sample_rate=self.audio_sample_rate,
+                    ),
+                    output_dim=self.qwen_output_dim,
+                    audio_key="instruction_audio",
+                    audio_mask_key="instruction_audio_mask",
+                )(outputs)
             outputs["audio"] = outputs["ambient_audio"]
             outputs["audio_mask"] = outputs["ambient_audio_mask"]
             return outputs
@@ -343,5 +411,7 @@ class AudiovlaInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class AudiovlaOutputs(transforms.DataTransformFn):
+    action_dim: int = 8
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :8])}
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

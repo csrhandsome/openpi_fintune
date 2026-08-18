@@ -9,9 +9,18 @@ whole episode.
 Task -> dialogue-wav mapping comes from RoboOmni's data/libero_<speech>.json files, which map
 each LIBERO task instruction string to a `speech_conv` list of wavs under the eval audio set.
 
+Two protocols are supported:
+  - ``full_dialogue`` (legacy): concatenate all user turns and directly sample
+    actions. This preserves the original benchmark implementation in this repo.
+  - ``interactive``: reveal one user audio turn at a time; ask the policy to
+    generate robot text between turns; begin action execution only after the
+    policy emits ``[ACT]``. This matches RoboOmni's intended Talker/Executor
+    interaction protocol without requiring robot TTS for simulator evaluation.
+
 Usage (client side; a pi0_audio policy server must be serving separately):
 
-  export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=8
+  export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=0
+  export LIBERO_CONFIG_PATH=$PWD/.libero
   export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
   python examples/omniaction_libero/eval_omniaction_libero.py \
     --task_suite_name libero_object \
@@ -21,7 +30,9 @@ Usage (client side; a pi0_audio policy server must be serving separately):
     --host 0.0.0.0 --port 8000
 """
 
-from __future__ import annotations  # PEP 585 generic aliases (tuple[...], list[...]) need py3.9+ at runtime without this
+from __future__ import (
+    annotations,
+)  # PEP 585 generic aliases (tuple[...], list[...]) need py3.9+ at runtime without this
 
 import collections
 import dataclasses
@@ -30,6 +41,7 @@ import logging
 import math
 import pathlib
 import wave
+from collections.abc import Sequence
 
 import imageio
 import numpy as np
@@ -40,6 +52,7 @@ from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
+from openpi.shared import dialogue as dialogue_utils
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
@@ -58,6 +71,7 @@ class Args:
     speech: str = "overlap"  # overlap | identity | libero_sentiment | events | two | three
     speech_json: str = "third_party/RoboOmni/data/libero_overlap.json"
     audio_root: str = "data/libero_audio/overlap"
+    protocol: str = "full_dialogue"  # full_dialogue | interactive
 
     # How to feed the time-series ambient_audio slot (active in full_avla training, 1s/1-token):
     #   shared  -> send the same dialogue waveform (server fits the last 1s window). No server change.
@@ -126,7 +140,7 @@ def _resolve_wav(audio_root: pathlib.Path, entry: str) -> pathlib.Path | None:
     return hits[0] if hits else None
 
 
-def _load_task_audio(audio_root: pathlib.Path, speech_conv: list[str]) -> np.ndarray:
+def _load_task_audio_turns(audio_root: pathlib.Path, speech_conv: list[str]) -> list[np.ndarray]:
     segments = []
     for entry in speech_conv:
         p = _resolve_wav(audio_root, entry)
@@ -135,25 +149,68 @@ def _load_task_audio(audio_root: pathlib.Path, speech_conv: list[str]) -> np.nda
             continue
         data, sr = _read_wav_mono(p)
         segments.append(_resample(data, sr, TARGET_SR))
-    if not segments:
-        return np.zeros((0,), dtype=np.float32)
-    return np.concatenate(segments, axis=0)
+    return segments
 
 
-def _build_inst2audio(speech_json: str, audio_root: pathlib.Path) -> dict[str, np.ndarray]:
+def _build_inst2dialogue(speech_json: str, audio_root: pathlib.Path) -> dict[str, dict]:
     with open(speech_json, encoding="utf-8") as f:
         data = json.load(f)
-    inst2audio = {}
+    inst2dialogue = {}
     for item in data:
-        inst2audio[item["instruction"]] = _load_task_audio(audio_root, item.get("speech_conv", []))
-    return inst2audio
+        turns = _load_task_audio_turns(audio_root, item.get("speech_conv", []))
+        inst2dialogue[item["instruction"]] = {
+            "audio_turns": turns,
+            "reference_responses": [turn.get("response", "") for turn in item.get("conversation", [])],
+        }
+    return inst2dialogue
+
+
+def _concat_audio(turns: Sequence[np.ndarray]) -> np.ndarray:
+    valid = [np.asarray(turn, dtype=np.float32).reshape(-1) for turn in turns if np.asarray(turn).size > 0]
+    return np.concatenate(valid, axis=0) if valid else np.zeros((0,), dtype=np.float32)
+
+
+def _prepare_observation_element(
+    obs,
+    *,
+    resize_size: int,
+    instruction_audio: np.ndarray,
+    ambient_mode: str,
+) -> dict:
+    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+    img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, resize_size, resize_size))
+    wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, resize_size, resize_size))
+    has_audio = bool(instruction_audio.size > 0)
+    element = {
+        "observation/image": img,
+        "observation/wrist_image": wrist_img,
+        "observation/state": np.concatenate(
+            (
+                obs["robot0_eef_pos"],
+                _quat2axisangle(obs["robot0_eef_quat"]),
+                obs["robot0_gripper_qpos"],
+            )
+        ),
+        "prompt": "",
+        "observation/instruction_audio": instruction_audio,
+        "observation/instruction_audio_sample_rate": np.int32(TARGET_SR),
+        "observation/instruction_audio_mask": np.bool_(has_audio),
+    }
+    if ambient_mode == "shared":
+        element["observation/ambient_audio"] = instruction_audio
+        element["observation/ambient_audio_sample_rate"] = np.int32(TARGET_SR)
+        element["observation/ambient_audio_mask"] = np.bool_(has_audio)
+    return element
 
 
 def eval_omniaction_libero(args: Args) -> None:
     np.random.seed(args.seed)
     audio_root = pathlib.Path(args.audio_root)
-    inst2audio = _build_inst2audio(args.speech_json, audio_root)
-    logging.info(f"Loaded audio for {len(inst2audio)} task instructions.")
+    if args.protocol not in {"full_dialogue", "interactive"}:
+        raise ValueError("--protocol must be 'full_dialogue' or 'interactive'")
+    inst2dialogue = _build_inst2dialogue(args.speech_json, audio_root)
+    logging.info(f"Loaded dialogue data for {len(inst2dialogue)} task instructions.")
 
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
@@ -176,11 +233,12 @@ def eval_omniaction_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed, args.render_gpu_device_id)
 
-        task_audio = inst2audio.get(task_description)
-        if task_audio is None:
+        dialogue_item = inst2dialogue.get(task_description)
+        if dialogue_item is None:
             logging.warning(f"No dialogue audio for task '{task_description}'; using silence.")
-            task_audio = np.zeros((TARGET_SR,), dtype=np.float32)
-        has_audio = bool(task_audio.size > 0)
+            dialogue_item = {"audio_turns": [np.zeros((TARGET_SR,), dtype=np.float32)], "reference_responses": []}
+        audio_turns = dialogue_item["audio_turns"]
+        task_audio = _concat_audio(audio_turns)
 
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
@@ -190,6 +248,44 @@ def eval_omniaction_libero(args: Args) -> None:
             t = 0
             replay_images = []
             done = False
+            robot_history: list[str] = []
+            action_mode = args.protocol == "full_dialogue"
+
+            if args.protocol == "interactive":
+                for turn_index, _turn_audio in enumerate(audio_turns):
+                    dialogue_audio = _concat_audio(audio_turns[: turn_index + 1])
+                    element = _prepare_observation_element(
+                        obs,
+                        resize_size=args.resize_size,
+                        instruction_audio=dialogue_audio,
+                        ambient_mode=args.ambient_mode,
+                    )
+                    element["prompt"] = ""
+                    element["dialogue_prompt"] = dialogue_utils.build_talker_prompt(robot_history)
+                    element["dialogue_generate"] = np.bool_(True)
+                    response = client.infer(element)
+                    robot_text = str(response.get("text", "")).strip()
+                    logging.info(
+                        "[interactive/%s] task=%r turn=%d robot=%r",
+                        args.speech,
+                        task_description,
+                        turn_index,
+                        robot_text,
+                    )
+                    if robot_text:
+                        robot_history.append(robot_text)
+                    if dialogue_utils.ACT_TOKEN in robot_text:
+                        action_mode = True
+                        break
+
+                if not action_mode:
+                    logging.info(
+                        "[interactive/%s] task=%r never produced %s; no action execution.",
+                        args.speech,
+                        task_description,
+                        dialogue_utils.ACT_TOKEN,
+                    )
+
             while t < max_steps + args.num_steps_wait:
                 try:
                     if t < args.num_steps_wait:
@@ -198,46 +294,26 @@ def eval_omniaction_libero(args: Args) -> None:
                         continue
 
                     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
                     img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
                     )
-                    wrist_img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
-                    )
                     replay_images.append(img)
 
-                    if not action_plan:
-                        element = {
-                            "observation/image": img,
-                            "observation/wrist_image": wrist_img,
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
-                                )
-                            ),
-                            # RoboOmni: intent inferred from audio; prompt kept empty like training.
-                            "prompt": "",
-                            # Whole-dialogue static instruction audio (raw waveform).
-                            "observation/instruction_audio": task_audio,
-                            "observation/instruction_audio_sample_rate": np.int32(TARGET_SR),
-                            "observation/instruction_audio_mask": np.bool_(has_audio),
-                        }
-                        if args.ambient_mode == "shared":
-                            # Ambient slot is also active under full_avla training (1s/1-token); feed the
-                            # same dialogue waveform so the server-side window extraction matches training
-                            # instead of a zeroed/masked-off ambient slot the model never saw.
-                            element["observation/ambient_audio"] = task_audio
-                            element["observation/ambient_audio_sample_rate"] = np.int32(TARGET_SR)
-                            element["observation/ambient_audio_mask"] = np.bool_(has_audio)
+                    if action_mode and not action_plan:
+                        element = _prepare_observation_element(
+                            obs,
+                            resize_size=args.resize_size,
+                            instruction_audio=task_audio,
+                            ambient_mode=args.ambient_mode,
+                        )
+                        if args.protocol == "interactive":
+                            element["prompt"] = dialogue_utils.build_action_prompt(robot_history)
                         action_chunk = client.infer(element)["actions"]
                         assert len(action_chunk) >= args.replan_steps
                         action_plan.extend(action_chunk[: args.replan_steps])
 
-                    action = action_plan.popleft()
-                    obs, reward, done, info = env.step(action.tolist())
+                    action = action_plan.popleft() if action_plan else LIBERO_DUMMY_ACTION
+                    obs, reward, done, info = env.step(action.tolist() if hasattr(action, "tolist") else action)
                     if done:
                         task_successes += 1
                         total_successes += 1

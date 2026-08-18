@@ -10,13 +10,13 @@ Default output:
 Examples:
     # Franka (writes under data/realworld/franka_lerobot_7_6_audio/qwen_instruction_features)
     OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 \
-      uv run scripts/precompute_omniaction_qwen_features.py \
+      .venv/bin/python scripts/precompute_omniaction_qwen_features.py \
       pi0_base_audio_joint_lora --qwen --workers 4 --threads-per-worker 4
 
-    # OmniAction-LIBERO (after convert_omniaction_to_lerobot.py)
+    # OmniAction-LIBERO (writes under data/omniaction_libero/qwen_features/<repo_id>)
     OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 \
-      uv run scripts/precompute_omniaction_qwen_features.py \
-      pi0_audio_omniaction_libero_object --qwen --workers 4 --threads-per-worker 4
+      .venv/bin/python scripts/precompute_omniaction_qwen_features.py \
+      pi0_omniaction_libero_10 --workers 4 --threads-per-worker 4
 """
 
 from __future__ import annotations
@@ -249,6 +249,7 @@ def main() -> None:
     audio_data_config_types = (
         training_config.LeRobotLiberoAudioDataConfig,
         training_config.LeRobotFrankaJointAudioDataConfig,
+        training_config.LeRobotOmniActionLiberoDataConfig,
     )
 
     config = training_config.get_config(args.config_name)
@@ -269,9 +270,19 @@ def main() -> None:
         raise ValueError("Precomputation currently requires audio_tokenizer_type='sequence_resampler'.")
 
     repo_id = config.data.repo_id
-    audio_sidecar_dir = args.audio_sidecar_dir or _resolve_dataset_root(str(repo_id))
+    if args.audio_sidecar_dir is not None:
+        audio_sidecar_dir = args.audio_sidecar_dir
+    elif getattr(config.data, "audio_sidecar_dir", None):
+        audio_sidecar_dir = Path(str(config.data.audio_sidecar_dir))
+    else:
+        audio_sidecar_dir = _resolve_dataset_root(str(repo_id))
     audio_sidecar_dir = audio_sidecar_dir.expanduser().resolve()
-    output_dir = args.output_dir or qwen_feature_cache_dir(audio_sidecar_dir)
+    if args.output_dir is not None:
+        output_dir = args.output_dir
+    elif isinstance(config.data, training_config.LeRobotOmniActionLiberoDataConfig):
+        output_dir = training_config.omniaction_qwen_feature_cache_dir(str(repo_id))
+    else:
+        output_dir = qwen_feature_cache_dir(audio_sidecar_dir)
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 

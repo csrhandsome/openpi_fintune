@@ -1,0 +1,5 @@
+assets: /data/codes/grade_two/github/robot/openpi/third_party/LIBERO/libero/libero/assets
+bddl_files: /data/codes/grade_two/github/robot/openpi/third_party/LIBERO/libero/libero/bddl_files
+benchmark_root: /data/codes/grade_two/github/robot/openpi/third_party/LIBERO/libero/libero
+datasets: /data/codes/grade_two/github/robot/openpi/third_party/LIBERO/datasets
+init_states: /data/codes/grade_two/github/robot/openpi/third_party/LIBERO/libero/libero/init_files

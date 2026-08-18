@@ -274,6 +274,50 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeDialogue(DataTransformFn):
+    """Tokenize an optional causal robot-response target.
+
+    The regular Pi0 prompt remains a conditioning input.  Dialogue tokens carry
+    a separate prefix-LM sequence whose answer span is autoregressive and
+    supervised by Pi0Audio's Talker loss.
+    """
+
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data = dict(data)
+        dialogue_prompt = data.pop("dialogue_prompt", None)
+        dialogue_target = data.pop("dialogue_target", None)
+
+        if dialogue_prompt is None:
+            zeros = np.zeros((self.tokenizer.max_len,), dtype=np.int32)
+            false = np.zeros((self.tokenizer.max_len,), dtype=np.bool_)
+            return {
+                **data,
+                "dialogue_token_ids": zeros,
+                "dialogue_token_mask": false,
+                "dialogue_token_ar_mask": false,
+                "dialogue_token_loss_mask": false,
+            }
+
+        if not isinstance(dialogue_prompt, str):
+            dialogue_prompt = np.asarray(dialogue_prompt).reshape(()).item()
+        if dialogue_target is not None and not isinstance(dialogue_target, str):
+            dialogue_target = np.asarray(dialogue_target).reshape(()).item()
+        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize_dialogue(
+            str(dialogue_prompt),
+            None if dialogue_target is None else str(dialogue_target),
+        )
+        return {
+            **data,
+            "dialogue_token_ids": tokens,
+            "dialogue_token_mask": token_mask,
+            "dialogue_token_ar_mask": ar_mask,
+            "dialogue_token_loss_mask": loss_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
 
@@ -657,6 +701,11 @@ _AUDIO_PASSTHROUGH_KEYS: tuple[tuple[str, Sequence[str]], ...] = (
     ("frame_index", ("frame_index", "observation/frame_index")),
 )
 
+_DIALOGUE_PASSTHROUGH_KEYS: tuple[tuple[str, Sequence[str]], ...] = (
+    ("dialogue_prompt", ("dialogue_prompt", "observation/dialogue_prompt")),
+    ("dialogue_target", ("dialogue_target", "observation/dialogue_target")),
+)
+
 
 def copy_present_audio_fields(source: Mapping[str, object], dest: dict) -> dict:
     """Copy any available audio-related fields into a transformed input dict."""
@@ -665,6 +714,100 @@ def copy_present_audio_fields(source: Mapping[str, object], dest: dict) -> dict:
         if value is not None:
             dest[out_key] = value
     return dest
+
+
+def copy_present_dialogue_fields(source: Mapping[str, object], dest: dict) -> dict:
+    """Copy turn-level robot-dialogue supervision fields when provided."""
+    for out_key, candidate_keys in _DIALOGUE_PASSTHROUGH_KEYS:
+        value = _find_first_present(source, candidate_keys)
+        if value is not None:
+            dest[out_key] = value
+    return dest
+
+
+@dataclasses.dataclass(frozen=True)
+class ExtractDialogueTurn(DataTransformFn):
+    """Load a supervised robot dialogue turn from an episode sidecar.
+
+    The converter writes a ``dialogue`` list into each ``.sync.json``.  Frames
+    whose ``turn_index`` is -1 keep zero text-loss masks; action frames point
+    at the final confirmation turn so their regular prompt includes the
+    teacher-forced robot dialogue history.
+    """
+
+    dataset_root: str | None = None
+    strict: bool = False
+    episode_index_keys: Sequence[str] = ("episode_index", "observation/episode_index")
+    frame_index_keys: Sequence[str] = ("frame_index", "observation/frame_index")
+    dialogue_turn_index_keys: Sequence[str] = ("dialogue_turn_index", "observation/dialogue_turn_index")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if _find_first_present(data, ("dialogue_prompt", "dialogue_target")) is not None:
+            return data
+
+        episode_index = _find_first_present(data, self.episode_index_keys)
+        if episode_index is None or self.dataset_root is None:
+            return data
+        try:
+            _, sync_path = _audio_tools.resolve_episode_audio_paths(
+                self.dataset_root,
+                _as_int(episode_index, key="episode_index"),
+            )
+            sync_data = _audio_tools.load_json(sync_path)
+            dialogue = sync_data.get("dialogue") if sync_data else None
+            if not isinstance(dialogue, list) or not dialogue:
+                return data
+
+            output = dict(data)
+            explicit_turn_index = _find_first_present(data, self.dialogue_turn_index_keys)
+            turn_index = _as_int_or_none(explicit_turn_index)
+            frame_index = _find_first_present(data, self.frame_index_keys)
+            turn_frame_indices = sync_data.get("dialogue_turn_frame_indices")
+            if turn_index is None and isinstance(turn_frame_indices, list) and frame_index is not None:
+                current_frame = _as_int(frame_index, key="frame_index")
+                for candidate_index, candidate_frame in enumerate(turn_frame_indices):
+                    if _as_int_or_none(candidate_frame) == current_frame:
+                        turn_index = candidate_index
+                        break
+
+            if turn_index is not None and 0 <= turn_index < len(dialogue):
+                turn = dialogue[turn_index]
+                if isinstance(turn, Mapping):
+                    prompt = turn.get("text_prompt")
+                    target = turn.get("robot_response")
+                    if isinstance(prompt, str):
+                        output["dialogue_prompt"] = prompt
+                    if isinstance(target, str) and target.strip():
+                        output["dialogue_target"] = target
+                    audio_window = _time_window_from_mapping(
+                        {
+                            "start_sec": turn.get("context_audio_start_sec"),
+                            "end_sec": turn.get("context_audio_end_sec"),
+                        }
+                    )
+                    if audio_window is not None:
+                        audio_path = _audio_tools.resolve_audio_path_from_sync(self.dataset_root, sync_data)
+                        if audio_path is not None and audio_path.is_file():
+                            audio, sample_rate = _audio_tools.read_wav_mono(audio_path)
+                            start_sample = int(np.clip(round(audio_window[0] * sample_rate), 0, audio.shape[0]))
+                            end_sample = int(
+                                np.clip(round(audio_window[1] * sample_rate), start_sample, audio.shape[0])
+                            )
+                            context_audio = np.ascontiguousarray(audio[start_sample:end_sample], dtype=np.float32)
+                            output["instruction_audio"] = context_audio
+                            output["instruction_audio_sample_rate"] = np.int32(sample_rate)
+                            output["instruction_audio_mask"] = np.bool_(context_audio.size > 0)
+                            output["ambient_audio"] = context_audio
+                            output["ambient_audio_sample_rate"] = np.int32(sample_rate)
+                            output["ambient_audio_mask"] = np.bool_(context_audio.size > 0)
+                    # These synthetic dialogue-supervision frames should not
+                    # also optimize an unrelated action chunk.
+                    output["action_loss_mask"] = np.False_
+            return output
+        except Exception:
+            if self.strict:
+                raise
+            return data
 
 
 _AUDIO_VLA_BASE_MODES = ("full_avla", "audio_action", "image_action")
@@ -691,7 +834,7 @@ def _stable_index_from_fields(
     return int(accumulator % modulo) if found else 0
 
 
-def _set_audio_masks(data: dict, *, value: bool) -> None:
+def _set_audio_masks(data: dict, value: bool) -> None:
     for key in ("audio_mask", "ambient_audio_mask", "instruction_audio_mask"):
         if key in data:
             data[key] = np.bool_(value)
@@ -727,9 +870,9 @@ class AudioVLAConditioning(DataTransformFn):
 
         output = dict(data)
         if mode == "audio_action":
-            output["image_mask"] = dict.fromkeys(output.get("image_mask", {}), np.False_)
+            output["image_mask"] = {key: np.False_ for key in output.get("image_mask", {})}
         elif mode == "image_action":
-            _set_audio_masks(output, value=False)
+            _set_audio_masks(output, False)
         else:
             raise ValueError(f"Unsupported resolved AVLA conditioning mode: {mode}")
         return output
@@ -1145,12 +1288,13 @@ class ExtractQwenASRAudioEmbedding(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class ExtractUSADAudioSequence(DataTransformFn):
-    """Encode an audio waveform window into USAD encoder features."""
+class ExtractUsad2AudioSequence(DataTransformFn):
+    """Encode an audio waveform window into USAD2 universal-audio-encoder features."""
 
-    model_name: str = "MIT-SLS/USAD2-Large"
+    model_name: str = "MIT-SLS/USAD2-Large-Plus"
     sample_rate: int = 16_000
     device: str = "auto"
+    target_layer: int | None = None
     num_frames: int | None = None
     output_dim: int | None = None
     audio_key: str = "audio"
@@ -1159,15 +1303,15 @@ class ExtractUSADAudioSequence(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         raw_audio = data.get(self.audio_key)
         if raw_audio is None:
-            raise ValueError(f"USAD sequence extraction requires a `{self.audio_key}` field.")
+            raise ValueError(f"USAD2 sequence extraction requires a `{self.audio_key}` field.")
 
         raw_mask = data.get(self.audio_mask_key)
         has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
-        expected_dim = self.output_dim or _audio_tools.infer_usad_hidden_size(self.model_name)
-        target_num_frames = self.num_frames or _audio_tools.usad_num_frames_for_duration(
+        expected_dim = self.output_dim or _audio_tools.infer_usad2_hidden_size(self.model_name)
+        target_num_frames = self.num_frames or _audio_tools.usad2_num_frames_for_duration(
             int(np.asarray(raw_audio).reshape(-1).shape[0]),
             sample_rate=self.sample_rate,
-            model_name=self.model_name,
+            frame_rate=_audio_tools.infer_usad2_frame_rate(self.model_name),
         )
 
         if not has_audio:
@@ -1177,17 +1321,18 @@ class ExtractUSADAudioSequence(DataTransformFn):
                 self.audio_mask_key: np.False_,
             }
 
-        sequence = _audio_tools.compute_usad_audio_sequence(
+        sequence = _audio_tools.compute_usad2_audio_sequence(
             np.asarray(raw_audio, dtype=np.float32),
             sample_rate=self.sample_rate,
             model_name=self.model_name,
             device=self.device,
+            target_layer=self.target_layer,
         )
         sequence = np.asarray(sequence, dtype=np.float32)
         if sequence.ndim != 2:
-            raise ValueError(f"USAD sequence must be rank-2, got shape {sequence.shape}")
+            raise ValueError(f"USAD2 sequence must be rank-2, got shape {sequence.shape}")
         if sequence.shape[-1] != expected_dim:
-            raise ValueError(f"USAD sequence hidden size mismatch: expected {expected_dim}, got {sequence.shape[-1]}")
+            raise ValueError(f"USAD2 sequence hidden size mismatch: expected {expected_dim}, got {sequence.shape[-1]}")
         sequence = _audio_tools.fit_audio_feature_sequence(sequence, target_num_frames)
 
         return {
@@ -1198,12 +1343,13 @@ class ExtractUSADAudioSequence(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class ExtractUSADAudioEmbedding(DataTransformFn):
-    """Encode an audio waveform window into a pooled USAD embedding."""
+class ExtractUsad2AudioEmbedding(DataTransformFn):
+    """Encode an audio waveform window into a pooled USAD2 embedding."""
 
-    model_name: str = "MIT-SLS/USAD2-Large"
+    model_name: str = "MIT-SLS/USAD2-Large-Plus"
     sample_rate: int = 16_000
     device: str = "auto"
+    target_layer: int | None = None
     pooling: Literal["mean", "first"] = "mean"
     output_dim: int | None = None
     audio_key: str = "audio"
@@ -1212,11 +1358,11 @@ class ExtractUSADAudioEmbedding(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         raw_audio = data.get(self.audio_key)
         if raw_audio is None:
-            raise ValueError(f"USAD embedding extraction requires a `{self.audio_key}` field.")
+            raise ValueError(f"USAD2 embedding extraction requires a `{self.audio_key}` field.")
 
         raw_mask = data.get(self.audio_mask_key)
         has_audio = bool(_as_bool(raw_mask)) if raw_mask is not None else bool(np.asarray(raw_audio).size > 0)
-        expected_dim = self.output_dim or _audio_tools.infer_usad_hidden_size(self.model_name)
+        expected_dim = self.output_dim or _audio_tools.infer_usad2_hidden_size(self.model_name)
 
         if not has_audio:
             return {
@@ -1225,16 +1371,17 @@ class ExtractUSADAudioEmbedding(DataTransformFn):
                 self.audio_mask_key: np.False_,
             }
 
-        embedding = _audio_tools.compute_usad_audio_embedding(
+        embedding = _audio_tools.compute_usad2_audio_embedding(
             np.asarray(raw_audio, dtype=np.float32),
             sample_rate=self.sample_rate,
             model_name=self.model_name,
             device=self.device,
+            target_layer=self.target_layer,
             pooling=self.pooling,
         )
         embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if embedding.shape != (expected_dim,):
-            raise ValueError(f"USAD embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
+            raise ValueError(f"USAD2 embedding shape mismatch: expected {(expected_dim,)}, got {embedding.shape}")
 
         return {
             **data,

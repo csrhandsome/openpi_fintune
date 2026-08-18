@@ -16,6 +16,7 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+from openpi.shared import audio_tools as _audio_tools
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -70,6 +71,63 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class DialogueAugmentedDataset(Dataset):
+    """Add one Talker-only sample per dialogue turn to a LeRobot dataset.
+
+    The original frame samples are retained for continuous action learning.  A
+    synthetic sample reuses the image/state from the annotated turn frame; the
+    downstream ``ExtractDialogueTurn`` transform recognizes
+    ``dialogue_turn_index`` and supplies causal text targets while masking the
+    action loss.
+    """
+
+    def __init__(self, dataset: Dataset, dataset_root: str, *, repeat: int = 1):
+        self._dataset = dataset
+        self._turn_specs: list[tuple[int, int]] = []
+        if repeat <= 0:
+            raise ValueError("dialogue repeat must be > 0")
+        for episode_index, start_index in self._episode_start_indices().items():
+            _, sync_path = _audio_tools.resolve_episode_audio_paths(dataset_root, episode_index)
+            sync = _audio_tools.load_json(sync_path)
+            turns = sync.get("dialogue") if sync else None
+            if not isinstance(turns, list):
+                continue
+            for turn_index, turn in enumerate(turns):
+                if not isinstance(turn, dict) or not str(turn.get("robot_response", "")).strip():
+                    continue
+                frame_index = turn.get("frame_index")
+                try:
+                    source_index = int(start_index) + max(int(frame_index), 0)
+                except (TypeError, ValueError):
+                    source_index = int(start_index)
+                self._turn_specs.extend([(source_index, turn_index)] * repeat)
+
+    def _episode_start_indices(self) -> dict[int, int]:
+        episode_data_index = getattr(self._dataset, "episode_data_index", None)
+        episodes = getattr(self._dataset, "episodes", None)
+        if episode_data_index is None or episodes is None:
+            return {}
+        starts = np.asarray(episode_data_index["from"]).reshape(-1)
+        return {int(episode): int(start) for episode, start in zip(episodes, starts, strict=True)}
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        index = index.__index__()
+        base_length = len(self._dataset)
+        if index < base_length:
+            item = dict(self._dataset[index])
+            # Preserve a uniform key set for RepackTransform. ``-1`` denotes a
+            # normal action sample rather than a synthetic Talker sample.
+            item["dialogue_turn_index"] = np.int32(-1)
+            return item
+        source_index, turn_index = self._turn_specs[index - base_length]
+        item = dict(self._dataset[source_index])
+        item["dialogue_turn_index"] = np.int32(turn_index)
+        return item
+
+    def __len__(self) -> int:
+        return len(self._dataset) + len(self._turn_specs)
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -162,6 +220,12 @@ def create_torch_dataset(
         delta_timestamps=delta_timestamps or None,
     )
 
+    if data_config.dialogue_turn_augmentation:
+        dataset = DialogueAugmentedDataset(
+            dataset,
+            dataset_root=str(dataset_meta.root),
+            repeat=data_config.dialogue_turn_repeat,
+        )
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
