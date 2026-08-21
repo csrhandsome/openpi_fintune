@@ -2,7 +2,7 @@
 # Evaluate one suite-specific OmniAction-LIBERO model across its six speech types.
 #
 # Prereq: policy server already running (terminal A), e.g.
-#   .venv/bin/python scripts/serve_policy.py --port 8000 policy:checkpoint \
+#   .venv/bin/python scripts/serve_policy.py --port 8001 policy:checkpoint \
 #     --policy.config=pi0_omniaction_libero_10 \
 #     --policy.dir=checkpoints/threecheng_livevla/checkpoints/pi0_omniaction_libero_10/10_full_ft_qwen32s/29999
 #
@@ -29,7 +29,7 @@ unset CUDA_VISIBLE_DEVICES
 
 # --- tunables ---
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
+PORT="${PORT:-8001}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-10}"
 # Whole-dialogue checkpoints consume the complete speech waveform per task.
 PROTOCOL="${PROTOCOL:-full_dialogue}"

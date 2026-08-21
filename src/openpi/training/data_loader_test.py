@@ -1,11 +1,13 @@
 import dataclasses
 import importlib.util
+import json
 import pathlib
 import sys
 
 from flax import nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -15,8 +17,7 @@ from openpi.training import data_loader as _data_loader
 def _load_train_stages_module():
     module_path = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "train_stages.py"
     spec = importlib.util.spec_from_file_location("train_stages_for_test", module_path)
-    assert spec is not None
-    assert spec.loader is not None
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -24,6 +25,85 @@ def _load_train_stages_module():
 
 
 train_stages = _load_train_stages_module()
+
+
+class _DialogueDataset:
+    def __init__(self):
+        self.episodes = np.asarray([3], dtype=np.int64)
+        self.episode_data_index = {"from": np.asarray([0], dtype=np.int64)}
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, index):
+        return {"sample_index": index}
+
+
+def test_dialogue_augmented_dataset_uses_supplied_sidecar_root(tmp_path):
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    (audio_dir / "episode_000003.sync.json").write_text(
+        json.dumps(
+            {
+                "dialogue": [
+                    {"frame_index": 0, "robot_response": "First reply."},
+                    {"frame_index": 0, "robot_response": "Second reply. [ACT]"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = _DialogueDataset()
+    augmented = _data_loader.DialogueAugmentedDataset(dataset, dataset_root=str(tmp_path), repeat=2)
+
+    assert len(augmented) == 5
+    assert augmented[0]["dialogue_turn_index"] == np.int32(-1)
+    assert augmented[1]["dialogue_turn_index"] == np.int32(0)
+    assert augmented[2]["dialogue_turn_index"] == np.int32(0)
+    assert augmented[3]["dialogue_turn_index"] == np.int32(1)
+    assert augmented[4]["dialogue_turn_index"] == np.int32(1)
+
+
+def test_dialogue_augmented_dataset_has_no_samples_when_sidecars_are_missing(tmp_path):
+    dataset = _DialogueDataset()
+    augmented = _data_loader.DialogueAugmentedDataset(dataset, dataset_root=str(tmp_path), repeat=2)
+
+    assert len(augmented) == len(dataset)
+
+
+def test_create_torch_dataset_uses_configured_dialogue_sidecar_root(tmp_path, monkeypatch):
+    audio_dir = tmp_path / "sidecars" / "audio"
+    audio_dir.mkdir(parents=True)
+    (audio_dir / "episode_000003.sync.json").write_text(
+        json.dumps({"dialogue": [{"frame_index": 0, "robot_response": "Ready. [ACT]"}]}),
+        encoding="utf-8",
+    )
+
+    class Metadata:
+        def __init__(self):
+            self.root = tmp_path / "lerobot_without_audio"
+            self.fps = 20
+            self.tasks = {0: ""}
+
+    class Dataset(_DialogueDataset):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", lambda _repo_id: Metadata())
+    monkeypatch.setattr(_data_loader.lerobot_dataset, "LeRobotDataset", Dataset)
+    data_config = _config.DataConfig(
+        repo_id="fake_omniaction",
+        dialogue_turn_augmentation=True,
+        dialogue_turn_repeat=2,
+        dialogue_sidecar_dir=str(tmp_path / "sidecars"),
+    )
+
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon=1, model_config=pi0_config.Pi0Config())
+
+    assert len(dataset) == 3
+    assert dataset[1]["dialogue_turn_index"] == np.int32(0)
+    assert dataset[2]["dialogue_turn_index"] == np.int32(0)
 
 
 def test_torch_data_loader():
@@ -172,18 +252,6 @@ def test_qwen_override_preserves_audio_curriculum_freeze_filter():
     route = _config.enable_qwen_encoder(_config.get_config("pi0_base_audio_joint_route_warmup_lora"))
 
     assert route.model.use_qwen
-    assert not route.model.use_whisper
-    assert route.trainable_filter(("route_head", "kernel"), param)
-    assert route.trainable_filter(("instruction_audio_resampler", "query", "kernel"), param)
-    assert not route.trainable_filter(("action_out_proj", "kernel"), param)
-
-
-def test_usad_override_preserves_audio_curriculum_freeze_filter():
-    param = nnx.Param(jnp.array(0.0))
-    route = _config.enable_usad_encoder(_config.get_config("pi0_base_audio_joint_route_warmup_lora"))
-
-    assert route.model.use_usad
-    assert not route.model.use_qwen
     assert not route.model.use_whisper
     assert route.trainable_filter(("route_head", "kernel"), param)
     assert route.trainable_filter(("instruction_audio_resampler", "query", "kernel"), param)

@@ -137,6 +137,11 @@ class DataConfig:
     # Repeat factor for each Talker turn. A value >1 prevents sparse dialogue
     # annotations from being drowned out by the many action-timestep samples.
     dialogue_turn_repeat: int = 1
+    # Optional root containing ``audio/episode_XXXXXX.sync.json`` sidecars used
+    # to construct Talker text-supervision samples. This can differ from the
+    # LeRobot dataset root because OmniAction stores large audio sidecars
+    # separately (typically on /dev/shm).
+    dialogue_sidecar_dir: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -700,6 +705,7 @@ class LeRobotOmniActionLiberoDataConfig(DataConfigFactory):
                         "episode_index": "episode_index",
                         "frame_index": "frame_index",
                         "dialogue_turn_index": "dialogue_turn_index",
+                        "action_loss_mask": "action_loss_mask",
                     }
                 )
             ]
@@ -762,6 +768,7 @@ class LeRobotOmniActionLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             dialogue_turn_augmentation=model_config.enable_text_loss,
             dialogue_turn_repeat=self.dialogue_turn_repeat if model_config.enable_text_loss else 1,
+            dialogue_sidecar_dir=self.audio_sidecar_dir,
         )
 
 

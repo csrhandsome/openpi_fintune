@@ -13,45 +13,46 @@ Two protocols are supported:
   - ``full_dialogue`` (legacy): concatenate all user turns and directly sample
     actions. This preserves the original benchmark implementation in this repo.
   - ``interactive``: reveal one user audio turn at a time; ask the policy to
-    generate robot text between turns; begin action execution only after the
-    policy emits ``[ACT]``. This matches RoboOmni's intended Talker/Executor
-    interaction protocol without requiring robot TTS for simulator evaluation.
+    generate robot text between turns. An ``[ACT]`` response can begin action
+    execution early; after the final user turn, execution begins regardless,
+    matching RoboOmni's final-turn fallback behavior.
 
 Usage (client side; a pi0_audio policy server must be serving separately):
 
+  export LIBERO_CONFIG_PATH="$PWD/.libero"
   export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl MUJOCO_EGL_DEVICE_ID=0
-  export LIBERO_CONFIG_PATH=$PWD/.libero
   export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
   python examples/omniaction_libero/eval_omniaction_libero.py \
     --task_suite_name libero_object \
     --speech overlap \
     --speech_json third_party/RoboOmni/data/libero_overlap.json \
     --audio_root data/libero_audio/overlap \
-    --host 0.0.0.0 --port 8000
+    --host 127.0.0.1 --port 8001
 """
 
 from __future__ import (
-    annotations,
-)  # PEP 585 generic aliases (tuple[...], list[...]) need py3.9+ at runtime without this
+    annotations,  # PEP 585 generic aliases (tuple[...], list[...]) need py3.9+ at runtime without this
+)
 
 import collections
+from collections.abc import Sequence
 import dataclasses
 import json
 import logging
 import math
 import pathlib
 import wave
-from collections.abc import Sequence
 
 import imageio
-import numpy as np
-import tqdm
-import tyro
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
+import tqdm
+import tyro
+
 from openpi.shared import dialogue as dialogue_utils
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
@@ -62,8 +63,10 @@ SPEECH_SEP = "[UNK]"
 
 @dataclasses.dataclass
 class Args:
-    host: str = "0.0.0.0"
-    port: int = 8000
+    # The policy server listens on all interfaces, but local clients should
+    # connect through loopback rather than the wildcard bind address.
+    host: str = "127.0.0.1"
+    port: int = 8001
     resize_size: int = 224
     replan_steps: int = 5
 
@@ -72,6 +75,10 @@ class Args:
     speech_json: str = "third_party/RoboOmni/data/libero_overlap.json"
     audio_root: str = "data/libero_audio/overlap"
     protocol: str = "full_dialogue"  # full_dialogue | interactive
+    # Legacy checkpoints were trained with an empty Executor prompt. New
+    # Talker/Executor checkpoints can request the reference robot dialogue
+    # prompt in full-dialogue mode to match their action-training inputs.
+    executor_prompt_mode: str = "legacy_empty"  # legacy_empty | reference
 
     # How to feed the time-series ambient_audio slot (active in full_avla training, 1s/1-token):
     #   shared  -> send the same dialogue waveform (server fits the last 1s window). No server change.
@@ -209,6 +216,8 @@ def eval_omniaction_libero(args: Args) -> None:
     audio_root = pathlib.Path(args.audio_root)
     if args.protocol not in {"full_dialogue", "interactive"}:
         raise ValueError("--protocol must be 'full_dialogue' or 'interactive'")
+    if args.executor_prompt_mode not in {"legacy_empty", "reference"}:
+        raise ValueError("--executor-prompt-mode must be 'legacy_empty' or 'reference'")
     inst2dialogue = _build_inst2dialogue(args.speech_json, audio_root)
     logging.info(f"Loaded dialogue data for {len(inst2dialogue)} task instructions.")
 
@@ -239,6 +248,7 @@ def eval_omniaction_libero(args: Args) -> None:
             dialogue_item = {"audio_turns": [np.zeros((TARGET_SR,), dtype=np.float32)], "reference_responses": []}
         audio_turns = dialogue_item["audio_turns"]
         task_audio = _concat_audio(audio_turns)
+        reference_action_prompt = dialogue_utils.build_action_prompt(dialogue_item["reference_responses"])
 
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
@@ -280,11 +290,17 @@ def eval_omniaction_libero(args: Args) -> None:
 
                 if not action_mode:
                     logging.info(
-                        "[interactive/%s] task=%r never produced %s; no action execution.",
+                        "[interactive/%s] task=%r exhausted all dialogue turns without %s; "
+                        "starting Executor via RoboOmni-compatible final-turn fallback.",
                         args.speech,
                         task_description,
                         dialogue_utils.ACT_TOKEN,
                     )
+                    # RoboOmni begins action generation after it has consumed
+                    # the final dialogue turn even if its text decoder omitted
+                    # the literal [ACT] marker. Do not turn a formatting/text
+                    # generation failure into an automatic control failure.
+                    action_mode = True
 
             while t < max_steps + args.num_steps_wait:
                 try:
@@ -307,7 +323,13 @@ def eval_omniaction_libero(args: Args) -> None:
                             ambient_mode=args.ambient_mode,
                         )
                         if args.protocol == "interactive":
+                            # Interactive execution conditions on the Talker's
+                            # own generated dialogue history.
                             element["prompt"] = dialogue_utils.build_action_prompt(robot_history)
+                        elif args.executor_prompt_mode == "reference":
+                            # New Talker/Executor checkpoints are trained with
+                            # the teacher-forced action prompt from sidecars.
+                            element["prompt"] = reference_action_prompt
                         action_chunk = client.infer(element)["actions"]
                         assert len(action_chunk) >= args.replan_steps
                         action_plan.extend(action_chunk[: args.replan_steps])

@@ -803,6 +803,14 @@ class ExtractDialogueTurn(DataTransformFn):
                     # These synthetic dialogue-supervision frames should not
                     # also optimize an unrelated action chunk.
                     output["action_loss_mask"] = np.False_
+            else:
+                # Normal action samples use the confirmed robot dialogue
+                # history written by the converter. This aligns Executor
+                # training with both full-dialogue evaluation (reference
+                # history) and interactive evaluation (generated history).
+                action_prompt = sync_data.get("action_prompt")
+                if isinstance(action_prompt, str) and action_prompt.strip():
+                    output["prompt"] = action_prompt
             return output
         except Exception:
             if self.strict:
@@ -946,8 +954,16 @@ class ExtractAudioWindow(DataTransformFn):
             raw_mask = _find_first_present(data, self.audio_mask_keys)
             audio_mask = bool(audio.size > 0) if raw_mask is None else bool(_as_bool(raw_mask))
             audio_window = _audio_tools.fit_audio_window(audio, self.window_num_samples)
+            # Sample-rate fields describe the *raw* waveform only. Keeping
+            # them after materializing the fixed-rate window makes the output
+            # schema depend on whether a sample came from a dialogue sidecar
+            # (which supplies raw audio) or from the normal sidecar lookup.
+            # Torch's custom collate requires identical dictionary trees.
+            output = dict(data)
+            for key in (*self.audio_sample_rate_keys, "audio_sample_rate", "observation/audio_sample_rate"):
+                output.pop(key, None)
             return {
-                **data,
+                **output,
                 "ambient_audio": audio_window,
                 "ambient_audio_mask": np.bool_(audio_mask),
                 "audio": audio_window,
@@ -989,8 +1005,11 @@ class ExtractAudioWindow(DataTransformFn):
             audio = np.zeros((self.window_num_samples,), dtype=np.float32)
             has_audio = False
 
+        output = dict(data)
+        for key in (*self.audio_sample_rate_keys, "audio_sample_rate", "observation/audio_sample_rate"):
+            output.pop(key, None)
         return {
-            **data,
+            **output,
             "ambient_audio": audio,
             "ambient_audio_mask": np.bool_(has_audio),
             "audio": audio,
@@ -1042,8 +1061,14 @@ class ExtractInstructionAudioWindow(DataTransformFn):
 
             raw_mask = _find_first_present(data, self.audio_mask_keys)
             audio_mask = bool(audio.size > 0) if raw_mask is None else bool(_as_bool(raw_mask))
+            # See ExtractAudioWindow: remove transient raw-waveform metadata
+            # after it has been consumed so action and Talker samples collate
+            # into the same tree.
+            output = dict(data)
+            for key in self.audio_sample_rate_keys:
+                output.pop(key, None)
             return {
-                **data,
+                **output,
                 "instruction_audio": _audio_tools.fit_audio_window(audio, self.window_num_samples),
                 "instruction_audio_mask": np.bool_(audio_mask),
             }
@@ -1080,8 +1105,11 @@ class ExtractInstructionAudioWindow(DataTransformFn):
             audio = np.zeros((self.window_num_samples,), dtype=np.float32)
             has_audio = False
 
+        output = dict(data)
+        for key in self.audio_sample_rate_keys:
+            output.pop(key, None)
         return {
-            **data,
+            **output,
             "instruction_audio": audio,
             "instruction_audio_mask": np.bool_(has_audio),
         }
