@@ -15,6 +15,13 @@ uv run scripts/serve_policy.py --usad --usad-device cpu policy:checkpoint \
   --policy.config=pi0_base_audio_joint_lora \
   --policy.dir=checkpoints/pi0_base_audio_joint_lora/pi0_audio_7_17_usad/29999
 
+# Qwen-asr 版本
+export HF_LEROBOT_HOME="$(pwd)"
+export HF_HUB_OFFLINE=1
+uv run scripts/serve_policy.py --qwen --qwen-device cpu policy:checkpoint \
+  --policy.config=pi0_base_audio_joint_lora \
+  --policy.dir=checkpoints/pi0_base_audio_joint_lora/pi0_audio_7_20_qwen/29999
+
 # 4stage版本的
 export HF_LEROBOT_HOME="$(pwd)"
 export HF_HUB_OFFLINE=1

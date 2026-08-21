@@ -323,3 +323,50 @@ def test_audiovla_inputs_loads_route_label_from_sync_sidecar(tmp_path):
 
     assert outputs["route_label"] == np.int32(1)
     assert outputs["route_label_mask"] == np.True_
+
+
+def test_audiovla_inputs_loads_cached_qwen_instruction_features(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "qwen_cache"
+    cache_dir.mkdir()
+    cached = np.array([[4.0, 5.0, 6.0, 7.0]], dtype=np.float32)
+    np.save(cache_dir / "episode_000007.npy", cached)
+
+    def fake_qwen_sequence(audio, *, sample_rate, model_name, device):
+        del sample_rate, model_name, device
+        # Ambient still encodes online; instruction should come from cache instead.
+        return np.array([[9.0, 8.0, 7.0, 6.0]], dtype=np.float32)
+
+    monkeypatch.setattr(audio_tools, "compute_qwen_asr_audio_sequence", fake_qwen_sequence)
+
+    transform = audiovla_policy.AudiovlaInputs(
+        action_dim=32,
+        audio_num_samples=6,
+        instruction_audio_num_samples=4,
+        audio_sample_rate=16_000,
+        use_qwen=True,
+        qwen_model_name="Qwen/Qwen3-ASR-0.6B",
+        qwen_output_dim=4,
+        qwen_instruction_feature_cache_dir=str(cache_dir),
+        audio_strict=False,
+    )
+    outputs = transform(
+        {
+            "observation/exterior_image_1_left": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/wrist_image_left": np.zeros((224, 224, 3), dtype=np.uint8),
+            "observation/joint_position": np.zeros((7,), dtype=np.float32),
+            "observation/gripper_position": np.ones((1,), dtype=np.float32),
+            "observation/audio": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+            "observation/audio_sample_rate": np.int32(16_000),
+            "episode_index": np.int64(7),
+            "frame_index": np.int64(0),
+            "actions": np.zeros((50, 8), dtype=np.float32),
+            "prompt": "test",
+        }
+    )
+
+    assert outputs["instruction_audio"].shape == (1, 4)
+    assert np.allclose(outputs["instruction_audio"], np.array([[4.0, 5.0, 6.0, 7.0]], dtype=np.float32))
+    assert outputs["instruction_audio_mask"] == np.True_
+    assert outputs["ambient_audio"].shape == (1, 4)
+    assert np.allclose(outputs["ambient_audio"], np.array([[9.0, 8.0, 7.0, 6.0]], dtype=np.float32))
+    assert outputs["ambient_audio_mask"] == np.True_

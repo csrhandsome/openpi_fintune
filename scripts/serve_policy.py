@@ -1,8 +1,10 @@
 import dataclasses
 import enum
 import logging
+import os
 import socket
 
+import numpy as np
 import tyro
 
 from openpi.policies import policy as _policy
@@ -106,6 +108,13 @@ def create_policy(args: Args) -> _policy.Policy:
                     qwen_model_name=args.qwen_model_name,
                     qwen_device=args.qwen_device,
                 )
+            elif args.qwen_device != "auto" and getattr(train_config.model, "use_qwen", False):
+                # Override encoder device without --qwen, which would reset the
+                # baked-in OmniAction 32s audio window.
+                train_config = dataclasses.replace(
+                    train_config,
+                    model=dataclasses.replace(train_config.model, qwen_device=args.qwen_device),
+                )
             if args.usad:
                 train_config = _config.enable_usad_encoder(
                     train_config,
@@ -119,6 +128,42 @@ def create_policy(args: Args) -> _policy.Policy:
             return create_default_policy(args.env, default_prompt=args.default_prompt)
 
 
+def _warmup_policy(policy: _policy.Policy) -> None:
+    """Run one Talker + one Executor infer on the main thread before serving.
+
+    First-call Qwen load and JAX compile inside asyncio.to_thread is what has
+    been aborting this WSL box (`free(): invalid pointer` / xla_cuda_plugin).
+    """
+    zeros_audio = np.zeros((16_000,), dtype=np.float32)
+    obs = {
+        "observation/state": np.zeros((8,), dtype=np.float32),
+        "observation/image": np.zeros((224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image": np.zeros((224, 224, 3), dtype=np.uint8),
+        "prompt": "",
+        "observation/instruction_audio": zeros_audio,
+        "observation/instruction_audio_sample_rate": np.int32(16_000),
+        "observation/instruction_audio_mask": np.bool_(True),
+        "observation/ambient_audio": zeros_audio,
+        "observation/ambient_audio_sample_rate": np.int32(16_000),
+        "observation/ambient_audio_mask": np.bool_(True),
+        "dialogue_prompt": "",
+        "dialogue_generate": np.bool_(True),
+    }
+    logging.info("Warming up policy on the main thread (dialogue generate)")
+    try:
+        policy.infer(obs)
+        logging.info("Warmup dialogue generate done")
+    except Exception:
+        logging.exception("Warmup dialogue generate failed; continuing")
+    logging.info("Warming up policy on the main thread (action sample)")
+    try:
+        obs["dialogue_generate"] = np.bool_(False)
+        policy.infer(obs)
+        logging.info("Warmup action sample done")
+    except Exception:
+        logging.exception("Warmup action sample failed; continuing")
+
+
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
@@ -126,6 +171,9 @@ def main(args: Args) -> None:
     # Record the policy's behavior.
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
+
+    if os.environ.get("OPENPI_WARMUP", "0") == "1":
+        _warmup_policy(policy)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)

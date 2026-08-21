@@ -94,7 +94,10 @@ class Policy(BasePolicy):
             if getattr(model, "use_route_head", False):
                 self._predict_route_logits = nnx_utils.module_jit(model.predict_route_logits)
             if getattr(model, "enable_text_loss", False) and hasattr(model, "generate_text_tokens"):
-                self._generate_text_tokens = model.generate_text_tokens
+                # JIT the Talker decode loop. The eager Python loop otherwise
+                # recompiles a new KV-cache shape on every token (48 compiles
+                # on first request) and crashes XLA/glibc on WSL.
+                self._generate_text_tokens = nnx_utils.module_jit(model.generate_text_tokens)
                 self._dialogue_tokenizer = _tokenizer.PaligemmaTokenizer(model.max_token_len)
             self._rng = rng or jax.random.key(0)
 

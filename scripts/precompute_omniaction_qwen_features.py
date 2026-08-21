@@ -1,5 +1,5 @@
 """Precompute static instruction-audio Qwen features per episode.
-
+暂时没用上,因为我的仓库不存在训练很慢已经需要训练checkpoint的情况
 Supports both:
   - Franka realworld ASR sidecars (instruction often mid-episode)
   - OmniAction-LIBERO converted sidecars (static dialogue for the whole episode)

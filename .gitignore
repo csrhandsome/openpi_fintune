@@ -194,3 +194,6 @@ franka_lerobot_7_6_audio_asr
 
 # Local model weights
 third_party/Qwen3-TTS/models/
+
+# ModelScope local credentials
+scripts/modelscope/config.py
