@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# run_all_eval.sh — 依次评测四个 suite-specific OmniAction-LIBERO 权重。
+# run_all_eval.sh — 依次评测四个 suite-specific OmniAction-LIBERO Talker 权重。
 #
 # 每个 checkpoint 的流程(串行,一个接一个):
 #   1) 后台启动 policy server(端口在 policy 加载完成后才 bind → 可用 TCP 连通性作 ready 信号)
 #   2) 轮询端口直到 ready(Qwen 编码器加载较慢,超时可调 READY_TIMEOUT)
-#   3) 跑 scripts/run_benchmark.sh,对该 suite × 全部 speech 评测
+#   3) 跑 scripts/run_benchmark.sh,对该 suite × 全部 speech 评测(interactive)
 #   4) kill 掉 server 进程组,释放显存,再进入下一个 checkpoint
 #
 # 用法:
-#   bash scripts/run_all_eval.sh                       # 默认只跑 libero_10 + full_dialogue
-#   SUITES="object spatial goal 10" bash scripts/run_all_eval.sh
+#   bash scripts/run_all_eval.sh                       # 四个 suite × 6 speech, interactive
+#   SUITES=object bash scripts/run_all_eval.sh         # 只跑一个 suite
 #   NUM_TRIALS_PER_TASK=20 bash scripts/run_all_eval.sh
 #   PORT=8002 bash scripts/run_all_eval.sh
 #   SUITES=object NUM_TRIALS_PER_TASK=1 bash scripts/run_all_eval.sh
@@ -38,25 +38,30 @@ export NO_PROXY="0.0.0.0,127.0.0.1,localhost"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8001}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-10}"
-# Whole-dialogue checkpoints consume the complete speech waveform per task.
-PROTOCOL="${PROTOCOL:-full_dialogue}"
-SUITES="${SUITES:-10}"
+# Talker/Executor checkpoints are evaluated turn-by-turn (interactive).
+PROTOCOL="${PROTOCOL:-interactive}"
+SUITES="${SUITES:-object spatial goal 10}"
 SPEECHES="${SPEECHES:-overlap,identity,libero_sentiment,events,two,three}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"   # 等 server ready 的最长秒数(Qwen 加载慢)
 RESULT_DIR="${RESULT_DIR:-examples/omniaction_libero/results}"
 SERVER_LOG_DIR="${SERVER_LOG_DIR:-$RESULT_DIR/server_logs}"
 VIDEO_ROOT="${VIDEO_ROOT:-data/omniaction_libero/videos}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$REPO_ROOT/checkpoints/threecheng_livevla/checkpoints}"
+# Qwen on CPU keeps PyTorch off the JAX GPU. Combined with OPENPI_WARMUP=1,
+# Talker JIT runs on the main thread before the websocket binds.
+export OPENPI_WARMUP="${OPENPI_WARMUP:-1}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+QWEN_DEVICE="${QWEN_DEVICE:-cpu}"
 
 mkdir -p "$RESULT_DIR" "$SERVER_LOG_DIR"
 
 # --- 评测清单: 每行 "config|checkpoint_dir|eval_suite|log_stem" ---
-# 每个 suite 只测本轮训练得到的 final checkpoint；每个模型跑全部 SPEECHES。
+# 每个 suite 只测本轮训练得到的 final Talker checkpoint；每个模型跑全部 SPEECHES。
 JOBS=(
-  "pi0_omniaction_libero_object|$CHECKPOINT_ROOT/pi0_omniaction_libero_object/object_full_ft_qwen32s/29999|libero_object|object_full_ft"
-  "pi0_omniaction_libero_spatial|$CHECKPOINT_ROOT/pi0_omniaction_libero_spatial/spatial_full_ft_qwen32s/29999|libero_spatial|spatial_full_ft"
-  "pi0_omniaction_libero_goal|$CHECKPOINT_ROOT/pi0_omniaction_libero_goal/goal_full_ft_qwen32s/27000|libero_goal|goal_full_ft"
-  "pi0_omniaction_libero_10|$CHECKPOINT_ROOT/pi0_omniaction_libero_10/10_full_ft_qwen32s/29999|libero_10|10_full_ft"
+  "pi0_omniaction_libero_object|$CHECKPOINT_ROOT/pi0_omniaction_libero_object/object_talker_executor_qwen32s/29999|libero_object|object_talker"
+  "pi0_omniaction_libero_spatial|$CHECKPOINT_ROOT/pi0_omniaction_libero_spatial/spatial_talker_executor_qwen32s/29999|libero_spatial|spatial_talker"
+  "pi0_omniaction_libero_goal|$CHECKPOINT_ROOT/pi0_omniaction_libero_goal/goal_talker_executor_qwen32s/29999|libero_goal|goal_talker"
+  "pi0_omniaction_libero_10|$CHECKPOINT_ROOT/pi0_omniaction_libero_10/10_talker_executor_qwen32s/29999|libero_10|10_talker"
 )
 
 FILTERED_JOBS=()
@@ -75,6 +80,14 @@ for requested_suite in $SUITES; do
   done
 done
 JOBS=("${FILTERED_JOBS[@]}")
+
+ckpt_ready() {
+  local dir="$1"
+  [[ -d "$dir/params" ]] || return 1
+  find "$dir/assets" -name 'norm_stats.json' 2>/dev/null | grep -q . || return 1
+  [[ "$(find "$dir" -name '*.incomplete' 2>/dev/null | wc -l)" -eq 0 ]] || return 1
+  return 0
+}
 
 SERVER_PID=""
 
@@ -118,9 +131,11 @@ wait_ready() {
 }
 
 echo "########################################################"
-echo "# OmniAction-LIBERO 四个 suite 模型评测"
+echo "# OmniAction-LIBERO 四个 suite Talker interactive 评测"
 echo "#   实验数: ${#JOBS[@]}   host=$HOST port=$PORT trials/task=$NUM_TRIALS_PER_TASK"
+echo "#   protocol: $PROTOCOL"
 echo "#   speech: $SPEECHES"
+echo "#   qwen_device: $QWEN_DEVICE  warmup: $OPENPI_WARMUP"
 echo "#   结果目录: $RESULT_DIR"
 echo "########################################################"
 
@@ -137,8 +152,9 @@ for job in "${JOBS[@]}"; do
   echo "    suite  = $suite"
   echo "========================================================"
 
-  if [[ ! -d "$ckpt" ]]; then
-    echo "  !! checkpoint 目录不存在,跳过: $ckpt"
+  if ! ckpt_ready "$ckpt"; then
+    echo "  !! checkpoint 不完整,跳过: $ckpt"
+    echo "     需要 params/ 与 assets/*/norm_stats.json,且无 *.incomplete"
     continue
   fi
 
@@ -149,8 +165,10 @@ for job in "${JOBS[@]}"; do
 
   server_log="$SERVER_LOG_DIR/${stem}_server.log"
   echo "  -> 启动 server,日志: $server_log"
+  # --qwen-device is a top-level tyro flag and must precede policy:checkpoint.
   # setsid: 独立进程组,便于整组 kill;</dev/null: 不占终端 stdin
-  setsid "$POLICY_PYTHON" scripts/serve_policy.py --port "$PORT" policy:checkpoint \
+  setsid "$POLICY_PYTHON" scripts/serve_policy.py --port "$PORT" --qwen-device "$QWEN_DEVICE" \
+      policy:checkpoint \
       --policy.config="$config" \
       --policy.dir="$ckpt" \
       > "$server_log" 2>&1 < /dev/null &
@@ -191,6 +209,7 @@ for job in "${JOBS[@]}"; do
   echo "===== $stem ====="
   if [[ -f "$bench_log" ]]; then
     grep -E "TOTAL \[" "$bench_log" || echo "  (未找到 TOTAL 行,可能评测失败,见 $bench_log)"
+    grep -E "\[interactive/" "$bench_log" | head -5 || true
   else
     echo "  (无日志: $bench_log)"
   fi

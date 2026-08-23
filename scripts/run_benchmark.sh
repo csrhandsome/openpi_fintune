@@ -4,7 +4,7 @@
 # Prereq: policy server already running (terminal A), e.g.
 #   .venv/bin/python scripts/serve_policy.py --port 8001 policy:checkpoint \
 #     --policy.config=pi0_omniaction_libero_10 \
-#     --policy.dir=checkpoints/threecheng_livevla/checkpoints/pi0_omniaction_libero_10/10_full_ft_qwen32s/29999
+#     --policy.dir=checkpoints/threecheng_livevla/checkpoints/pi0_omniaction_libero_10/10_talker_executor_qwen32s/29999
 #
 # Usage:
 #   SUITES="libero_object" bash scripts/run_benchmark.sh
@@ -31,8 +31,8 @@ unset CUDA_VISIBLE_DEVICES
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8001}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-10}"
-# Whole-dialogue checkpoints consume the complete speech waveform per task.
-PROTOCOL="${PROTOCOL:-full_dialogue}"
+# Talker/Executor checkpoints are evaluated turn-by-turn (interactive).
+PROTOCOL="${PROTOCOL:-interactive}"
 VIDEO_ROOT="${VIDEO_ROOT:-data/omniaction_libero/videos}"
 LOG_DIR="${LOG_DIR:-examples/omniaction_libero/results}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/suite_benchmark.log}"
@@ -79,7 +79,7 @@ for suite in $SUITES; do
   done
 done
 
-echo "==> Benchmarking ${#CELLS[@]} speech cells for $SUITES  host=$HOST port=$PORT trials=$NUM_TRIALS_PER_TASK"
+echo "==> Benchmarking ${#CELLS[@]} speech cells for $SUITES  host=$HOST port=$PORT protocol=$PROTOCOL trials=$NUM_TRIALS_PER_TASK"
 echo "==> Videos -> $VIDEO_ROOT/<suite>_<speech>/   log -> $LOG_FILE"
 
 idx=0
