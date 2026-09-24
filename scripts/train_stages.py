@@ -7,7 +7,6 @@ import tyro
 import wandb
 
 from openpi.models import model as _model
-from openpi.models import pi0_audio
 import openpi.training.config as _config
 import openpi.training.weight_loaders as _weight_loaders
 
@@ -20,24 +19,13 @@ import scripts.train as _train  # noqa: E402
 
 @dataclasses.dataclass(frozen=True)
 class StagedTrainArgs:
-    configs: tuple[str, ...] = (
-        "pi0_base_audio_joint_route_warmup_lora",
-        "pi0_base_audio_joint_audio_action_lora",
-        "pi0_base_audio_joint_mixed_aa_avla_lora",
-        "pi0_base_audio_joint_full_avla_lora",
-    )
+    configs: tuple[str, ...] = ()
     exp_name: str = tyro.MISSING
     stage_exp_names: tuple[str, ...] = ()
     checkpoint_base_dir: str = "./checkpoints"
     overwrite: bool = False
     resume: bool = False
     wandb_enabled: bool = True
-    qwen: bool = False
-    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B"
-    qwen_device: str = "auto"
-    usad: bool = False
-    usad_model_name: str = "MIT-SLS/USAD2-Large"
-    usad_device: str = "auto"
     num_train_steps: tuple[int, ...] = ()
     save_interval: tuple[int, ...] = ()
 
@@ -71,8 +59,6 @@ def _continuation_weight_loader(
     model: _model.BaseModelConfig,
     params_path: pathlib.Path,
 ) -> _weight_loaders.WeightLoader:
-    if isinstance(model, pi0_audio.Pi0AudioConfig):
-        return _weight_loaders.Pi0AudioWeightLoader(str(params_path))
     return _weight_loaders.CheckpointWeightLoader(str(params_path))
 
 
@@ -84,21 +70,6 @@ def _build_stage_config(
     previous_params_path: pathlib.Path | None,
 ) -> _config.TrainConfig:
     config = _config.get_config(config_name)
-    if args.qwen and args.usad:
-        raise ValueError("--qwen and --usad cannot both be enabled.")
-    if args.qwen:
-        config = _config.enable_qwen_encoder(
-            config,
-            qwen_model_name=args.qwen_model_name,
-            qwen_device=args.qwen_device,
-        )
-    if args.usad:
-        config = _config.enable_usad_encoder(
-            config,
-            usad_model_name=args.usad_model_name,
-            usad_device=args.usad_device,
-        )
-
     updates = {
         "exp_name": _stage_exp_name(args, config_name, stage_index),
         "checkpoint_base_dir": args.checkpoint_base_dir,

@@ -21,11 +21,10 @@
   - prefix 不保真 / 缝接突跳 → 训练或采样侧确有 bug，值得继续深挖。
 
 注意：本脚本只合成机械臂低维状态（关节角 + gripper）。图像可以用灰图，也可以
-直接从真实 RealSense 双相机抓一帧；audio 默认用静音 ambient/instruction 两个槽位，
-避免 audio strict transform 因缺 instruction_audio 而失败。它验证的是 RTC 机制本身
-（pin + seam），不验证策略在真实场景下的动作质量——后者本来就该在实机上看。
+直接从真实 RealSense 双相机抓一帧。它验证的是 RTC 机制本身（pin + seam），不验证
+策略在真实场景下的动作质量——后者本来就该在实机上看。
 
-用法（灰图 + 静音 audio）：
+用法（灰图）：
   uv run vla-scripts/realworld/rtc_offline_check.py \
       --remote-host 192.168.5.54 --remote-port 8001 \
       --action-horizon 32 --open-loop-horizon 24 --delay 8 \
@@ -58,7 +57,7 @@ class Args:
     remote_host: str = "192.168.5.54"
     remote_port: int = 8001
 
-    # 必须与训练 config 的 model.action_horizon 一致（pi0_base_audio_joint_lora 工作区为 32）。
+    # 必须与训练 config 的 model.action_horizon 一致（franka joint RTC 工作区为 32）。
     action_horizon: int = 32
     # 实机每次重新请求策略前已经执行掉的旧 chunk 步数；应与推理脚本 --open-loop-horizon 一致。
     open_loop_horizon: int = 24
@@ -91,13 +90,6 @@ class Args:
     joint_position: tuple[float, ...] = (0.00388, -0.45916, -0.15237, -2.47266, -0.06778, 1.96442, 0.70214)
     gripper_position: float = 1.0
 
-    # 静音 audio 只用于满足 AudioVLA 双音频槽位输入。默认 mask=False，不触发真实 Whisper/Qwen 编码。
-    audio_num_samples: int = 16_000
-    instruction_audio_num_samples: int = 16_000
-    audio_sample_rate: int = 16_000
-    ambient_audio_mask: bool = False
-    instruction_audio_mask: bool = False
-
     # 缝接突跳判定：seam_jump / median(内部相邻步) 超过该倍数即判 FAIL。
     seam_ratio_threshold: float = 3.0
     # prefix 保真判定：逐位绝对误差超过该值即判 FAIL（归一化后 action 空间，留浮点裕度）。
@@ -114,7 +106,7 @@ class ObservationImages:
 
 
 def _center_crop_and_resize(rgb: np.ndarray, out_hw: int = 224, crop_scale: float = 0.9) -> np.ndarray:
-    """Center crop + resize to match franka_joint_main_audio.py preprocessing."""
+    """Center crop + resize to match franka_joint_main_rtc.py preprocessing."""
     from PIL import Image
 
     rgb = _ensure_rgb_uint8("camera image", rgb)
@@ -162,7 +154,7 @@ def _capture_camera_images(args: Args) -> ObservationImages:
             raise RuntimeError(
                 "failed to connect RealSense cameras. "
                 "Pass the same --external-camera-serial and --wrist-camera-serial used by "
-                "franka_joint_main_audio.py; use --no-require-camera-serials only if auto selection is intended."
+                "franka_joint_main_rtc.py; use --no-require-camera-serials only if auto selection is intended."
             ) from exc
         for _ in range(max(0, int(args.camera_warmup_frames))):
             cameras.update(timeout_ms=args.camera_timeout_ms)
@@ -235,15 +227,11 @@ def _validate_args(args: Args) -> None:
             f"open_loop_horizon/skip + delay ({prefix_start}+{args.delay}) must be <= "
             f"action_horizon ({args.action_horizon})."
         )
-    if args.audio_num_samples <= 0 or args.instruction_audio_num_samples <= 0:
-        raise ValueError("--audio-num-samples and --instruction-audio-num-samples must be > 0.")
-    if args.audio_sample_rate <= 0:
-        raise ValueError("--audio-sample-rate must be > 0.")
     if args.image_source == "cameras" and args.require_camera_serials:
         if args.external_camera_serial is None or args.wrist_camera_serial is None:
             raise ValueError(
                 "--image-source cameras requires explicit --external-camera-serial and --wrist-camera-serial. "
-                "Use the same serials that work in franka_joint_main_audio.py, or pass "
+                "Use the same serials that work in franka_joint_main_rtc.py, or pass "
                 "--no-require-camera-serials to allow RealSense auto selection."
             )
     if args.camera_width <= 0 or args.camera_height <= 0 or args.camera_fps <= 0:
@@ -259,26 +247,16 @@ def _validate_args(args: Args) -> None:
 
 
 def _build_request(args: Args, images: ObservationImages) -> dict:
-    ambient_audio = np.zeros((args.audio_num_samples,), dtype=np.float32)
-    instruction_audio = np.zeros((args.instruction_audio_num_samples,), dtype=np.float32)
     return {
         "observation/exterior_image_1_left": images.exterior.copy(),
         "observation/wrist_image_left": images.wrist.copy(),
         "observation/joint_position": np.asarray(args.joint_position, dtype=np.float32),
         "observation/gripper_position": np.asarray([args.gripper_position], dtype=np.float32),
-        "observation/audio": ambient_audio,
-        "observation/audio_sample_rate": np.int32(args.audio_sample_rate),
-        "observation/audio_mask": np.bool_(args.ambient_audio_mask),
-        "observation/instruction_audio": instruction_audio,
-        "observation/instruction_audio_sample_rate": np.int32(args.audio_sample_rate),
-        "observation/instruction_audio_mask": np.bool_(args.instruction_audio_mask),
         "prompt": args.instruction,
     }
 
 
 def _print_request_summary(req: dict, images: ObservationImages) -> None:
-    ambient = np.asarray(req["observation/audio"])
-    instruction = np.asarray(req["observation/instruction_audio"])
     print(
         "[rtc-check] observation:"
         f" image_source={images.source},"
@@ -286,12 +264,6 @@ def _print_request_summary(req: dict, images: ObservationImages) -> None:
         f" wrist={req['observation/wrist_image_left'].shape},"
         f" joint={np.asarray(req['observation/joint_position']).shape},"
         f" gripper={np.asarray(req['observation/gripper_position']).shape}"
-    )
-    print(
-        "[rtc-check] synthetic audio:"
-        f" ambient_shape={ambient.shape}, ambient_mask={bool(req['observation/audio_mask'])};"
-        f" instruction_shape={instruction.shape},"
-        f" instruction_mask={bool(req['observation/instruction_audio_mask'])}"
     )
 
 

@@ -6,7 +6,6 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-import sys
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -15,13 +14,11 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
-import openpi.models.pi0_audio as pi0_audio
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
-import openpi.policies.audiovla_policy as audiovla_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
@@ -47,29 +44,6 @@ def _freeze_except_trainable(*patterns: str) -> Filter:
         nnx.Param,
         nnx.Not(nnx.Any(*(nnx_utils.PathRegex(pattern) for pattern in patterns))),
     )
-
-
-def _pi0_audio_stage_freeze_filter(
-    *,
-    train_audio: bool,
-    train_route: bool,
-    train_action_side: bool,
-    train_lora: bool = True,
-    train_backbone: bool = False,
-) -> Filter:
-    if train_backbone:
-        return nnx.Nothing
-
-    trainable_patterns: list[str] = []
-    if train_audio:
-        trainable_patterns.append(".*audio.*")
-    if train_route:
-        trainable_patterns.append(".*route.*")
-    if train_action_side:
-        trainable_patterns.extend((".*state_proj.*", ".*action_.*", ".*norm_1.*Dense.*"))
-    if train_lora:
-        trainable_patterns.append(".*lora.*")
-    return _freeze_except_trainable(*trainable_patterns)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,17 +105,6 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
-    # If true, expand each annotated dialogue turn in an episode into an
-    # additional text-supervision sample. The original action samples remain.
-    dialogue_turn_augmentation: bool = False
-    # Repeat factor for each Talker turn. A value >1 prevents sparse dialogue
-    # annotations from being drowned out by the many action-timestep samples.
-    dialogue_turn_repeat: int = 1
-    # Optional root containing ``audio/episode_XXXXXX.sync.json`` sidecars used
-    # to construct Talker text-supervision samples. This can differ from the
-    # LeRobot dataset root because OmniAction stores large audio sidecars
-    # separately (typically on /dev/shm).
-    dialogue_sidecar_dir: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -165,7 +128,7 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI0_AUDIO:
+            case _model.ModelType.PI0:
                 inputs: list[_transforms.DataTransformFn] = [
                     _transforms.InjectDefaultPrompt(self.default_prompt),
                     _transforms.ResizeImages(224, 224),
@@ -173,10 +136,6 @@ class ModelTransformFactory(GroupFactory):
                         _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                     ),
                 ]
-                if model_config.model_type == _model.ModelType.PI0_AUDIO:
-                    inputs.append(
-                        _transforms.TokenizeDialogue(_tokenizer.PaligemmaTokenizer(model_config.max_token_len))
-                    )
                 inputs.append(_transforms.PadStatesAndActions(model_config.action_dim))
                 return _transforms.Group(inputs=inputs)
             case _model.ModelType.PI05:
@@ -240,7 +199,7 @@ class DataConfigFactory(abc.ABC):
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type not in (ModelType.PI0, ModelType.PI0_AUDIO),
+            use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -566,212 +525,6 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
         )
 
 
-# audio的dataconfig,在这里决定什么key,决定最终怎么transform数据
-@dataclasses.dataclass(frozen=True)
-class LeRobotFrankaJointAudioDataConfig(DataConfigFactory):
-    """Franka joint-control dataset with sidecar audio aligned by episode/frame indices."""
-
-    audio_fallback_fps: float = 20.0
-    audio_strict: bool = True
-    conditioning_mode: Literal["full_avla", "audio_action", "image_action", "mixed_aa_avla"] = "full_avla"
-    mixed_conditioning_modes: Sequence[Literal["full_avla", "audio_action", "image_action"]] = (
-        "audio_action",
-        "full_avla",
-    )
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if not isinstance(model_config, pi0_audio.Pi0AudioConfig):
-            raise TypeError("LeRobotFrankaJointAudioDataConfig requires Pi0AudioConfig.")
-
-        dataset_root = self.repo_id if self.repo_id is not tyro.MISSING else None
-        if dataset_root is None:
-            raise ValueError("repo_id is required for Franka audio datasets with sidecar WAV files.")
-
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "episode_index": "episode_index",
-                        "frame_index": "frame_index",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-        data_transforms = _transforms.Group(
-            inputs=[
-                audiovla_policy.AudiovlaInputs(
-                    action_dim=model_config.action_dim,
-                    audio_num_samples=model_config.audio_num_samples,
-                    instruction_audio_num_samples=model_config.instruction_audio_num_samples,
-                    audio_sample_rate=model_config.audio_sample_rate,
-                    use_whisper=model_config.use_whisper,
-                    use_qwen=model_config.use_qwen,
-                    audio_tokenizer_type=model_config.audio_tokenizer_type,
-                    whisper_model_name=model_config.whisper_model_name,
-                    whisper_output_dim=model_config.audio_feature_dim,
-                    whisper_device=model_config.whisper_device,
-                    qwen_model_name=model_config.qwen_model_name,
-                    qwen_output_dim=model_config.audio_feature_dim
-                    if model_config.use_qwen
-                    else model_config.qwen_output_dim,
-                    qwen_device=model_config.qwen_device,
-                    use_usad2=model_config.use_usad2,
-                    usad2_model_name=model_config.usad2_model_name,
-                    usad2_output_dim=model_config.audio_feature_dim
-                    if model_config.use_usad2
-                    else model_config.usad2_output_dim,
-                    usad2_device=model_config.usad2_device,
-                    usad2_target_layer=model_config.usad2_target_layer,
-                    dataset_root=dataset_root,
-                    audio_fallback_fps=self.audio_fallback_fps,
-                    audio_strict=self.audio_strict,
-                    model_type=model_config.model_type,
-                ),
-                _transforms.AudioVLAConditioning(
-                    mode=self.conditioning_mode,
-                    mixed_modes=self.mixed_conditioning_modes,
-                ),
-            ],
-            outputs=[audiovla_policy.AudiovlaOutputs()],
-        )
-        delta_action_mask = _transforms.make_bool_mask(7, -1)
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-        )
-
-
-# RoboOmni / OmniAction-LIBERO audio dataconfig.
-# The spoken dialogue is STATIC per episode (semantic intent inference, not time-triggered),
-# so the whole-dialogue clip is fed as the `instruction_audio` slot at every frame via the
-# sidecar sync.json (instruction_audio_window covering the full timeline). The `ambient_audio`
-# slot is kept minimal (RoboOmni has no time-triggered environmental-sound cue -- that is HEAR).
-@dataclasses.dataclass(frozen=True)
-class LeRobotOmniActionLiberoDataConfig(DataConfigFactory):
-    """OmniAction-LIBERO (RoboOmni) dataset with per-episode static dialogue audio sidecars.
-
-    Expects a LeRobot dataset (image/wrist_image/state/actions) plus audio sidecars written by
-    examples/omniaction_libero/convert_omniaction_to_lerobot.py at ``audio_sidecar_dir``:
-    ``<audio_sidecar_dir>/audio/episode_XXXXXX.wav`` + ``.sync.json``.
-    """
-
-    # Directory holding the ``audio/`` sidecar subdir (dataset_root for audio extraction).
-    audio_sidecar_dir: str | None = None
-    # Optional directory with precomputed episode_XXXXXX.npy Qwen instruction features.
-    qwen_instruction_feature_cache_dir: str | None = None
-    audio_fallback_fps: float = 20.0
-    audio_strict: bool = True
-    # Staged image/audio masking for the curriculum (audio_action -> mixed_aa_avla -> full_avla).
-    conditioning_mode: Literal["full_avla", "audio_action", "image_action", "mixed_aa_avla"] = "full_avla"
-    mixed_conditioning_modes: Sequence[Literal["full_avla", "audio_action", "image_action"]] = (
-        "audio_action",
-        "full_avla",
-    )
-    dialogue_turn_repeat: int = 4
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if not isinstance(model_config, pi0_audio.Pi0AudioConfig):
-            raise TypeError("LeRobotOmniActionLiberoDataConfig requires Pi0AudioConfig.")
-        if self.audio_sidecar_dir is None:
-            raise ValueError("audio_sidecar_dir is required (dir containing the audio/ sidecars).")
-
-        # Match the LIBERO LeRobot dataset keys and expose episode/frame indices for audio lookup.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "image",
-                        "observation/wrist_image_left": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                        "episode_index": "episode_index",
-                        "frame_index": "frame_index",
-                        "dialogue_turn_index": "dialogue_turn_index",
-                        "action_loss_mask": "action_loss_mask",
-                    }
-                )
-            ]
-        )
-
-        data_transforms = _transforms.Group(
-            inputs=[
-                _transforms.ExtractDialogueTurn(
-                    dataset_root=self.audio_sidecar_dir,
-                    strict=False,
-                ),
-                audiovla_policy.AudiovlaInputs(
-                    action_dim=model_config.action_dim,
-                    audio_num_samples=model_config.audio_num_samples,
-                    instruction_audio_num_samples=model_config.instruction_audio_num_samples,
-                    audio_sample_rate=model_config.audio_sample_rate,
-                    use_whisper=model_config.use_whisper,
-                    use_qwen=model_config.use_qwen,
-                    audio_tokenizer_type=model_config.audio_tokenizer_type,
-                    whisper_model_name=model_config.whisper_model_name,
-                    whisper_output_dim=model_config.audio_feature_dim,
-                    whisper_device=model_config.whisper_device,
-                    qwen_model_name=model_config.qwen_model_name,
-                    qwen_output_dim=model_config.audio_feature_dim
-                    if model_config.use_qwen
-                    else model_config.qwen_output_dim,
-                    qwen_device=model_config.qwen_device,
-                    qwen_instruction_feature_cache_dir=self.qwen_instruction_feature_cache_dir,
-                    use_usad2=model_config.use_usad2,
-                    usad2_model_name=model_config.usad2_model_name,
-                    usad2_output_dim=model_config.audio_feature_dim
-                    if model_config.use_usad2
-                    else model_config.usad2_output_dim,
-                    usad2_device=model_config.usad2_device,
-                    usad2_target_layer=model_config.usad2_target_layer,
-                    dataset_root=self.audio_sidecar_dir,
-                    audio_fallback_fps=self.audio_fallback_fps,
-                    audio_strict=self.audio_strict,
-                    model_type=model_config.model_type,
-                ),
-                _transforms.AudioVLAConditioning(
-                    mode=self.conditioning_mode,
-                    mixed_modes=self.mixed_conditioning_modes,
-                ),
-            ],
-            outputs=[audiovla_policy.AudiovlaOutputs(action_dim=7)],
-        )
-        # LIBERO actions are already deltas except the gripper (7th dim, absolute).
-        delta_action_mask = _transforms.make_bool_mask(6, -1)
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            dialogue_turn_augmentation=model_config.enable_text_loss,
-            dialogue_turn_repeat=self.dialogue_turn_repeat if model_config.enable_text_loss else 1,
-            dialogue_sidecar_dir=self.audio_sidecar_dir,
-        )
-
-
 @dataclasses.dataclass(frozen=True)
 class LeRobotForcevlaDataConfig(DataConfigFactory):
     """
@@ -930,25 +683,6 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
-
-# RoboOmni / OmniAction-LIBERO: every (suite x speech) subset on fnlp/OmniAction-LIBERO that
-# actually ships tfrecord data (the other suite x speech combos on HF are empty -- metadata only).
-# Mapping: (suite, speech, hf_subset_dir, eval_audio_dir). `suite` matches the LIBERO eval
-# task_suite_name suffix (libero_<suite>); `hf_subset_dir` is the top-level dir on HF and the
-# local RLDS dir name; `eval_audio_dir` is the subdir under data/libero_audio/ holding the wavs
-# the convert script joins into per-episode dialogue sidecars.
-_OMNIACTION_LIBERO_SUBSETS: Sequence[tuple[str, str, str, str]] = (
-    ("object", "overlap", "libero_speech_object_overlap", "overlap"),
-    ("object", "identity", "libero_speech_object_identity", "identity"),
-    ("object", "sentiment", "libero_speech_object_sentiment", "libero_sentiment"),
-    ("spatial", "identity", "libero_speech_spatial_identity", "identity"),
-    ("spatial", "sentiment", "libero_speech_spatial_sentiment", "libero_sentiment"),
-    ("goal", "events", "libero_speech_goal_events", "events"),
-    ("goal", "identity", "libero_speech_goal_identity", "identity"),
-    ("goal", "sentiment", "libero_speech_goal_sentiment", "libero_sentiment"),
-    ("10", "identity", "libero_speech10_identity", "identity"),
-    ("10", "sentiment", "libero_speech10_sentiment", "libero_sentiment"),
-)
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
@@ -1435,413 +1169,6 @@ _CONFIGS = [
         ema_decay=None,
         batch_size=4,
     ),
-    # 声音训练config baseline
-    TrainConfig(
-        name="pi0_base_audio_joint_lora",
-        model=pi0_audio.Pi0AudioConfig(
-            action_dim=32,
-            action_horizon=32,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            use_whisper=True,
-            whisper_model_name="openai/whisper-tiny",
-            rtc_train_max_delay=8,
-            use_audio_guidance=False,
-            audio_guidance_lambda=1.5,
-        ),
-        data=LeRobotFrankaJointAudioDataConfig(
-            # 数据放在openpi的根目录且名称为repo_id
-            repo_id="franka_lerobot_7_6_audio",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_6_audio",  # 这里为之前compute的产物的地址
-            ),
-        ),
-        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
-        batch_size=4,
-        save_interval=1000,
-        freeze_filter=_pi0_audio_stage_freeze_filter(
-            train_audio=True,
-            train_route=False,
-            train_action_side=True,
-            train_lora=True,
-        ),
-        ema_decay=None,
-    ),
-    # RoboOmni / OmniAction-LIBERO: whole-dialogue audio -> static instruction_audio slot.
-    TrainConfig(
-        name="pi0_omniaction_libero_object_overlap",
-        model=pi0_audio.Pi0AudioConfig(
-            action_dim=32,
-            action_horizon=32,
-            # Multi-turn robot history plus the answer target does not fit
-            # Pi0's default 48-token prompt budget.
-            max_token_len=128,
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            use_whisper=False,
-            use_qwen=True,
-            qwen_model_name="Qwen/Qwen3-ASR-0.6B",
-            # ~32s window covers the full spoken dialogue.
-            instruction_audio_num_samples=16_000 * 32,
-            instruction_audio_num_tokens=32,
-            # RoboOmni has no time-triggered ambient cue; keep the ambient slot minimal.
-            ambient_audio_num_samples=16_000,
-            ambient_audio_num_tokens=1,
-            rtc_train_max_delay=0,
-            use_audio_guidance=False,
-            enable_text_loss=True,
-            text_loss_weight=0.1,
-            text_max_new_tokens=48,
-        ),
-        data=LeRobotOmniActionLiberoDataConfig(
-            repo_id="omniaction_libero_object_overlap",
-            audio_sidecar_dir="data/omniaction_libero/sidecars/object_overlap",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=50_000,
-        batch_size=4,
-        save_interval=1000,
-        freeze_filter=_pi0_audio_stage_freeze_filter(
-            train_audio=True,
-            train_route=False,
-            train_action_side=True,
-            train_lora=False,
-            train_backbone=True,
-        ),
-        ema_decay=None,
-    ),
-    # RoboOmni / OmniAction-LIBERO: full-FT configs for every OTHER populated (suite x speech)
-    # subset on fnlp/OmniAction-LIBERO (object_overlap is the standalone config above). Each
-    # mirrors it -- Qwen3-ASR encoder, 32s dialogue window, action_dim=32 padded to pi0_base
-    # weights, route head off (OmniAction has no route labels). Train with:
-    #   uv run scripts/train.py pi0_omniaction_libero_<suite>_<speech> \
-    #     --exp_name omniaction_full_ft_qwen32s_<suite>_<speech> \
-    #     --fsdp-devices 8 --batch-size 64 --overwrite
-    *(
-        TrainConfig(
-            name=f"pi0_omniaction_libero_{suite}_{speech}",
-            model=pi0_audio.Pi0AudioConfig(
-                action_dim=32,
-                action_horizon=32,
-                max_token_len=128,
-                paligemma_variant="gemma_2b",
-                action_expert_variant="gemma_300m",
-                use_whisper=False,
-                use_qwen=True,
-                qwen_model_name="Qwen/Qwen3-ASR-0.6B",
-                instruction_audio_num_samples=16_000 * 32,
-                instruction_audio_num_tokens=32,
-                ambient_audio_num_samples=16_000,
-                ambient_audio_num_tokens=1,
-                rtc_train_max_delay=0,
-                use_audio_guidance=False,
-                enable_text_loss=True,
-                text_loss_weight=0.1,
-                text_max_new_tokens=48,
-            ),
-            data=LeRobotOmniActionLiberoDataConfig(
-                repo_id=f"omniaction_libero_{suite}_{speech}",
-                audio_sidecar_dir=f"data/omniaction_libero/sidecars/{suite}_{speech}",
-                base_config=DataConfig(prompt_from_task=True),
-            ),
-            weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=50_000,
-            batch_size=4,
-            save_interval=1000,
-            freeze_filter=_pi0_audio_stage_freeze_filter(
-                train_audio=True,
-                train_route=False,
-                train_action_side=True,
-                train_lora=False,
-                train_backbone=True,
-            ),
-            ema_decay=None,
-        )
-        for suite, speech, _hf_subset, _eval_audio_dir in _OMNIACTION_LIBERO_SUBSETS
-        if not (suite == "object" and speech == "overlap")
-    ),
-    # RoboOmni-style SINGLE-SUITE models: one per suite, each with ALL 6 speech types. Datasets:
-    #   goal            -> build_goal_all6.py  (events/identity/sentiment real; overlap/two/three
-    #                      reuse goal/events trajectories, audio matched by instruction)
-    #   object/spatial/10 -> build_suite_all6.py --suite <s>  (real subsets as-is; missing types
-    #                      synthesized by reusing that suite's sentiment trajectories + matched audio)
-    # Qwen3-ASR-0.6B with a 32-second dialogue window. Per suite:
-    #   <build script above>
-    #   JAX_PLATFORMS=cpu .venv/bin/python scripts/compute_norm_stats.py --config-name pi0_omniaction_libero_<s>
-    #   bash scripts/train_omniaction_libero_suites.sh
-    # Sidecars live at data/omniaction_libero/sidecars/<s>/.
-    *[
-        TrainConfig(
-            name=f"pi0_omniaction_libero_{suite}",
-            model=pi0_audio.Pi0AudioConfig(
-                action_dim=32,
-                action_horizon=32,
-                max_token_len=128,
-                paligemma_variant="gemma_2b",
-                action_expert_variant="gemma_300m",
-                use_whisper=False,
-                use_qwen=True,
-                qwen_model_name="Qwen/Qwen3-ASR-0.6B",
-                instruction_audio_num_samples=16_000 * 32,
-                instruction_audio_num_tokens=32,
-                ambient_audio_num_samples=16_000,
-                ambient_audio_num_tokens=1,
-                rtc_train_max_delay=0,
-                use_audio_guidance=False,
-                enable_text_loss=True,
-                text_loss_weight=0.1,
-                text_max_new_tokens=48,
-            ),
-            data=LeRobotOmniActionLiberoDataConfig(
-                repo_id=f"omniaction_libero_{suite}",
-                audio_sidecar_dir=f"data/omniaction_libero/sidecars/{suite}",
-                base_config=DataConfig(prompt_from_task=True),
-            ),
-            weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=30_000,
-            batch_size=4,
-            save_interval=1000,
-            freeze_filter=_pi0_audio_stage_freeze_filter(
-                train_audio=True,
-                train_route=False,
-                train_action_side=True,
-                train_lora=False,
-                train_backbone=True,
-            ),
-            ema_decay=None,
-        )
-        for suite in ("object", "spatial", "goal", "10")
-    ],
-    # RoboOmni 3-stage curriculum (Qwen3-ASR encoder, route head OFF -- OmniAction has no
-    # route labels). Image-masking curriculum: audio_action -> mixed_aa_avla -> full_avla.
-    # NOTE: use_qwen baked in (NOT via --qwen) so the 22s dialogue window is preserved;
-    # enable_qwen_encoder would otherwise force instruction_audio_num_samples back to 2s.
-    # Run with:
-    #   uv run scripts/train_stages.py --exp-name omniaction_curriculum \
-    #     --configs pi0_omniaction_libero_object_overlap_audio_action \
-    #               pi0_omniaction_libero_object_overlap_mixed \
-    #               pi0_omniaction_libero_object_overlap_full \
-    #     --stage-exp-names ckpt_audio_action ckpt_mixed final_full --overwrite
-    *(
-        TrainConfig(
-            name=f"pi0_omniaction_libero_object_overlap_{suffix}",
-            model=pi0_audio.Pi0AudioConfig(
-                action_dim=32,
-                action_horizon=32,
-                paligemma_variant="gemma_2b",
-                action_expert_variant="gemma_300m",
-                use_whisper=False,
-                use_qwen=True,
-                qwen_model_name="Qwen/Qwen3-ASR-0.6B",
-                instruction_audio_num_samples=16_000 * 22,
-                instruction_audio_num_tokens=32,
-                ambient_audio_num_samples=16_000,
-                ambient_audio_num_tokens=1,
-                rtc_train_max_delay=0,
-                use_route_head=False,
-                route_loss_weight=0.0,
-                use_audio_guidance=False,
-            ),
-            data=LeRobotOmniActionLiberoDataConfig(
-                repo_id="omniaction_libero_object_overlap",
-                audio_sidecar_dir="data/omniaction_libero/sidecars/object_overlap",
-                base_config=DataConfig(prompt_from_task=True),
-                # All three curriculum stages share the same OmniAction-LIBERO dataset, so they reuse
-                # the norm stats computed for the base `pi0_omniaction_libero_object_overlap` config.
-                # (conditioning_mode does not affect state/action statistics, and the audio encoder is
-                # excluded during norm-stats computation.)
-                assets=AssetsConfig(
-                    assets_dir="./assets/pi0_omniaction_libero_object_overlap",
-                    asset_id="omniaction_libero_object_overlap",
-                ),
-                conditioning_mode=cond_mode,
-            ),
-            weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=10_000,
-            batch_size=32,
-            save_interval=1000,
-            fsdp_devices=8,
-            freeze_filter=_pi0_audio_stage_freeze_filter(
-                train_audio=True,
-                train_route=False,
-                train_action_side=True,
-                train_lora=False,
-                train_backbone=True,
-            ),
-            ema_decay=None,
-        )
-        for suffix, cond_mode in (
-            ("audio_action", "audio_action"),
-            ("mixed", "mixed_aa_avla"),
-            ("full", "full_avla"),
-        )
-    ),
-    # four stage training
-    TrainConfig(
-        name="pi0_base_audio_joint_route_warmup_lora",
-        model=pi0_audio.Pi0AudioConfig(
-            action_dim=32,
-            action_horizon=32,
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            use_whisper=True,
-            whisper_model_name="openai/whisper-tiny",
-            rtc_train_max_delay=8,
-            use_route_head=True,
-            route_loss_weight=1.0,
-            action_loss_weight=0.0,
-            use_audio_guidance=False,
-            audio_guidance_lambda=1.5,
-        ),
-        data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_6_audio",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_6_audio",
-            ),
-            conditioning_mode="audio_action",
-        ),
-        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=500,
-        batch_size=4,
-        save_interval=300,
-        freeze_filter=_pi0_audio_stage_freeze_filter(
-            train_audio=True,
-            train_route=True,
-            train_action_side=False,
-            train_lora=False,
-            train_backbone=True,
-        ),
-        ema_decay=None,
-        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
-    ),
-    TrainConfig(
-        name="pi0_base_audio_joint_audio_action_lora",
-        model=pi0_audio.Pi0AudioConfig(
-            action_dim=32,
-            action_horizon=32,
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            use_whisper=True,
-            whisper_model_name="openai/whisper-tiny",
-            rtc_train_max_delay=8,
-            use_route_head=True,
-            route_loss_weight=0.1,
-            action_loss_weight=1.0,
-            use_audio_adaln_gate=True,
-            use_audio_guidance=False,
-            audio_guidance_lambda=1.5,
-        ),
-        data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_6_audio",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_6_audio",
-            ),
-            conditioning_mode="audio_action",
-        ),
-        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=10_000,
-        batch_size=4,
-        save_interval=1000,
-        freeze_filter=_pi0_audio_stage_freeze_filter(
-            train_audio=True,
-            train_route=True,
-            train_action_side=True,
-            train_lora=True,
-            train_backbone=True,
-        ),
-        ema_decay=None,
-        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
-    ),
-    TrainConfig(
-        name="pi0_base_audio_joint_mixed_aa_avla_lora",
-        model=pi0_audio.Pi0AudioConfig(
-            action_dim=32,
-            action_horizon=32,
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            use_whisper=True,
-            whisper_model_name="openai/whisper-tiny",
-            rtc_train_max_delay=8,
-            use_route_head=True,
-            route_loss_weight=0.1,
-            action_loss_weight=1.0,
-            use_audio_adaln_gate=True,
-            use_audio_guidance=False,
-            audio_guidance_lambda=1.5,
-        ),
-        data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_6_audio",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_6_audio",
-            ),
-            conditioning_mode="mixed_aa_avla",
-            mixed_conditioning_modes=("audio_action", "full_avla"),
-        ),
-        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=10_000,
-        batch_size=4,
-        save_interval=1000,
-        freeze_filter=_pi0_audio_stage_freeze_filter(
-            train_audio=True,
-            train_route=True,
-            train_action_side=True,
-            train_lora=True,
-            train_backbone=True,
-        ),
-        ema_decay=None,
-        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
-    ),
-    TrainConfig(
-        name="pi0_base_audio_joint_full_avla_lora",
-        model=pi0_audio.Pi0AudioConfig(
-            action_dim=32,
-            action_horizon=32,
-            paligemma_variant="gemma_2b",
-            action_expert_variant="gemma_300m",
-            use_whisper=True,
-            whisper_model_name="openai/whisper-tiny",
-            rtc_train_max_delay=8,
-            use_route_head=True,
-            route_loss_weight=0.1,
-            action_loss_weight=1.0,
-            use_audio_adaln_gate=True,
-            use_audio_guidance=False,
-            audio_guidance_lambda=1.5,
-        ),
-        data=LeRobotFrankaJointAudioDataConfig(
-            repo_id="franka_lerobot_7_6_audio",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="./assets/pi0_base_audio_joint_lora",
-                asset_id="franka_lerobot_7_6_audio",
-            ),
-            conditioning_mode="full_avla",
-        ),
-        weight_loader=weight_loaders.Pi0AudioWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=5e-6, decay_steps=30_000, decay_lr=5e-7),
-        num_train_steps=10_000,
-        batch_size=4,
-        save_interval=1000,
-        freeze_filter=_pi0_audio_stage_freeze_filter(
-            train_audio=True,
-            train_route=True,
-            train_action_side=True,
-            train_lora=True,
-            train_backbone=True,
-        ),
-        ema_decay=None,
-        policy_metadata={"route_label_names": list(_transforms.ROUTE_LABEL_NAMES)},
-    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
@@ -1891,16 +1218,6 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    TrainConfig(
-        name="debug_pi0_audio",
-        model=pi0_audio.Pi0AudioConfig(paligemma_variant="dummy", action_expert_variant="dummy"),
-        data=FakeDataConfig(),
-        batch_size=2,
-        num_train_steps=10,
-        overwrite=True,
-        exp_name="debug_pi0_audio",
-        wandb_enabled=False,
-    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
@@ -1911,157 +1228,8 @@ if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
 
 
-def enable_qwen_encoder(
-    config: TrainConfig,
-    *,
-    qwen_model_name: str = "Qwen/Qwen3-ASR-0.6B",
-    qwen_device: str = "auto",
-    instruction_audio_num_samples: int = 32_000,
-    instruction_audio_num_tokens: int = 24,
-) -> TrainConfig:
-    if not isinstance(config.model, pi0_audio.Pi0AudioConfig):
-        raise TypeError("--qwen can only be used with Pi0AudioConfig-based configs.")
-
-    model = dataclasses.replace(
-        config.model,
-        use_whisper=False,
-        use_qwen=True,
-        qwen_model_name=qwen_model_name,
-        qwen_output_dim=None,
-        qwen_device=qwen_device,
-        instruction_audio_num_samples=instruction_audio_num_samples,
-        instruction_audio_num_tokens=instruction_audio_num_tokens,
-    )
-    return dataclasses.replace(
-        config,
-        model=model,
-        freeze_filter=model.get_freeze_filter(),
-    )
-
-
-def enable_usad2_encoder(
-    config: TrainConfig,
-    *,
-    usad2_model_name: str = "MIT-SLS/USAD2-Large-Plus",
-    usad2_device: str = "auto",
-    usad2_target_layer: int | None = None,
-    instruction_audio_num_samples: int = 32_000,
-    instruction_audio_num_tokens: int = 24,
-) -> TrainConfig:
-    if not isinstance(config.model, pi0_audio.Pi0AudioConfig):
-        raise TypeError("--usad2 can only be used with Pi0AudioConfig-based configs.")
-
-    model = dataclasses.replace(
-        config.model,
-        use_whisper=False,
-        use_qwen=False,
-        use_usad2=True,
-        usad2_model_name=usad2_model_name,
-        usad2_output_dim=None,
-        usad2_device=usad2_device,
-        usad2_target_layer=usad2_target_layer,
-        instruction_audio_num_samples=instruction_audio_num_samples,
-        instruction_audio_num_tokens=instruction_audio_num_tokens,
-    )
-    return dataclasses.replace(
-        config,
-        model=model,
-        freeze_filter=model.get_freeze_filter(),
-    )
-
-
-def _pop_cli_value(argv: list[str], name: str, default: str) -> str:
-    flag = f"--{name}"
-    for index, arg in enumerate(list(argv)):
-        if arg == flag:
-            if index + 1 >= len(argv):
-                raise ValueError(f"{flag} requires a value")
-            value = argv[index + 1]
-            del argv[index : index + 2]
-            return value
-        if arg.startswith(f"{flag}="):
-            del argv[index]
-            return arg.split("=", 1)[1]
-    return default
-
-
-def _pop_cli_bool(argv: list[str], name: str) -> bool:
-    flag = f"--{name}"
-    for index, arg in enumerate(list(argv)):
-        if arg == flag:
-            del argv[index]
-            return True
-        if arg.startswith(f"{flag}="):
-            del argv[index]
-            value = arg.split("=", 1)[1].lower()
-            return value in ("1", "true", "yes", "on")
-    return False
-
-
-def omniaction_qwen_feature_cache_dir(repo_id: str) -> pathlib.Path:
-    return pathlib.Path("data/omniaction_libero/qwen_features") / repo_id
-
-
-def enable_cached_omniaction_instruction_features(
-    config: TrainConfig,
-    *,
-    cache_dir: str | None = None,
-) -> TrainConfig:
-    if not isinstance(config.data, LeRobotOmniActionLiberoDataConfig):
-        raise ValueError("--cashed is only supported for LeRobotOmniActionLiberoDataConfig.")
-    if not isinstance(config.model, pi0_audio.Pi0AudioConfig) or not config.model.use_qwen:
-        raise ValueError("--cashed currently requires an OmniAction config with the Qwen audio encoder enabled.")
-    if config.model.audio_tokenizer_type != "sequence_resampler":
-        raise ValueError("--cashed currently requires audio_tokenizer_type='sequence_resampler'.")
-
-    repo_id = config.data.repo_id
-    if repo_id is tyro.MISSING:
-        raise ValueError("--cashed requires the OmniAction data config to have a repo_id.")
-    resolved_cache_dir = (
-        pathlib.Path(cache_dir).expanduser() if cache_dir else omniaction_qwen_feature_cache_dir(repo_id)
-    )
-    return dataclasses.replace(
-        config,
-        data=dataclasses.replace(
-            config.data,
-            qwen_instruction_feature_cache_dir=str(resolved_cache_dir),
-        ),
-    )
-
-
 def cli() -> TrainConfig:
-    argv = sys.argv
-    cashed = _pop_cli_bool(argv, "cashed")
-    cashed_dir = _pop_cli_value(argv, "cashed-dir", "")
-    qwen = _pop_cli_bool(argv, "qwen")
-    qwen_model_name = _pop_cli_value(argv, "qwen-model-name", "Qwen/Qwen3-ASR-0.6B")
-    qwen_device = _pop_cli_value(argv, "qwen-device", "auto")
-    usad2 = _pop_cli_bool(argv, "usad2")
-    usad2_model_name = _pop_cli_value(argv, "usad2-model-name", "MIT-SLS/USAD2-Large-Plus")
-    usad2_device = _pop_cli_value(argv, "usad2-device", "auto")
-    usad2_target_layer = _pop_cli_value(argv, "usad2-target-layer", "")
-    config = tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
-    if qwen and usad2:
-        raise ValueError("--qwen and --usad2 are mutually exclusive.")
-    if qwen:
-        config = enable_qwen_encoder(
-            config,
-            qwen_model_name=qwen_model_name,
-            qwen_device=qwen_device,
-        )
-    if usad2:
-        config = enable_usad2_encoder(
-            config,
-            usad2_model_name=usad2_model_name,
-            usad2_device=usad2_device,
-            usad2_target_layer=int(usad2_target_layer) if usad2_target_layer else None,
-        )
-    if cashed:
-        config = enable_cached_omniaction_instruction_features(
-            config,
-            cache_dir=cashed_dir or None,
-        )
-    return config
+    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
 
 
 def get_config(config_name: str) -> TrainConfig:

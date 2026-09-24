@@ -1,5 +1,0 @@
-assets: third_party/libero/libero/libero/assets
-bddl_files: third_party/libero/libero/libero/bddl_files
-benchmark_root: third_party/libero/libero/libero
-datasets: third_party/libero/datasets
-init_states: third_party/libero/libero/libero/init_files

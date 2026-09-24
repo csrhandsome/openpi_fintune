@@ -111,21 +111,6 @@ class Pi0ForceWeightLoader(Pi0GuidanceWeightLoader):
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class Pi0AudioWeightLoader(WeightLoader):
-    """Loads Pi0 weights while preserving audio-specific modules from model init."""
-
-    params_path: str
-
-    def load(self, params: at.Params) -> at.Params:
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        return _merge_params(
-            loaded_params,
-            params,
-            missing_regex=".*lora.*|.*audio.*|.*whisper.*|.*projector.*|.*route.*|.*norm_1.*Dense.*",
-        )
-
-
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
