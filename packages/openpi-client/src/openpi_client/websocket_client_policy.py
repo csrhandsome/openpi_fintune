@@ -30,24 +30,36 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
 
-    def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
+    def _wait_for_server(
+        self, timeout: Optional[float] = None
+    ) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
-                conn = websockets.sync.client.connect(
-                    self._uri,
-                    compression=None,
-                    max_size=None,
-                    additional_headers=headers,
-                    # Real-world policy inference can take >20s (e.g. first-call JIT compile).
-                    # Increase keepalive timeout to avoid spurious disconnects.
-                    ping_timeout=300,
-                    open_timeout=10,
-                )
+                # websockets>=14 supports ping_timeout/open_timeout on the sync client;
+                # older versions (common on py3.8 eval envs) raise TypeError if passed.
+                connect_kwargs = {
+                    "compression": None,
+                    "max_size": None,
+                    "additional_headers": headers,
+                }
+                try:
+                    conn = websockets.sync.client.connect(
+                        self._uri,
+                        # Real-world policy inference can take >20s (e.g. first-call JIT).
+                        ping_timeout=300,
+                        open_timeout=10,
+                        **connect_kwargs,
+                    )
+                except TypeError:
+                    conn = websockets.sync.client.connect(self._uri, **connect_kwargs)
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, OSError, TimeoutError):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise ConnectionRefusedError(f"Timed out waiting for server at {self._uri}") from None
                 logging.info("Still waiting for server...")
                 time.sleep(5)
 
@@ -59,7 +71,8 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             response = self._ws.recv()
         except websockets.exceptions.ConnectionClosed:
             # Reconnect once on transient disconnects (e.g. server restart).
-            self._ws, self._server_metadata = self._wait_for_server()
+            # Cap the wait so a dead server fails the eval instead of hanging.
+            self._ws, self._server_metadata = self._wait_for_server(timeout=120)
             self._ws.send(data)
             response = self._ws.recv()
         if isinstance(response, str):

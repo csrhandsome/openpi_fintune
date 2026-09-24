@@ -29,7 +29,6 @@ from collections.abc import Sequence
 import dataclasses
 from enum import Enum
 from typing import Literal, TypeAlias
-import re
 
 import einops
 import flax.linen as nn
@@ -105,12 +104,8 @@ class RMSNorm(nn.Module):
     def __call__(self, x):
         dtype = x.dtype  # original dtype, could be half-precision
         scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
-        var = jnp.mean(
-            jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True
-        )  # compute variance in float32
-        normed_inputs = jnp.asarray(
-            x * jnp.reciprocal(jnp.sqrt(var + 1e-06))
-        )  # compute normalization in float32
+        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32
+        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32
         normed_inputs = normed_inputs * (
             1 + scale
         )  # scale by learned parameter in float32 (matches Flax implementation)
@@ -142,7 +137,6 @@ class Embedder(nn.Module):
 
 @at.typecheck
 class Einsum(nn.Module):
-
     # Shape of the weight.
     shape: tuple[int, ...]
     # Initialization function for the weight.
@@ -168,20 +162,11 @@ class Attention(nn.Module):
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
-        assert all(
-            config.head_dim == self.configs[0].head_dim for config in self.configs
-        )
-        assert all(
-            config.num_heads == self.configs[0].num_heads for config in self.configs
-        )
-        assert all(
-            config.num_kv_heads == self.configs[0].num_kv_heads
-            for config in self.configs
-        )
+        assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
+        assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
+        assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
 
-        dtype = next(
-            x.dtype for x in xs if x is not None
-        )  # original dtype, could be half-precision
+        dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
 
         qkvs = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
@@ -191,26 +176,20 @@ class Attention(nn.Module):
                 qkv_einsum = Einsum(
                     shape=(3, config.num_heads, config.width, config.head_dim),
                     name=_name("qkv_einsum", i),
-                    init_fn=nn.initializers.lecun_normal(
-                        in_axis=-2, out_axis=-1, batch_axis=(0, 1)
-                    ),
+                    init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                 )
                 qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
             else:
                 q_einsum = Einsum(
                     shape=(config.num_heads, config.width, config.head_dim),
                     name=_name("q_einsum", i),
-                    init_fn=nn.initializers.lecun_normal(
-                        in_axis=-2, out_axis=-1, batch_axis=(0,)
-                    ),
+                    init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                 )
                 q = q_einsum("BTD,NDH->BTNH", x)
                 kv_einsum = Einsum(
                     shape=(2, config.num_kv_heads, config.width, config.head_dim),
                     name=_name("kv_einsum", i),
-                    init_fn=nn.initializers.lecun_normal(
-                        in_axis=-2, out_axis=-1, batch_axis=(0, 1)
-                    ),
+                    init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
@@ -230,12 +209,8 @@ class Attention(nn.Module):
             k = jnp.concatenate([cache_k, k], axis=1)
             v = jnp.concatenate([cache_v, v], axis=1)
 
-        q = einops.rearrange(
-            q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads
-        )
-        logits = jnp.einsum(
-            "BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32
-        )
+        q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
+        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
 
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
@@ -316,15 +291,9 @@ class Block(nn.Module):
     general_expert_weight: float = 0.5
 
     @nn.compact
-    def __call__(
-        self, xs, kv_cache, positions, attn_mask, decode, deterministic=True
-    ):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, decode, deterministic=True):
         xs = sharding.activation_sharding_constraint(xs)
-        drop = (
-            nn.Dropout(self.dropout, self.dropout_bdims)
-            if self.dropout
-            else lambda x, _: x
-        )
+        drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
         attn = Attention(configs=self.configs, name="attn")
 
@@ -351,15 +320,13 @@ class Block(nn.Module):
                     if config.use_moe:
                         # Choose MoE implementation based on config
                         if config.moe_type == MoEType.VANILLA:
-                            (routed_expert_output, moe_info) = (
-                                moe.VanillaMoEFeedForward(
-                                    expert_dim=config.width,
-                                    hidden_dim=config.mlp_dim,
-                                    num_experts=self.num_experts,
-                                    top_k=self.top_k,
-                                    name=_name("moe_ffn", i),
-                                )(x)
-                            )
+                            (routed_expert_output, moe_info) = moe.VanillaMoEFeedForward(
+                                expert_dim=config.width,
+                                hidden_dim=config.mlp_dim,
+                                num_experts=self.num_experts,
+                                top_k=self.top_k,
+                                name=_name("moe_ffn", i),
+                            )(x)
                         elif config.moe_type == MoEType.CSMOE:
                             (routed_expert_output, moe_info) = moe.CSMoEFeedForward(
                                 expert_dim=config.width,
@@ -376,20 +343,14 @@ class Block(nn.Module):
                                 top_k=self.top_k,
                                 name=_name("moe_ffn", i),
                             )(x)
-                        routed_expert_output = sharding.activation_sharding_constraint(
-                            routed_expert_output
-                        )
+                        routed_expert_output = sharding.activation_sharding_constraint(routed_expert_output)
                         if self.use_general_expert:
-                            general_expert_output = FeedForward(  # noqa: PLW2901
+                            general_expert_output = FeedForward(
                                 features=config.width,
                                 hidden_dim=config.mlp_dim,
                                 name=_name("mlp", i),
                             )(x)
-                            general_expert_output = (
-                                sharding.activation_sharding_constraint(
-                                    general_expert_output
-                                )
-                            )
+                            general_expert_output = sharding.activation_sharding_constraint(general_expert_output)
                             x = jax.tree.map(
                                 lambda x, y: 0.5 * x + 0.5 * y,
                                 general_expert_output,
@@ -398,7 +359,6 @@ class Block(nn.Module):
                             # x = general_expert_output * self.general_expert_weight + routed_expert_output * (1 - self.general_expert_weight)
                         else:
                             x = routed_expert_output
-                            # noqa: PLW2901
                     else:
                         # Fallback to original pi0 implementation (standard FeedForward)
                         x = FeedForward(  # noqa: PLW2901
@@ -423,9 +383,7 @@ class Block(nn.Module):
         return xs, (kv_cache, moe_info)
 
 
-KVCache: TypeAlias = tuple[
-    at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]
-]
+KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
 
 
 @at.typecheck
@@ -474,9 +432,7 @@ class Module(nn.Module):
             num_experts=self.num_experts,
             top_k=self.top_k,
         )
-        self.final_norms = [
-            RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))
-        ]
+        self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
@@ -500,20 +456,13 @@ class Module(nn.Module):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
 
-        embedded, (kv_cache, moe_info) = self.layers(
-            embedded, kv_cache, positions, mask, deterministic
-        )
+        embedded, (kv_cache, moe_info) = self.layers(embedded, kv_cache, positions, mask, deterministic)
 
-        assert all(
-            e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None
-        )
+        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
         if moe_info is not None:
             moe_info = {k: jnp.mean(v) for k, v in moe_info.items()}
         return (
-            [
-                f(e) if e is not None else e
-                for f, e in zip(self.final_norms, embedded, strict=True)
-            ],
+            [f(e) if e is not None else e for f, e in zip(self.final_norms, embedded, strict=True)],
             kv_cache,
             moe_info,
         )
@@ -530,9 +479,7 @@ class Module(nn.Module):
 
 def _apply_rope(x, *, positions, max_wavelength=10_000):
     """Applies RoPE positions [B, L] to x [B, L, H, D]."""
-    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(
-        x.shape[-1] // 2, dtype=jnp.float32
-    )
+    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
     timescale = max_wavelength**freq_exponents
     radians = positions[..., None] / timescale[None, None, :]
     radians = radians[..., None, :]

@@ -32,6 +32,7 @@ class ModelType(enum.Enum):
     """Supported model types."""
 
     PI0 = "pi0"
+    PI0_AUDIO = "pi0_audio"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
 
@@ -65,6 +66,15 @@ IMAGE_RESOLUTION = (224, 224)
 #         ...  # Masks for additional views
 #     },
 #     "state": float32[*b, s],  # Low-dimensional robot state
+#     "audio": float32[*b, ...],  # Optional legacy audio alias for ambient_audio
+#     "audio_mask": bool[*b],  # Optional legacy audio validity mask
+#     "ambient_audio": float32[*b, ...],  # Optional ambient audio representation
+#     "ambient_audio_mask": bool[*b],  # Optional ambient audio validity mask
+#     "instruction_audio": float32[*b, ...],  # Optional VAD-selected instruction audio representation
+#     "instruction_audio_mask": bool[*b],  # Optional instruction audio validity mask
+#     "route_label": int32[*b],  # Optional route label id for audio supervision
+#     "route_label_mask": bool[*b],  # Optional route-label validity mask
+#     "action_loss_mask": bool[*b],  # Optional action suffix loss validity mask
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
@@ -94,6 +104,25 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
+    # Optional legacy audio representation. This aliases `ambient_audio` for backward
+    # compatibility with single-slot audio code paths.
+    audio: at.Float[ArrayT, "..."] | None = None
+    # Optional legacy audio validity mask.
+    audio_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional ambient audio representation (waveform window or time-sequence features).
+    ambient_audio: at.Float[ArrayT, "..."] | None = None
+    # Optional ambient audio validity mask.
+    ambient_audio_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional instruction audio representation (for example VAD-selected speech).
+    instruction_audio: at.Float[ArrayT, "..."] | None = None
+    # Optional instruction audio validity mask.
+    instruction_audio_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional route label id, e.g. straight / detour / none after transform mapping.
+    route_label: at.Int[ArrayT, "*b"] | None = None
+    # Optional route-label validity mask. Invalid labels are ignored by auxiliary losses.
+    route_label_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional action suffix loss validity mask. False samples keep auxiliary losses but skip action BC.
+    action_loss_mask: at.Bool[ArrayT, "*b"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -106,6 +135,12 @@ class Observation(Generic[ArrayT]):
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+    # Dialogue answer tokens use a causal prefix-LM mask. These fields are
+    # consumed by Pi0Audio's optional Talker text-loss branch.
+    dialogue_token_ids: at.Int[ArrayT, "*b l"] | None = None
+    dialogue_token_mask: at.Bool[ArrayT, "*b l"] | None = None
+    dialogue_token_ar_mask: at.Bool[ArrayT, "*b l"] | None = None
+    dialogue_token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -113,20 +148,81 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        dialogue_fields = (
+            "dialogue_token_ids",
+            "dialogue_token_mask",
+            "dialogue_token_ar_mask",
+            "dialogue_token_loss_mask",
+        )
+        present_dialogue_fields = [field in data for field in dialogue_fields]
+        if any(present_dialogue_fields) and not all(present_dialogue_fields):
+            raise ValueError(f"Dialogue token fields must be provided together: {dialogue_fields}")
+        if "audio_mask" in data and "audio" not in data and "ambient_audio" not in data:
+            raise ValueError("audio_mask cannot be provided without audio or ambient_audio.")
+        if "ambient_audio_mask" in data and "ambient_audio" not in data and "audio" not in data:
+            raise ValueError("ambient_audio_mask cannot be provided without ambient_audio or audio.")
+        if "instruction_audio_mask" in data and "instruction_audio" not in data:
+            raise ValueError("instruction_audio_mask cannot be provided without instruction_audio.")
+        if "route_label_mask" in data and "route_label" not in data:
+            raise ValueError("route_label_mask cannot be provided without route_label.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+
+        def _default_audio_mask(audio_value, audio_mask_value):
+            if audio_value is None or audio_mask_value is not None:
+                return audio_mask_value
+            audio_batch_shape = audio_value.shape[:-2] if audio_value.ndim >= 3 else audio_value.shape[:-1]
+            if isinstance(audio_value, torch.Tensor):
+                return torch.ones(audio_batch_shape, dtype=torch.bool, device=audio_value.device)
+            return np.ones(audio_batch_shape, dtype=np.bool_)
+
+        ambient_audio = data.get("ambient_audio", data.get("audio"))
+        ambient_audio_mask = data.get("ambient_audio_mask", data.get("audio_mask"))
+        ambient_audio_mask = _default_audio_mask(ambient_audio, ambient_audio_mask)
+
+        instruction_audio = data.get("instruction_audio")
+        instruction_audio_mask = _default_audio_mask(
+            instruction_audio,
+            data.get("instruction_audio_mask"),
+        )
+
+        route_label = data.get("route_label")
+        route_label_mask = data.get("route_label_mask")
+        if route_label is not None and route_label_mask is None:
+            if isinstance(route_label, torch.Tensor):
+                route_label_mask = torch.ones(route_label.shape, dtype=torch.bool, device=route_label.device)
+            else:
+                route_label_mask = np.ones(np.asarray(route_label).shape, dtype=np.bool_)
+
+        audio = ambient_audio if ambient_audio is not None else data.get("audio")
+        audio_mask = ambient_audio_mask if ambient_audio_mask is not None else data.get("audio_mask")
+        audio_mask = _default_audio_mask(audio, audio_mask)
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            audio=audio,
+            audio_mask=audio_mask,
+            ambient_audio=ambient_audio,
+            ambient_audio_mask=ambient_audio_mask,
+            instruction_audio=instruction_audio,
+            instruction_audio_mask=instruction_audio_mask,
+            route_label=route_label,
+            route_label_mask=route_label_mask,
+            action_loss_mask=data.get("action_loss_mask"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            dialogue_token_ids=data.get("dialogue_token_ids"),
+            dialogue_token_mask=data.get("dialogue_token_mask"),
+            dialogue_token_ar_mask=data.get("dialogue_token_ar_mask"),
+            dialogue_token_loss_mask=data.get("dialogue_token_loss_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,10 +301,23 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        audio=observation.audio if observation.audio is not None else observation.ambient_audio,
+        audio_mask=(observation.audio_mask if observation.audio_mask is not None else observation.ambient_audio_mask),
+        ambient_audio=observation.ambient_audio,
+        ambient_audio_mask=observation.ambient_audio_mask,
+        instruction_audio=observation.instruction_audio,
+        instruction_audio_mask=observation.instruction_audio_mask,
+        route_label=observation.route_label,
+        route_label_mask=observation.route_label_mask,
+        action_loss_mask=observation.action_loss_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        dialogue_token_ids=observation.dialogue_token_ids,
+        dialogue_token_mask=observation.dialogue_token_mask,
+        dialogue_token_ar_mask=observation.dialogue_token_ar_mask,
+        dialogue_token_loss_mask=observation.dialogue_token_loss_mask,
     )
 
 

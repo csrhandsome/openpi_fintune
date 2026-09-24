@@ -11,8 +11,8 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
-import openpi.models.image_process_model as _cbam
 import openpi.models.gemma as _gemma
+import openpi.models.image_process_model as _cbam
 import openpi.models.moe as _moe
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -370,7 +370,9 @@ class Pi0_Guidance(_model.BaseModel):
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
 
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm([prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions)
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions
+        )
 
         force_embs = self._embed_force_images(observation)
         fvl_features = self._fused_action_features(prefix_out, force_embs, deterministic=not train)
@@ -399,7 +401,9 @@ class Pi0_Guidance(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
 
         force_embs = self._embed_force_images(observation)
         fvl_features = self._fused_action_features(prefix_out, force_embs, deterministic=True)

@@ -14,31 +14,30 @@ Usage:
         --output_hf_model_local_path <OUTPUT DIR FOR CONVERTED CHECKPOINT>
 """
 
+from dataclasses import dataclass
 import json
 import os
-import shutil
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Union
+import shutil
 
 import draccus
-import timm
-import torch
-import torch.nn as nn
 from huggingface_hub import hf_hub_download
-from timm.models.vision_transformer import LayerScale
-from transformers import AutoTokenizer
-
 from prismatic.conf import ModelConfig
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor
+from prismatic.extern.hf.processing_prismatic import PrismaticProcessor
+import timm
+from timm.models.vision_transformer import LayerScale
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer
 
 
 @dataclass
 class HFConvertConfig:
     # fmt: off
-    openvla_model_path_or_id: Union[str, Path] = (                      # Path to Pretrained VLA (on disk or HF Hub)
+    openvla_model_path_or_id: str | Path = (                      # Path to Pretrained VLA (on disk or HF Hub)
         "runs/prism-dinosiglip-224px+mx-oxe-magic-soup-plus+n8+b32+x7"
     )
     output_hf_model_local_path: Path = Path(                            # Path to Local Path to save HF model
@@ -48,7 +47,7 @@ class HFConvertConfig:
                                                                         # model to
 
     # HF Hub Credentials (required for Gated Models like LLaMa-2)
-    hf_token: Union[str, Path] = Path(".hf_token")                      # Environment variable or Path to HF Token
+    hf_token: str | Path = Path(".hf_token")                      # Environment variable or Path to HF Token
 
     def __post_init__(self) -> None:
         self.hf_token = self.hf_token.read_text().strip() if isinstance(self.hf_token, Path) else self.hf_token
@@ -81,11 +80,11 @@ PROJECTOR_KEY_MAPPING = {
 
 
 def remap_state_dicts_for_hf(
-    prismatic_vision_backbone_state_dict: Dict[str, torch.Tensor],
-    projector_state_dict: Dict[str, torch.Tensor],
-    llm_backbone_state_dict: Dict[str, torch.Tensor],
+    prismatic_vision_backbone_state_dict: dict[str, torch.Tensor],
+    projector_state_dict: dict[str, torch.Tensor],
+    llm_backbone_state_dict: dict[str, torch.Tensor],
     use_fused_vision_backbone: bool = False,
-) -> Dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor]:
     """Iterate through Prismatic component state dictionaries and unify / fix key mapping for HF conversion."""
     hf_state_dict = {}
 
@@ -140,12 +139,12 @@ def convert_openvla_weights_to_hf(cfg: HFConvertConfig) -> None:
         )
 
     # Load "Native" Config JSON =>> Create LLM Config & Instantiate Tokenizer
-    with open(config_json, "r") as f:
+    with open(config_json) as f:
         vla_cfg = json.load(f)["vla"]
         prismatic_config = ModelConfig.get_choice_class(vla_cfg["base_vlm"])().__dict__
 
     # Load Normalization Statistics
-    with open(dataset_statistics_json, "r") as f:
+    with open(dataset_statistics_json) as f:
         norm_stats = json.load(f)
 
     # Create HF OpenVLAConfig (`transformers.PretrainedConfig`)

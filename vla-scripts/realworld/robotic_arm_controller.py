@@ -1,18 +1,20 @@
 # 模块加载更快
 from __future__ import annotations
 
+from collections.abc import Sequence
+from contextlib import suppress
+from datetime import datetime
 import json
 import os
 import threading
-from contextlib import suppress
-from datetime import datetime
-from typing import TYPE_CHECKING, Literal, Optional, Sequence
 import time
+from typing import TYPE_CHECKING, Literal
+
 import h5py
 import numpy as np
 import panda_py
-from spatialmath import SE3
 from panda_py import libfranka
+from spatialmath import SE3
 
 if TYPE_CHECKING:
     from realsense_connector import RealSenseConnector
@@ -22,14 +24,14 @@ class _LatestFrameBuffer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._seq = 0
-        self._rgb: Optional[np.ndarray] = None
+        self._rgb: np.ndarray | None = None
 
     def set(self, rgb: np.ndarray) -> None:
         with self._lock:
             self._seq += 1
             self._rgb = np.asarray(rgb, dtype=np.uint8)
 
-    def get_latest(self) -> Optional[np.ndarray]:
+    def get_latest(self) -> np.ndarray | None:
         with self._lock:
             if self._rgb is None:
                 return None
@@ -38,7 +40,7 @@ class _LatestFrameBuffer:
 
 def _camera_capture_worker(
     *,
-    camera: "RealSenseConnector",
+    camera: RealSenseConnector,
     buf: _LatestFrameBuffer,
     stop_event: threading.Event,
     timeout_ms: int,
@@ -73,7 +75,7 @@ def _camera_capture_worker(
         buf.set(rgb224)
         frame_count += 1
         if frame_count == 1:
-            print(f"[Camera Thread] First frame captured successfully!")
+            print("[Camera Thread] First frame captured successfully!")
         elif frame_count % 100 == 0:
             print(f"[Camera Thread] {frame_count} frames captured")
 
@@ -140,16 +142,16 @@ class RoboticArmControler:
         password: str = "Design@2018",
         cartesian_speed_factor: float = 0.2,
         joint_speed_factor: float = 0.21,
-        default_height: Optional[float] = 0.118046,
+        default_height: float | None = 0.118046,
         enforce_default_height: bool = False,
-        stiffness: Optional[Sequence[float]] = (600, 600, 600, 600, 250, 150, 50),
-        damping: Optional[Sequence[float]] = None,
+        stiffness: Sequence[float] | None = (600, 600, 600, 600, 250, 150, 50),
+        damping: Sequence[float] | None = None,
         auto_set_default_behavior: bool = True,
         auto_move_to_start: bool = True,
     ) -> None:
         config_path = os.path.join(os.path.dirname(__file__), "config.json")
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 config = json.load(f)
             hostname = config.get("hostname", hostname)
             username = config.get("username", username)
@@ -191,20 +193,25 @@ class RoboticArmControler:
 
         self.robot_state: dict[str, np.ndarray] = {}
         self.time: list[float] = []
-        self._logging_started_at: Optional[datetime] = None
-        self._last_log_filename: Optional[str] = None
+        self._logging_started_at: datetime | None = None
+        self._last_log_filename: str | None = None
 
         # 流式速度控制的持久化状态
-        self._velocity_controller: Optional[object] = None
-        self._velocity_ctx: Optional[object] = None
-        self._velocity_control_thread: Optional[threading.Thread] = None
+        self._velocity_controller: object | None = None
+        self._velocity_ctx: object | None = None
+        self._velocity_control_thread: threading.Thread | None = None
         self._velocity_control_stop = threading.Event()
         self._velocity_control_lock = threading.Lock()
         self._velocity_accel_time: float = 0.1  # 加速度时间
         self._velocity_control_freq: float = 200.0  # 控制频率
         self._velocity_time_step: float = 1.0 / 200.0  # 积分时间步
-        self._last_velocity_target: Optional[np.ndarray] = None  # 上一次的速度目标
-        self._velocity_ramp_start_time: Optional[float] = None  # 梯形斜坡开始时间
+        self._last_velocity_target: np.ndarray | None = None  # 上一次的速度目标
+        self._velocity_ramp_start_time: float | None = None  # 梯形斜坡开始时间
+
+        # 流式关节位置控制的持久化状态（JointPosition 控制器，直接吃关节位置目标）
+        self._position_controller: object | None = None
+        self._position_control_lock = threading.Lock()
+        self._last_position_target: np.ndarray | None = None  # 上一次发出的关节位置目标
 
     def move_to_start(self) -> None:
         if self.auto_set_default_behavior:
@@ -583,6 +590,111 @@ class RoboticArmControler:
                 print(f"[Error] Error stopping velocity controller: {e}")
                 raise
 
+    def start_position_streaming(
+        self,
+        stiffness: Sequence[float] | None = None,
+        damping: Sequence[float] | None = None,
+        filter_coeff: float = 1.0,
+    ) -> None:
+        """
+        启动持久化关节位置控制器（JointPosition），用于高频流式调用。
+
+        与速度流式控制不同：JointPosition 直接吃关节位置目标 q_target，控制器内部用
+        关节阻抗跟踪，无需"位置增量→速度→再积分回位置"的绕路，也就没有速度阶跃带来的
+        加速度尖峰（之前 cartesian_reflex 假触发的根因）。
+
+        Args:
+            stiffness: 7维关节刚度（可选，None 用控制器默认值）
+            damping: 7维关节阻尼（可选，None 用控制器默认值）
+            filter_coeff: 位置目标低通滤波系数，范围 (0, 1]。
+                1.0 = 不滤波（直接跟踪目标）；越小越平滑、跟踪越滞后。
+                用于吸收相邻位置目标的跳变，进一步抑制加速度尖峰。
+
+        用法:
+            arm.start_position_streaming(filter_coeff=0.x)
+            try:
+                while ...:
+                    arm.set_joint_position_target(q_target)
+            finally:
+                arm.stop_position_streaming()
+        """
+        if self._position_controller is not None:
+            print("[Warning] Position streaming already started, stopping first...")
+            self.stop_position_streaming()
+        if self._velocity_controller is not None:
+            print("[Warning] Velocity streaming active, stopping it before position streaming...")
+            self.stop_velocity_streaming()
+
+        from panda_py import controllers
+
+        self.panda.stop_controller()
+        self._position_controller = controllers.JointPosition()
+
+        if stiffness is not None:
+            self._position_controller.set_stiffness(np.asarray(stiffness, dtype=np.float64))
+        if damping is not None:
+            self._position_controller.set_damping(np.asarray(damping, dtype=np.float64))
+        if filter_coeff is not None:
+            self._position_controller.set_filter(float(filter_coeff))
+
+        # 以当前关节位置作为初始目标，避免启动瞬间产生位置跳变
+        q_current = np.asarray(self.panda.q, dtype=np.float64).flatten()
+        self._last_position_target = q_current.copy()
+        self.panda.start_controller(self._position_controller)
+        self._position_controller.set_control(q_current, np.zeros(7))
+
+        print(f"[Position] 已启动持续关节位置控制器 (filter_coeff={filter_coeff})")
+
+    def set_joint_position_target(
+        self,
+        q_target: np.ndarray,
+        velocity_feedforward: np.ndarray | None = None,
+    ) -> None:
+        """
+        在流式模式下更新关节位置目标。
+
+        Args:
+            q_target: 7维关节位置目标（rad）
+            velocity_feedforward: 可选的 7维速度前馈（rad/s），跟踪更跟手；默认零前馈
+        """
+        if self._position_controller is None:
+            raise RuntimeError(
+                "Position controller not started. Call start_position_streaming() first."
+            )
+
+        q_target = np.asarray(q_target, dtype=np.float64).flatten()
+        if q_target.shape[0] != 7:
+            raise ValueError(f"Expected 7-DoF joint position target, got {q_target.shape}")
+
+        if velocity_feedforward is None:
+            vff = np.zeros(7, dtype=np.float64)
+        else:
+            vff = np.asarray(velocity_feedforward, dtype=np.float64).flatten()
+            if vff.shape[0] != 7:
+                raise ValueError(f"Expected 7-DoF velocity feedforward, got {vff.shape}")
+
+        with self._position_control_lock:
+            try:
+                self._position_controller.set_control(q_target, vff)
+                self._last_position_target = q_target.copy()
+            except Exception as e:
+                print(f"[Error] Failed to set position command: {e}")
+                raise
+
+    def stop_position_streaming(self) -> None:
+        """停止持久化关节位置控制器"""
+        with self._position_control_lock:
+            if self._position_controller is None:
+                return
+            try:
+                self.panda.stop_controller()
+                self._position_controller = None
+                self._last_position_target = None
+                print("[Position] 已停止持续关节位置控制器")
+            except Exception as e:
+                print(f"[Error] Error stopping position controller: {e}")
+                raise
+
     @property
     def state(self):
         """
@@ -591,7 +703,7 @@ class RoboticArmControler:
         注意：当流式速度控制器运行时，使用 get_state() 返回缓存快照，
         而不是 read_once() 来避免阻塞冲突。
         """
-        if self._velocity_controller is not None:
+        if self._velocity_controller is not None or self._position_controller is not None:
             # 流式控制运行中，用缓存状态
             robot_state = self.panda.get_state()
         else:
@@ -603,8 +715,8 @@ class RoboticArmControler:
             "joint_velocities": robot_state.dq,
             "end_effector_pose": robot_state.O_T_EE,
             "joint_torques": robot_state.tau_J,
-            "cartesian_position": robot_state.O_T_EE[:3, 3] if hasattr(robot_state.O_T_EE, 'shape') else np.zeros(3),
-            "gripper_position": self.gripper.read_once().width if hasattr(self, 'gripper') else 0.0,
+            "cartesian_position": robot_state.O_T_EE[:3, 3] if hasattr(robot_state.O_T_EE, "shape") else np.zeros(3),
+            "gripper_position": self.gripper.read_once().width if hasattr(self, "gripper") else 0.0,
         }
 
     @property
@@ -649,7 +761,7 @@ class RoboticArmControler:
         enable_logging: bool = True,
         max_logging_duration: float = 3600.0,
         *,
-        camera: Optional["RealSenseConnector"] = None,
+        camera: RealSenseConnector | None = None,
         camera_timeout_ms: int = 1000,
         language_instruction: str = "",
     ) -> None:
@@ -699,15 +811,15 @@ class RoboticArmControler:
         数据记录说明:
             如果启用logging，控制结束后可以通过 panda.get_log() 获取真实状态数据
         """
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"启动手动控制模式: {control_mode}")
         if use_impedance_control and enable_logging:
-            print(f"阻抗控制 + 状态记录（推荐用于数据采集）")
+            print("阻抗控制 + 状态记录（推荐用于数据采集）")
         elif use_impedance_control:
-            print(f"阻抗控制（平滑但不记录状态）")
+            print("阻抗控制（平滑但不记录状态）")
         else:
-            print(f"离散控制（实时读取状态但不平滑）")
-        print(f"{'='*60}\n")
+            print("离散控制（实时读取状态但不平滑）")
+        print(f"{'=' * 60}\n")
 
         if enable_logging and control_mode in ("keyboard", "gamepad", "teleop"):
             if camera is None:
@@ -758,7 +870,6 @@ class RoboticArmControler:
         else:
             raise ValueError(f"Unsupported control mode: {control_mode}")
 
-
     def replay_trajectory(
         self,
         trajectory_data: dict = None,
@@ -768,7 +879,7 @@ class RoboticArmControler:
         start_index: int = 0,
         end_index: int = None,
         *,
-        camera: Optional["RealSenseConnector"] = None,
+        camera: RealSenseConnector | None = None,
         show_images: bool = True,
         show_live_camera: bool = False,
     ) -> None:
@@ -826,13 +937,13 @@ class RoboticArmControler:
                             trajectory_data["images"] = images
                             print(f"  ✓ 加载了 {len(images)} 帧图像数据 (shape: {images.shape[1:]})")
                         else:
-                            print(f"  ⚠️ 该文件没有图像数据")
+                            print("  ⚠️ 该文件没有图像数据")
                     else:
                         q = np.array(f["q"])
                         dq = np.array(f["dq"]) if "dq" in f else np.zeros_like(q)
                         trajectory_data = {"q": q, "dq": dq}
             else:
-                raise ValueError("需要提供 trajectory_data 或 file_path，" "或先运行 manual_control() 并启用 logging")
+                raise ValueError("需要提供 trajectory_data 或 file_path，或先运行 manual_control() 并启用 logging")
 
         if "action" in trajectory_data:
             actions = np.asarray(trajectory_data["action"], dtype=np.float32)
@@ -864,12 +975,12 @@ class RoboticArmControler:
                 pos_diff = np.linalg.norm(recorded_pos - current_pos)
                 ori_diff = np.linalg.norm(recorded_ori - current_ori)
 
-                print(f"\n初始位姿验证:")
+                print("\n初始位姿验证:")
                 print(f"  位置差异: {pos_diff:.4f} m")
                 print(f"  姿态差异: {ori_diff:.4f} (四元数)")
 
                 if pos_diff > 0.05:  # 5cm
-                    print(f"  ⚠️ 警告: 初始位置差异较大 ({pos_diff*1000:.1f} mm)")
+                    print(f"  ⚠️ 警告: 初始位置差异较大 ({pos_diff * 1000:.1f} mm)")
                     print(f"  记录位置: {recorded_pos}")
                     print(f"  当前位置: {current_pos}")
                     response = input("  继续回放可能导致轨迹偏差，是否继续? (y/n): ").strip().lower()
@@ -877,16 +988,16 @@ class RoboticArmControler:
                         print("  取消回放")
                         return
                 elif pos_diff > 0.01:  # 1cm
-                    print(f"  ⚠️ 提示: 初始位置有微小差异 ({pos_diff*1000:.1f} mm)，回放可能略有偏差")
+                    print(f"  ⚠️ 提示: 初始位置有微小差异 ({pos_diff * 1000:.1f} mm)，回放可能略有偏差")
 
-            print(f"\n{'='*60}")
-            print(f"动作序列重放 (EEF_POS delta + gripper)")
-            print(f"{'='*60}")
+            print(f"\n{'=' * 60}")
+            print("动作序列重放 (EEF_POS delta + gripper)")
+            print(f"{'=' * 60}")
             print(f"轨迹长度: {len(actions)} 个样本")
             print(f"播放速度: {speed}x")
             print(f"循环次数: {loop}")
             print(f"采样频率: {hz:.1f} Hz")
-            print(f"{'='*60}\n")
+            print(f"{'=' * 60}\n")
 
             # input("按 Enter 键开始重放动作序列...")
 
@@ -901,11 +1012,11 @@ class RoboticArmControler:
 
                     # 如果需要实时相机，先预热
                     if show_live_camera and camera is not None:
-                        print(f"[Display] 预热相机...")
+                        print("[Display] 预热相机...")
                         for _ in range(5):
                             camera.update(timeout=200)
                             time.sleep(0.1)
-                        print(f"[Display] 相机预热完成")
+                        print("[Display] 相机预热完成")
 
                     if show_images and has_images:
                         print(f"[Display] 将显示采集的图像: {len(images)} 帧")
@@ -946,7 +1057,8 @@ class RoboticArmControler:
                 print(f"[Display] 不显示图像: show_images={show_images}, show_live_camera={show_live_camera}")
 
             from transforms3d.euler import euler2mat
-            from transforms3d.quaternions import mat2quat, qmult
+            from transforms3d.quaternions import mat2quat
+            from transforms3d.quaternions import qmult
 
             for loop_idx in range(loop):
                 if loop > 1:
@@ -955,7 +1067,7 @@ class RoboticArmControler:
                 ctrl = controllers.CartesianImpedance(filter_coeff=1.0)
                 target_position = self.panda.get_position().astype(np.float64)
                 target_orientation = self.panda.get_orientation().astype(np.float64)
-                last_gripper_open: Optional[bool] = None
+                last_gripper_open: bool | None = None
 
                 # 跟踪实时相机失败次数
                 live_camera_fail_count = 0
@@ -1085,7 +1197,13 @@ class RoboticArmControler:
                                             2,
                                         )
                                         cv2.putText(
-                                            live_resized, "LIVE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2
+                                            live_resized,
+                                            "LIVE",
+                                            (10, 30),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
+                                            1,
+                                            (0, 255, 255),
+                                            2,
                                         )
 
                                         display_img = np.hstack([recorded_resized, live_resized])
@@ -1109,9 +1227,9 @@ class RoboticArmControler:
                                     if display_img is not None:
                                         progress = (i / len(actions)) * 100
                                         info_text = [
-                                            f"Frame: {i+1}/{len(actions)}",
+                                            f"Frame: {i + 1}/{len(actions)}",
                                             f"Progress: {progress:.1f}%",
-                                            f"Loop: {loop_idx+1}/{loop}",
+                                            f"Loop: {loop_idx + 1}/{loop}",
                                             f"Gripper: {'Open' if g_open else 'Closed'}",
                                         ]
 
@@ -1139,9 +1257,8 @@ class RoboticArmControler:
                                             print("\n[Display] 用户按 'q' 键，关闭图像显示（回放继续）")
                                             cv2.destroyAllWindows()
                                             cv2_available = False  # 标记为不可用，后续不再显示
-                                    else:
-                                        if i == 0:
-                                            print(f"[Display] 错误: 无法生成显示图像")
+                                    elif i == 0:
+                                        print("[Display] 错误: 无法生成显示图像")
                                 except Exception as e:
                                     if i == 0 or i % 100 == 0:
                                         print(f"[Warning] Image display failed at frame {i}: {e}")
@@ -1156,13 +1273,13 @@ class RoboticArmControler:
 
                     # 检查是否完整播放
                     if i < len(actions):
-                        print(f"\n⚠️ 警告: 播放未完成! 播放了 {i}/{len(actions)} 帧 ({i/len(actions)*100:.1f}%)")
+                        print(f"\n⚠️ 警告: 播放未完成! 播放了 {i}/{len(actions)} 帧 ({i / len(actions) * 100:.1f}%)")
                         print(f"  ctx.ok() = {ctx.ok()}")
 
                         # 尝试读取机器人错误状态
                         try:
                             robot_state = self.panda.get_robot().read_once()
-                            print(f"  机器人状态检查:")
+                            print("  机器人状态检查:")
 
                             # 检查是否有碰撞
                             if hasattr(robot_state, "cartesian_collision"):
@@ -1184,12 +1301,12 @@ class RoboticArmControler:
                         except Exception as e:
                             print(f"  无法读取详细状态: {e}")
 
-                        print(f"\n可能原因:")
-                        print(f"  1. 碰撞检测触发（机器人检测到碰撞）")
-                        print(f"  2. 工作空间边界（超出机器人可达范围）")
-                        print(f"  3. 关节限位（某个关节超出限制）")
-                        print(f"  4. 控制器超时（动作执行时间过长）")
-                        print(f"  5. 初始位置不匹配（回放起点与采集起点不同）")
+                        print("\n可能原因:")
+                        print("  1. 碰撞检测触发（机器人检测到碰撞）")
+                        print("  2. 工作空间边界（超出机器人可达范围）")
+                        print("  3. 关节限位（某个关节超出限制）")
+                        print("  4. 控制器超时（动作执行时间过长）")
+                        print("  5. 初始位置不匹配（回放起点与采集起点不同）")
                     else:
                         print(f"\n✓ 播放完成 ({i}/{len(actions)} 样本)")
                 except KeyboardInterrupt:
@@ -1230,13 +1347,13 @@ class RoboticArmControler:
         q = q[start_index:end_index]
         dq = dq[start_index:end_index]
 
-        print(f"\n{'='*60}")
-        print(f"轨迹重放")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print("轨迹重放")
+        print(f"{'=' * 60}")
         print(f"轨迹长度: {len(q)} 个样本")
         print(f"播放速度: {speed}x")
         print(f"循环次数: {loop}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         # 移动到起始位置
         print("正在移动到轨迹起始位置...")
@@ -1297,7 +1414,7 @@ class RoboticArmControler:
 if __name__ == "__main__":
     robotic_arm_instance = RoboticArmControler()
     try:
-        print("")
+        print()
         robotic_arm_instance.move_to_start()
         robotic_arm_instance.gripper_grasp(width=0.5)
     finally:

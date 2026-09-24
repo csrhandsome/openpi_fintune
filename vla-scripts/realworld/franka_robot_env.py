@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional,TYPE_CHECKING
-
-import numpy as np
+from typing import TYPE_CHECKING
 
 from dual_camera_manager import DualCameraManager
+import numpy as np
 from robotic_arm_controller import RoboticArmControler
 
 if TYPE_CHECKING:
     from robotic_arm_controller import RoboticArmControler
+
 
 @dataclass
 class FrankaCameraIds:
@@ -39,8 +39,8 @@ class FrankaRobotEnv:
         franka_username: str = "your_username",
         franka_password: str = "your_password",
         camera_ids: FrankaCameraIds | None = None,
-        external_camera_serial: Optional[str] = None,
-        wrist_camera_serial: Optional[str] = None,
+        external_camera_serial: str | None = None,
+        wrist_camera_serial: str | None = None,
         camera_width: int = 640,
         camera_height: int = 480,
         camera_fps: int = 30,
@@ -53,16 +53,22 @@ class FrankaRobotEnv:
         camera_timeout_ms: int = 500,
         warmup_frames: int = 5,
         auto_move_to_start: bool = True,
+        control_mode: str = "joint_position",
+        position_filter_coeff: float = 1.0,
     ) -> None:
         if action_space != "joint_velocity":
             raise ValueError("FrankaRobotEnv only supports action_space='joint_velocity'")
         if gripper_action_space != "position":
             raise ValueError("FrankaRobotEnv only supports gripper_action_space='position'")
+        if control_mode not in ("joint_velocity", "joint_position"):
+            raise ValueError(f"control_mode must be 'joint_velocity' or 'joint_position', got {control_mode!r}")
 
         self._camera_ids = camera_ids or FrankaCameraIds()
         self._use_external_for_right = use_external_for_right
-        self._camera_timeout_ms = int(camera_timeout_ms)
+        self.camera_timeout_ms = int(camera_timeout_ms)
         self._control_frequency_hz = float(control_frequency_hz)
+        self._control_mode = control_mode
+        self._position_filter_coeff = float(position_filter_coeff)
         # DROID 官方: max_joint_delta = 0.2 rad/step @ 15Hz
         # 转换为速度: 0.2 * 15 = 3.0 rad/s (当 action=1.0 时)
         self._max_joint_delta = 0.2  # rad per step, 匹配 DROID
@@ -70,9 +76,9 @@ class FrankaRobotEnv:
         self._gripper_open_threshold = float(gripper_open_threshold)
         self._gripper_max_width_m = float(gripper_max_width_m)
         self._last_observation: dict | None = None
-        self._last_gripper_open: Optional[bool] = None
+        self._last_gripper_open: bool | None = None
 
-        self._cameras = DualCameraManager(
+        self.cameras = DualCameraManager(
             external_serial=external_camera_serial,
             wrist_serial=wrist_camera_serial,
             width=camera_width,
@@ -80,26 +86,40 @@ class FrankaRobotEnv:
             fps=camera_fps,
             color_only=color_only,
         )
-        self._cameras.connect()
+        self.cameras.connect()
 
         for _ in range(max(0, int(warmup_frames))):
-            self._cameras.update(timeout_ms=self._camera_timeout_ms)
+            self.cameras.update(timeout_ms=self.camera_timeout_ms)
 
-        self._robot: RoboticArmControler = RoboticArmControler(
+        self.robot: RoboticArmControler = RoboticArmControler(
             auto_move_to_start=auto_move_to_start,
         )
         if auto_move_to_start:
-            self._robot.move_to_start()
+            self.robot.move_to_start()
 
-        # 启动流式速度控制器
-        # 注意：时间步 = 1 / control_frequency_hz，这决定了积分的步长
-        self._robot.start_velocity_streaming(
-            control_frequency=max(control_frequency_hz * 10, 200.0),
-            time_step=1.0 / control_frequency_hz,
-        )
+        self._start_streaming()
+
+    def _start_streaming(self) -> None:
+        """根据 control_mode 启动对应的流式控制器。"""
+        if self._control_mode == "joint_position":
+            # 关节位置控制：直接吃 q_target，无速度阶跃 → 无 cartesian_reflex 假触发
+            self.robot.start_position_streaming(filter_coeff=self._position_filter_coeff)
+        else:
+            # 关节速度控制（旧路径，原 DROID joy setting）
+            # 注意：时间步 = 1 / control_frequency_hz，这决定了积分的步长
+            self.robot.start_velocity_streaming(
+                control_frequency=max(self._control_frequency_hz * 10, 200.0),
+                time_step=1.0 / self._control_frequency_hz,
+            )
+
+    def _stop_streaming(self) -> None:
+        if self._control_mode == "joint_position":
+            self.robot.stop_position_streaming()
+        else:
+            self.robot.stop_velocity_streaming()
 
     def _get_robot_state(self) -> dict:
-        state = self._robot.state
+        state = self.robot.state
         cartesian_position = np.asarray(state["cartesian_position"], dtype=np.float32).reshape(3)
         joint_positions = np.asarray(state["joint_positions"], dtype=np.float32)
         gripper_width = float(state["gripper_position"])
@@ -111,13 +131,13 @@ class FrankaRobotEnv:
         }
 
     def get_observation(self) -> dict:
-        external_ok, wrist_ok = self._cameras.update(timeout_ms=self._camera_timeout_ms)
+        external_ok, wrist_ok = self.cameras.update(timeout_ms=self.camera_timeout_ms)
         if not external_ok or not wrist_ok:
             if self._last_observation is None:
                 raise RuntimeError("Camera update failed and no previous observation is available.")
             return self._last_observation
 
-        external_img, wrist_img = self._cameras.get_images()
+        external_img, wrist_img = self.cameras.get_images()
         if external_img is None or wrist_img is None:
             if self._last_observation is None:
                 raise RuntimeError("Camera images missing and no previous observation is available.")
@@ -146,44 +166,47 @@ class FrankaRobotEnv:
             raise ValueError(f"Expected action shape (8,), got {action.shape}")
 
         # DROID 官方转换: action [-1,1] -> joint_delta [-0.2, 0.2] rad
-        # 然后转换为速度: joint_velocity = joint_delta * control_frequency
         action_clipped = np.clip(action[:7], -1.0, 1.0)
         joint_delta = action_clipped * self._max_joint_delta * self._joint_velocity_scale
-        joint_velocity = joint_delta * self._control_frequency_hz  # 转换为 rad/s
 
-        # 使用流式控制（无需频繁 start/stop 控制器）
-        self._robot.apply_joint_velocity(joint_velocity, streaming=True)
+        if self._control_mode == "joint_position":
+            # 关节位置控制：把位置增量直接加到当前关节位置，得到绝对位置目标。
+            # 模型本质输出的就是位置增量，这里不再绕 "转速度→控制器再积分回位置"。
+            q_current = np.asarray(self.robot.state["joint_positions"], dtype=np.float64).flatten()
+            q_target = q_current + joint_delta.astype(np.float64)
+            self.robot.set_joint_position_target(q_target)
+        else:
+            # 关节速度控制（旧路径）: joint_velocity = joint_delta * control_frequency
+            joint_velocity = joint_delta * self._control_frequency_hz  # 转换为 rad/s
+            self.robot.apply_joint_velocity(joint_velocity, streaming=True)
 
         gripper_open = float(action[7]) > self._gripper_open_threshold
         if self._last_gripper_open is None or gripper_open != self._last_gripper_open:
             if gripper_open:
-                self._robot.gripper_open()
+                self.robot.gripper_open()
             else:
-                self._robot.gripper_close()
+                self.robot.gripper_close()
             self._last_gripper_open = gripper_open
 
     def reset(self) -> dict:
         # 停止流式控制器以避免控制冲突
-        self._robot.stop_velocity_streaming()
+        self._stop_streaming()
 
         # 移动到起始位置
-        self._robot.gripper_open()
-        self._robot.move_to_start()
+        self.robot.gripper_open()
+        self.robot.move_to_start()
 
-        # 重新启动流式速度控制器
-        self._robot.start_velocity_streaming(
-            control_frequency=max(self._control_frequency_hz * 10, 200.0),
-            time_step=1.0 / self._control_frequency_hz,
-        )
+        # 重新启动流式控制器（与 control_mode 一致）
+        self._start_streaming()
 
         return self.get_observation()
 
     def close(self) -> None:
-        self._robot.stop_velocity_streaming()
-        self._cameras.close()
-        self._robot.cleanup()
+        self._stop_streaming()
+        self.cameras.close()
+        self.robot.cleanup()
 
-    def __enter__(self) -> "FrankaRobotEnv":
+    def __enter__(self) -> FrankaRobotEnv:
         return self
 
     def __exit__(self, exc_type, exc, exc_tb) -> bool:

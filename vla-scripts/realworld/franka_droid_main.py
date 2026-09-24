@@ -7,16 +7,16 @@ import os
 import signal
 import time
 
-import numpy as np
-import pandas as pd
-import tyro
+from franka_robot_env import FrankaCameraIds
+from franka_robot_env import FrankaRobotEnv
 from moviepy import ImageSequenceClip
+import numpy as np
 from openpi_client import websocket_client_policy
 from panda_py import libfranka
+import pandas as pd
 from PIL import Image
-
-from franka_robot_env import FrankaCameraIds, FrankaRobotEnv
 from plot_topk import plot_topk_xy
+import tyro
 
 
 def _center_crop_and_resize(rgb: np.ndarray, out_hw: int = 224, crop_scale: float = 0.9) -> np.ndarray:
@@ -27,7 +27,7 @@ def _center_crop_and_resize(rgb: np.ndarray, out_hw: int = 224, crop_scale: floa
     crop_w = max(1, min(w, int(round(w * frac))))
     y0 = (h - crop_h) // 2
     x0 = (w - crop_w) // 2
-    cropped = rgb[y0:y0 + crop_h, x0:x0 + crop_w]
+    cropped = rgb[y0 : y0 + crop_h, x0 : x0 + crop_w]
     img = Image.fromarray(cropped, mode="RGB").resize((out_hw, out_hw), resample=Image.Resampling.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
 
@@ -47,7 +47,7 @@ class Args:
     external_camera: str | None = "left"
 
     # Rollout parameters
-    max_timesteps: int = 800 
+    max_timesteps: int = 800
     # How many actions to execute from a predicted action chunk before querying policy server again
     open_loop_horizon: int = 8
 
@@ -123,9 +123,10 @@ def _kmeans_topk(samples: np.ndarray, k: int = 3, iters: int = 20) -> tuple[np.n
 
 
 def main(args: Args):
-    assert args.external_camera in ["left", "right"], (
-        "Please specify an external camera to use for the policy, choose from ['left', 'right']"
-    )
+    assert args.external_camera in [
+        "left",
+        "right",
+    ], "Please specify an external camera to use for the policy, choose from ['left', 'right']"
 
     env = FrankaRobotEnv(
         action_space="joint_velocity",
@@ -152,7 +153,7 @@ def main(args: Args):
     franka_model = None
     franka_frame = None
     if args.topk_samples is not None and args.topk_samples > 1:
-        franka_model = env._robot.panda.get_robot().load_model()
+        franka_model = env.robot.panda.get_robot().load_model()
         franka_frame = libfranka.Frame.kEndEffector
     plot_xlim: tuple[float, float] | None = None
     plot_ylim: tuple[float, float] | None = None
@@ -203,7 +204,9 @@ def main(args: Args):
                     topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
                     with prevent_keyboard_interrupt():
                         if topk_k and topk_k > 1:
-                            topk_draws = int(args.topk_draws) if args.topk_draws is not None else max(4 * topk_k, topk_k + 1)
+                            topk_draws = (
+                                int(args.topk_draws) if args.topk_draws is not None else max(4 * topk_k, topk_k + 1)
+                            )
                             topk_draws = max(topk_draws, topk_k)
                             result = policy_client.infer(request_data)
                             pred_action_chunk = result["actions"]
@@ -215,7 +218,7 @@ def main(args: Args):
                             centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
 
                             # 不阻塞的get_state()，然后用官方的api转换成末端的xyz
-                            robot_state = env._robot.panda.get_state()
+                            robot_state = env.robot.panda.get_state()
                             q_curr = np.asarray(robot_state.q, dtype=np.float32).reshape(7)
                             F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
                             EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
@@ -235,7 +238,7 @@ def main(args: Args):
                             curr_ee_xyz = curr_pose[:3, 3]
                             # Freeze XY axis on first plot to avoid per-frame auto-rescaling jitter.
                             if plot_xlim is None or plot_ylim is None:
-                                xy = np.concatenate([topk_xyz[:, :2], curr_ee_xyz[:2].reshape(1,2)], axis=0)
+                                xy = np.concatenate([topk_xyz[:, :2], curr_ee_xyz[:2].reshape(1, 2)], axis=0)
                                 # 确定坐标轴范围
                                 xy_min = xy.min(axis=0)
                                 xy_max = xy.max(axis=0)
@@ -318,8 +321,8 @@ def main(args: Args):
     # timestamp = datetime.datetime.now().strftime("%I:%M%p_%B_%d_%Y")
     # csv_filename = os.path.join("results", f"eval_{timestamp}.csv")
     # df.to_csv(csv_filename, index=False)
-    env._robot.move_to_start()
-    env._robot.gripper_open()
+    env.robot.move_to_start()
+    env.robot.gripper_open()
     # print(f"Results saved to {csv_filename}")
 
 

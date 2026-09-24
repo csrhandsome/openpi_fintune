@@ -1,22 +1,23 @@
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 import logging
 import multiprocessing
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+from datasets.features import features as hf_features
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
-from datasets.features import features as hf_features
 
 import openpi.models.model as _model
+from openpi.shared import audio_tools as _audio_tools
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
-from datasets.features import features as hf_features
+
 T_co = TypeVar("T_co", covariant=True)
 
 
@@ -70,6 +71,81 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class DialogueAugmentedDataset(Dataset):
+    """Add one Talker-only sample per dialogue turn to a LeRobot dataset.
+
+    The original frame samples are retained for continuous action learning.  A
+    synthetic sample reuses the image/state from the annotated turn frame; the
+    downstream ``ExtractDialogueTurn`` transform recognizes
+    ``dialogue_turn_index`` and supplies causal text targets while masking the
+    action loss.
+    """
+
+    def __init__(self, dataset: Dataset, dataset_root: str, *, repeat: int = 1):
+        self._dataset = dataset
+        self._turn_specs: list[tuple[int, int]] = []
+        if repeat <= 0:
+            raise ValueError("dialogue repeat must be > 0")
+        for episode_index, start_index in self._episode_start_indices().items():
+            _, sync_path = _audio_tools.resolve_episode_audio_paths(dataset_root, episode_index)
+            sync = _audio_tools.load_json(sync_path)
+            turns = sync.get("dialogue") if sync else None
+            if not isinstance(turns, list):
+                continue
+            for turn_index, turn in enumerate(turns):
+                if not isinstance(turn, dict) or not str(turn.get("robot_response", "")).strip():
+                    continue
+                frame_index = turn.get("frame_index")
+                try:
+                    source_index = int(start_index) + max(int(frame_index), 0)
+                except (TypeError, ValueError):
+                    source_index = int(start_index)
+                self._turn_specs.extend([(source_index, turn_index)] * repeat)
+
+    def _episode_start_indices(self) -> dict[int, int]:
+        episode_data_index = getattr(self._dataset, "episode_data_index", None)
+        episodes = getattr(self._dataset, "episodes", None)
+        if episode_data_index is None:
+            return {}
+        starts = np.asarray(episode_data_index["from"]).reshape(-1)
+        # LeRobotDataset stores ``episodes=None`` when it loads the complete
+        # dataset. In that common case, episode ids live in
+        # ``dataset.meta.episodes`` instead. Using only ``dataset.episodes``
+        # silently produced zero Talker samples for every full dataset.
+        if episodes is None:
+            metadata_episodes = getattr(getattr(self._dataset, "meta", None), "episodes", None)
+            if isinstance(metadata_episodes, Mapping):
+                episodes = sorted(metadata_episodes)
+            elif metadata_episodes is not None:
+                episodes = metadata_episodes
+            else:
+                episodes = range(len(starts))
+        if len(episodes) != len(starts):
+            return {}
+        return {int(episode): int(start) for episode, start in zip(episodes, starts, strict=True)}
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        index = index.__index__()
+        base_length = len(self._dataset)
+        if index < base_length:
+            item = dict(self._dataset[index])
+            # Preserve a uniform key set for RepackTransform. ``-1`` denotes a
+            # normal action sample rather than a synthetic Talker sample.
+            # Keep the action-loss mask present on both branches so PyTorch's
+            # default batch collation sees one consistent dictionary tree.
+            item["dialogue_turn_index"] = np.int32(-1)
+            item["action_loss_mask"] = np.True_
+            return item
+        source_index, turn_index = self._turn_specs[index - base_length]
+        item = dict(self._dataset[source_index])
+        item["dialogue_turn_index"] = np.int32(turn_index)
+        item["action_loss_mask"] = np.False_
+        return item
+
+    def __len__(self) -> int:
+        return len(self._dataset) + len(self._turn_specs)
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -162,6 +238,29 @@ def create_torch_dataset(
         delta_timestamps=delta_timestamps or None,
     )
 
+    if data_config.dialogue_turn_augmentation:
+        dialogue_dataset_root = data_config.dialogue_sidecar_dir or str(dataset_meta.root)
+        augmented_dataset = DialogueAugmentedDataset(
+            dataset,
+            dataset_root=dialogue_dataset_root,
+            repeat=data_config.dialogue_turn_repeat,
+        )
+        talker_sample_count = len(augmented_dataset) - len(dataset)
+        if talker_sample_count == 0:
+            raise ValueError(
+                "Dialogue supervision is enabled, but no Talker samples were found. "
+                f"Checked sidecars under {dialogue_dataset_root!r}/audio. "
+                "Ensure audio_sidecar_dir contains episode_XXXXXX.sync.json files with dialogue targets."
+            )
+        logging.info(
+            "Initialized dialogue augmentation: sidecar_root=%s, base_samples=%d, "
+            "synthetic_talker_samples=%d, repeat=%d",
+            dialogue_dataset_root,
+            len(dataset),
+            talker_sample_count,
+            data_config.dialogue_turn_repeat,
+        )
+        dataset = augmented_dataset
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 

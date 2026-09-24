@@ -192,10 +192,22 @@ We provide more examples for how to fine-tune and run inference with our models 
 openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
 
 - The π₀-FAST model
-- Mixed precision training
+- FP16 training is not supported; the PyTorch entrypoint uses bfloat16 or float32.
 - FSDP (fully-sharded data parallelism) training
 - LoRA (low-rank adaptation) training
 - EMA (exponential moving average) weights during training
+
+### Embodied-aligned PI0 training details
+
+The PyTorch PI0 path follows the embodied implementation for memory and numerical behavior:
+
+- The full policy is cast to the configured training dtype. RMSNorm statistics/modulation and attention softmax are computed in float32 where required; attention probabilities are cast back to the value dtype.
+- Joint attention explicitly computes q/k in float32, while the suffix hidden states and action projection remain in the model dtype. The flow-matching MSE casts both prediction and target to float32 before reduction.
+- Timesteps accept `[B]` or per-action `[B, H]`; the default batch timestep is expanded to `[B, H]`, which keeps RTC-compatible conditioning available.
+- Before DDP and optimizer construction, the trainer removes the action expert token embedding and `lm_head`, removes an optional `future_teacher`, and freezes the action expert last-layer norms, q/o projections, MLP projections, and final norm.
+- Floating-point batch tensors are moved to the selected training dtype while token ids and masks retain their integer/bool dtypes. TF32 is enabled on CUDA.
+
+The current launcher still uses PyTorch DDP; DeepSpeed/ZeRO is not required for this implementation.
 
 ### Setup
 1. Make sure that you have the latest version of all dependencies installed: `uv sync`
@@ -301,8 +313,8 @@ JAX and PyTorch implementations handle precision as follows:
 2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
 
 **PyTorch:**
-1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
+1. Inference: the model uses bfloat16 weights by default, with numerically sensitive attention/time computations upcast as needed.
+2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. FP16 mixed precision is not supported.
 
 With torch.compile, inference speed is comparable between JAX and PyTorch.
 

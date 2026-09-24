@@ -188,6 +188,10 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if observation.dialogue_token_loss_mask is not None:
+        text_loss_mask = observation.dialogue_token_loss_mask.astype(jnp.float32)
+        info["text_target_tokens"] = jnp.sum(text_loss_mask)
+        info["text_supervision_samples"] = jnp.sum(jnp.any(text_loss_mask > 0, axis=-1))
     return new_state, info
 
 

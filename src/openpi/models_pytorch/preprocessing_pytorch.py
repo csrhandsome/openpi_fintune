@@ -38,9 +38,7 @@ def preprocess_observation_pytorch(
         image = observation.images[key]
 
         if image.dim() < 4:
-            raise ValueError(
-                f"Image tensor for key '{key}' must have at least 4 dims, got shape {tuple(image.shape)}"
-            )
+            raise ValueError(f"Image tensor for key '{key}' must have at least 4 dims, got shape {tuple(image.shape)}")
 
         if image.shape[-1] <= 4:
             is_channels_first = False
@@ -51,9 +49,7 @@ def preprocess_observation_pytorch(
             leading_shape = image.shape[:-3]
             image = image.reshape(-1, *image.shape[-3:]).permute(0, 2, 3, 1)
         else:
-            raise ValueError(
-                f"Unable to infer channel axis for key '{key}' with shape {tuple(image.shape)}"
-            )
+            raise ValueError(f"Unable to infer channel axis for key '{key}' with shape {tuple(image.shape)}")
 
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")

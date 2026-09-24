@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 
@@ -9,10 +8,10 @@ import numpy as np
 @dataclass
 class RealSenseSensorData:
     timestamp: float = 0.0
-    color_img: Optional[np.ndarray] = None  # RGB uint8 (H,W,3)
-    depth_m: Optional[np.ndarray] = None  # float32 (H,W) in meters
-    intrinsics: Optional[np.ndarray] = None  # 3x3 float32
-    ee_pose: Optional[np.ndarray] = None  # 4x4 float32 (optional, for stale observation)
+    color_img: np.ndarray | None = None  # RGB uint8 (H,W,3)
+    depth_m: np.ndarray | None = None  # float32 (H,W) in meters
+    intrinsics: np.ndarray | None = None  # 3x3 float32
+    ee_pose: np.ndarray | None = None  # 4x4 float32 (optional, for stale observation)
 
 
 class RealSenseConnector:
@@ -38,7 +37,7 @@ class RealSenseConnector:
     def __init__(
         self,
         *,
-        serial: Optional[str] = None,
+        serial: str | None = None,
         width: int = 640,
         height: int = 480,
         fps: int = 30,
@@ -96,21 +95,21 @@ class RealSenseConnector:
         self._bbox_expand_ratio = bbox_expand_ratio
 
         self._sensor_data = RealSenseSensorData()
-        self._cached_mask: Optional[np.ndarray] = None
+        self._cached_mask: np.ndarray | None = None
         self._mask_dirty = True
 
         # 缓存检测结果用于调试
         self._last_hand_bbox = None  # (x1, y1, x2, y2)
         # 上一帧有效的完整观测包（用于检测失败时的回退）
         # 包含: rgb, depth_m, mask, intrinsics, timestamp
-        self._last_valid_observation: Optional[dict] = None
+        self._last_valid_observation: dict | None = None
         # 标记当前帧是否使用了缓存的观测（stale）
         self._is_stale_observation: bool = False
         # 连续使用stale observation的次数
         self._stale_count: int = 0
         self._max_stale_count: int = 3  # 最多连续使用3次陈旧观测
 
-    def connect(self) -> "RealSenseConnector":
+    def connect(self) -> RealSenseConnector:
         if self._pipeline is not None:
             return self
 
@@ -118,8 +117,7 @@ class RealSenseConnector:
             import pyrealsense2 as rs
         except Exception as e:
             raise RuntimeError(
-                "RealSense connector requires `pyrealsense2`. "
-                "Install Intel RealSense SDK Python bindings."
+                "RealSense connector requires `pyrealsense2`. Install Intel RealSense SDK Python bindings."
             ) from e
 
         pipeline = rs.pipeline()
@@ -162,7 +160,7 @@ class RealSenseConnector:
                 self._depth_scale = None
         self._yolo_model = None
 
-    def __enter__(self) -> "RealSenseConnector":
+    def __enter__(self) -> RealSenseConnector:
         self.connect()
         return self
 
@@ -259,30 +257,31 @@ class RealSenseConnector:
         return self._sensor_data
 
     @property
-    def img(self) -> Optional[np.ndarray]:
+    def img(self) -> np.ndarray | None:
         return self._sensor_data.color_img
 
     @property
-    def depth(self) -> Optional[np.ndarray]:
+    def depth(self) -> np.ndarray | None:
         return self._sensor_data.depth_m
 
     @property
-    def intrinsics(self) -> Optional[np.ndarray]:
+    def intrinsics(self) -> np.ndarray | None:
         return self._sensor_data.intrinsics
 
     def _init_yolo_model(self):
         """初始化 YOLO 手部检测模型"""
         if self._yolo_model is None:
             from ultralytics import YOLO
-            from huggingface_hub import hf_hub_download
 
             # 从 HuggingFace 下载模型（会自动缓存）
             # model_path = hf_hub_download("Bingsu/adetailer", self._yolo_model_name)
             # print("[RealSenseConnector] Loading YOLO model from:", model_path)
-            self._yolo_model = YOLO("/home/three/.cache/huggingface/hub/models--Bingsu--adetailer/snapshots/53cc19de382014514d9d4038601d261a7faa9b7b/hand_yolov8n.pt")
+            self._yolo_model = YOLO(
+                "/home/three/.cache/huggingface/hub/models--Bingsu--adetailer/snapshots/53cc19de382014514d9d4038601d261a7faa9b7b/hand_yolov8n.pt"
+            )
         return self._yolo_model
 
-    def _compute_mask(self) -> Optional[np.ndarray]:
+    def _compute_mask(self) -> np.ndarray | None:
         """
         计算物体 mask：
         1. YOLO 手部检测 → Bounding Box
@@ -318,7 +317,9 @@ class RealSenseConnector:
             # 没有检测到手，回退到上一帧完整观测包
             self._last_hand_bbox = None
             if self._last_valid_observation is not None and self._stale_count < self._max_stale_count:
-                print(f"[RealSenseConnector] No hand detected, using last valid FULL observation (rgb+depth+mask) [{self._stale_count + 1}/{self._max_stale_count}]")
+                print(
+                    f"[RealSenseConnector] No hand detected, using last valid FULL observation (rgb+depth+mask) [{self._stale_count + 1}/{self._max_stale_count}]"
+                )
                 # 恢复完整观测包（rgb, depth, mask 都回退到同一帧）
                 self._sensor_data = RealSenseSensorData(
                     timestamp=self._last_valid_observation["timestamp"],
@@ -331,7 +332,9 @@ class RealSenseConnector:
                 return self._last_valid_observation["mask"].copy()
             # 没有缓存的有效观测，或者已超过最大回退次数
             if self._stale_count >= self._max_stale_count:
-                print(f"[RealSenseConnector] Exceeded max stale count ({self._max_stale_count}), returning background mask")
+                print(
+                    f"[RealSenseConnector] Exceeded max stale count ({self._max_stale_count}), returning background mask"
+                )
             self._is_stale_observation = False
             self._stale_count = 0
             return mask
@@ -440,7 +443,7 @@ class RealSenseConnector:
         return self._is_stale_observation
 
     @property
-    def mask(self) -> Optional[np.ndarray]:
+    def mask(self) -> np.ndarray | None:
         """
         Returns a label mask (H, W) uint8: background=0, instances=1..N.
         """

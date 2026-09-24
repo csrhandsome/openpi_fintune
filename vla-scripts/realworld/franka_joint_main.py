@@ -7,16 +7,17 @@ import os
 import signal
 import time
 
-import numpy as np
-import pandas as pd
-import tyro
+from franka_robot_env import FrankaCameraIds
+from franka_robot_env import FrankaRobotEnv
 from moviepy import ImageSequenceClip
+import numpy as np
 from openpi_client import websocket_client_policy
-from panda_py import controllers, libfranka
+from panda_py import controllers
+from panda_py import libfranka
+import pandas as pd
 from PIL import Image
-
-from franka_robot_env import FrankaCameraIds, FrankaRobotEnv
 from plot_topk import plot_topk_xy
+import tyro
 
 DEFAULT_CONTROL_FREQUENCY = 30.0
 GRIPPER_OPEN = 1.0
@@ -35,9 +36,7 @@ FRANKA_JOINT_LIMITS = np.array(
 )
 
 
-def _center_crop_and_resize(
-    rgb: np.ndarray, out_hw: int = 224, crop_scale: float = 0.9
-) -> np.ndarray:
+def _center_crop_and_resize(rgb: np.ndarray, out_hw: int = 224, crop_scale: float = 0.9) -> np.ndarray:
     """Center crop + resize to match training data preprocessing."""
     h, w = rgb.shape[:2]
     frac = float(np.sqrt(crop_scale))
@@ -46,9 +45,7 @@ def _center_crop_and_resize(
     y0 = (h - crop_h) // 2
     x0 = (w - crop_w) // 2
     cropped = rgb[y0 : y0 + crop_h, x0 : x0 + crop_w]
-    img = Image.fromarray(cropped, mode="RGB").resize(
-        (out_hw, out_hw), resample=Image.Resampling.BILINEAR
-    )
+    img = Image.fromarray(cropped, mode="RGB").resize((out_hw, out_hw), resample=Image.Resampling.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
 
 
@@ -123,9 +120,7 @@ def prevent_keyboard_interrupt():
             raise KeyboardInterrupt
 
 
-def _kmeans_topk(
-    samples: np.ndarray, k: int = 3, iters: int = 20
-) -> tuple[np.ndarray, np.ndarray]:
+def _kmeans_topk(samples: np.ndarray, k: int = 3, iters: int = 20) -> tuple[np.ndarray, np.ndarray]:
     samples = np.asarray(samples, dtype=np.float32)
     if samples.ndim != 2:
         raise ValueError(f"Expected samples shape (N, D), got {samples.shape}")
@@ -157,23 +152,21 @@ def _normalize_action_chunk(actions: np.ndarray) -> np.ndarray:
 
 
 def _hold_current_joint_position(env: FrankaRobotEnv, controller) -> np.ndarray:
-    q_curr = np.asarray(env._robot.panda.get_state().q, dtype=np.float64).reshape(7)
+    q_curr = np.asarray(env.robot.panda.get_state().q, dtype=np.float64).reshape(7)
     controller.set_control(q_curr, np.zeros(7, dtype=np.float64))
     return q_curr
 
 
 def _start_joint_position_controller(env: FrankaRobotEnv, *, settle_s: float = 0.0):
     controller = controllers.JointPosition()
-    env._robot.panda.start_controller(controller)
+    env.robot.panda.start_controller(controller)
     if settle_s > 0.0:
         time.sleep(settle_s)
     _hold_current_joint_position(env, controller)
     return controller
 
 
-def _sanitize_joint_target(
-    args: Args, q_curr: np.ndarray, joint_target: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+def _sanitize_joint_target(args: Args, q_curr: np.ndarray, joint_target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     q_curr = np.asarray(q_curr, dtype=np.float64).reshape(7)
     target = np.asarray(joint_target, dtype=np.float64).reshape(7)
     target = np.clip(target, FRANKA_JOINT_LIMITS[:, 0], FRANKA_JOINT_LIMITS[:, 1])
@@ -181,9 +174,7 @@ def _sanitize_joint_target(
     joint_delta = target - q_curr
     if args.max_joint_delta > 0.0:
         joint_delta = np.clip(joint_delta, -args.max_joint_delta, args.max_joint_delta)
-        target = np.clip(
-            q_curr + joint_delta, FRANKA_JOINT_LIMITS[:, 0], FRANKA_JOINT_LIMITS[:, 1]
-        )
+        target = np.clip(q_curr + joint_delta, FRANKA_JOINT_LIMITS[:, 0], FRANKA_JOINT_LIMITS[:, 1])
         joint_delta = target - q_curr
 
     if args.action_epsilon > 0.0:
@@ -206,27 +197,23 @@ def _extract_observation(
 ):
     last_observation = getattr(env, "_joint_main_last_observation", None)
 
-    external_ok, wrist_ok = env._cameras.update(timeout_ms=env._camera_timeout_ms)
+    external_ok, wrist_ok = env.cameras.update(timeout_ms=env.camera_timeout_ms)
     external_img = wrist_img = None
     if external_ok and wrist_ok:
-        external_img, wrist_img = env._cameras.get_images()
+        external_img, wrist_img = env.cameras.get_images()
 
     if external_img is None or wrist_img is None:
         if last_observation is None:
-            raise RuntimeError(
-                "Camera update failed and no previous observation is available."
-            )
+            raise RuntimeError("Camera update failed and no previous observation is available.")
         left_image = last_observation["left_image"]
         right_image = last_observation["right_image"]
         wrist_image = last_observation["wrist_image"]
     else:
         left_image = np.asarray(external_img, dtype=np.uint8).copy()
         wrist_image = np.asarray(wrist_img, dtype=np.uint8).copy()
-        right_image = (
-            left_image.copy() if args.use_external_for_right else wrist_image.copy()
-        )
+        right_image = left_image.copy() if args.use_external_for_right else wrist_image.copy()
 
-    robot_state = env._robot.panda.get_state()
+    robot_state = env.robot.panda.get_state()
     ee_pose = np.asarray(robot_state.O_T_EE, dtype=np.float32).reshape(4, 4).T
     joint_position = np.asarray(robot_state.q, dtype=np.float32).reshape(7)
     gripper_position = np.asarray([np.float32(gripper_state)], dtype=np.float32)
@@ -257,40 +244,36 @@ def _apply_gripper_if_needed(
         return controller, current_gripper_state
 
     _hold_current_joint_position(env, controller)
-    env._robot.panda.stop_controller()
+    env.robot.panda.stop_controller()
     if next_gripper_state > 0.5:
-        env._robot.gripper_open()
+        env.robot.gripper_open()
     else:
-        env._robot.gripper_close()
+        env.robot.gripper_close()
     controller = _start_joint_position_controller(env, settle_s=0.0)
     return controller, next_gripper_state
 
 
-def _reset_robot(
-    env: FrankaRobotEnv, controller, *, settle_s: float
-) -> tuple[object, float]:
+def _reset_robot(env: FrankaRobotEnv, controller, *, settle_s: float) -> tuple[object, float]:
     with contextlib.suppress(Exception):
-        env._robot.stop_velocity_streaming()
+        env.robot.stop_velocity_streaming()
     with contextlib.suppress(Exception):
         _hold_current_joint_position(env, controller)
     with contextlib.suppress(Exception):
-        env._robot.panda.stop_controller()
-    env._robot.gripper_open()
-    auto_move_to_start = getattr(env._robot, "auto_move_to_start", True)
-    env._robot.auto_move_to_start = True
+        env.robot.panda.stop_controller()
+    env.robot.gripper_open()
+    auto_move_to_start = getattr(env.robot, "auto_move_to_start", True)
+    env.robot.auto_move_to_start = True
     try:
-        env._robot.move_to_start()
+        env.robot.move_to_start()
     finally:
-        env._robot.auto_move_to_start = auto_move_to_start
+        env.robot.auto_move_to_start = auto_move_to_start
     controller = _start_joint_position_controller(env, settle_s=settle_s)
     return controller, GRIPPER_OPEN
 
 
 def main(args: Args):
     if args.external_camera not in ["left", "right"]:
-        raise ValueError(
-            "Please specify an external camera to use for the policy, choose from ['left', 'right']"
-        )
+        raise ValueError("Please specify an external camera to use for the policy, choose from ['left', 'right']")
     if args.control_frequency_hz <= 0.0:
         raise ValueError("--control-frequency-hz must be > 0")
     if args.open_loop_horizon <= 0:
@@ -325,27 +308,21 @@ def main(args: Args):
 
     controller = None
     try:
-        controller, gripper_state = _reset_robot(
-            env, controller, settle_s=args.controller_settle_s
-        )
+        controller, gripper_state = _reset_robot(env, controller, settle_s=args.controller_settle_s)
 
         franka_model = None
         franka_frame = None
         if args.topk_samples is not None and args.topk_samples > 1:
-            franka_model = env._robot.panda.get_robot().load_model()
+            franka_model = env.robot.panda.get_robot().load_model()
             franka_frame = libfranka.Frame.kEndEffector
         plot_xlim: tuple[float, float] | None = None
         plot_ylim: tuple[float, float] | None = None
 
-        policy_client = websocket_client_policy.WebsocketClientPolicy(
-            args.remote_host, args.remote_port
-        )
+        policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
         df = pd.DataFrame(columns=["success", "duration", "video_filename"])
 
         while True:
-            instruction = (
-                args.instruction.strip() or input("Enter instruction: ").strip()
-            )
+            instruction = args.instruction.strip() or input("Enter instruction: ").strip()
             if not instruction:
                 raise ValueError("Instruction must not be empty.")
 
@@ -378,36 +355,23 @@ def main(args: Args):
                         args.open_loop_horizon,
                         pred_action_horizon or args.open_loop_horizon,
                     )
-                    if (
-                        pred_action_chunk is None
-                        or actions_from_chunk_completed >= effective_horizon
-                    ):
+                    if pred_action_chunk is None or actions_from_chunk_completed >= effective_horizon:
                         actions_from_chunk_completed = 0
                         request_data = {
                             "observation/exterior_image_1_left": _center_crop_and_resize(
                                 curr_obs[f"{args.external_camera}_image"]
                             ),
-                            "observation/wrist_image_left": _center_crop_and_resize(
-                                curr_obs["wrist_image"]
-                            ),
+                            "observation/wrist_image_left": _center_crop_and_resize(curr_obs["wrist_image"]),
                             "observation/joint_position": curr_obs["joint_position"],
-                            "observation/gripper_position": curr_obs[
-                                "gripper_position"
-                            ],
+                            "observation/gripper_position": curr_obs["gripper_position"],
                             "prompt": instruction,
                         }
 
-                        topk_k = (
-                            int(args.topk_samples)
-                            if args.topk_samples is not None
-                            else 0
-                        )
+                        topk_k = int(args.topk_samples) if args.topk_samples is not None else 0
                         with prevent_keyboard_interrupt():
                             if topk_k and topk_k > 1:
                                 topk_draws = (
-                                    int(args.topk_draws)
-                                    if args.topk_draws is not None
-                                    else max(4 * topk_k, topk_k + 1)
+                                    int(args.topk_draws) if args.topk_draws is not None else max(4 * topk_k, topk_k + 1)
                                 )
                                 topk_draws = max(topk_draws, topk_k)
                                 pred_action_chunk = _normalize_action_chunk(
@@ -416,49 +380,23 @@ def main(args: Args):
                                 samples = [pred_action_chunk[0]]
                                 for _ in range(topk_draws - 1):
                                     samples.append(
-                                        _normalize_action_chunk(
-                                            policy_client.infer(request_data)["actions"]
-                                        )[0]
+                                        _normalize_action_chunk(policy_client.infer(request_data)["actions"])[0]
                                     )
-                                centers, probs = _kmeans_topk(
-                                    np.asarray(samples, dtype=np.float32), k=topk_k
-                                )
+                                centers, probs = _kmeans_topk(np.asarray(samples, dtype=np.float32), k=topk_k)
 
-                                robot_state = env._robot.panda.get_state()
-                                q_curr = np.asarray(
-                                    robot_state.q, dtype=np.float64
-                                ).reshape(7)
-                                F_T_EE = (
-                                    np.asarray(robot_state.F_T_EE, dtype=np.float32)
-                                    .reshape(16)
-                                    .tolist()
-                                )
-                                EE_T_K = (
-                                    np.asarray(robot_state.EE_T_K, dtype=np.float32)
-                                    .reshape(16)
-                                    .tolist()
-                                )
+                                robot_state = env.robot.panda.get_state()
+                                q_curr = np.asarray(robot_state.q, dtype=np.float64).reshape(7)
+                                F_T_EE = np.asarray(robot_state.F_T_EE, dtype=np.float32).reshape(16).tolist()
+                                EE_T_K = np.asarray(robot_state.EE_T_K, dtype=np.float32).reshape(16).tolist()
 
                                 topk_xyz = []
                                 for center in centers:
-                                    q_next, _ = _sanitize_joint_target(
-                                        args, q_curr, center[:7]
-                                    )
-                                    pose = franka_model.pose(
-                                        franka_frame, q_next.tolist(), F_T_EE, EE_T_K
-                                    )
-                                    pose = (
-                                        np.asarray(pose, dtype=np.float32)
-                                        .reshape(4, 4)
-                                        .T
-                                    )
+                                    q_next, _ = _sanitize_joint_target(args, q_curr, center[:7])
+                                    pose = franka_model.pose(franka_frame, q_next.tolist(), F_T_EE, EE_T_K)
+                                    pose = np.asarray(pose, dtype=np.float32).reshape(4, 4).T
                                     topk_xyz.append(pose[:3, 3])
                                 topk_xyz = np.asarray(topk_xyz, dtype=np.float32)
-                                curr_pose = (
-                                    np.asarray(robot_state.O_T_EE, dtype=np.float32)
-                                    .reshape(4, 4)
-                                    .T
-                                )
+                                curr_pose = np.asarray(robot_state.O_T_EE, dtype=np.float32).reshape(4, 4).T
                                 curr_ee_xyz = curr_pose[:3, 3]
                                 if plot_xlim is None or plot_ylim is None:
                                     xy = np.concatenate(
@@ -505,9 +443,7 @@ def main(args: Args):
                     actions_from_chunk_completed += 1
 
                     next_gripper_state = (
-                        GRIPPER_OPEN
-                        if float(action[7]) > args.gripper_open_threshold
-                        else GRIPPER_CLOSED
+                        GRIPPER_OPEN if float(action[7]) > args.gripper_open_threshold else GRIPPER_CLOSED
                     )
                     controller, gripper_state = _apply_gripper_if_needed(
                         env,
@@ -516,12 +452,8 @@ def main(args: Args):
                         next_gripper_state,
                     )
 
-                    q_curr = np.asarray(
-                        env._robot.panda.get_state().q, dtype=np.float64
-                    ).reshape(7)
-                    q_target, joint_delta = _sanitize_joint_target(
-                        args, q_curr, action[:7]
-                    )
+                    q_curr = np.asarray(env.robot.panda.get_state().q, dtype=np.float64).reshape(7)
+                    q_target, joint_delta = _sanitize_joint_target(args, q_curr, action[:7])
                     if args.joint_velocity_limit > 0.0:
                         qvel_ff = np.clip(
                             joint_delta * float(args.control_frequency_hz),
@@ -541,9 +473,7 @@ def main(args: Args):
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "motion aborted by reflex" in msg or "cartesian_reflex" in msg:
-                        print(
-                            f"[Error] Franka reflex triggered; stopping rollout safely: {msg}"
-                        )
+                        print(f"[Error] Franka reflex triggered; stopping rollout safely: {msg}")
                         break
                     raise
 
@@ -552,9 +482,7 @@ def main(args: Args):
 
             if video:
                 save_filename = "video_" + timestamp
-                ImageSequenceClip(
-                    list(np.stack(video)), fps=int(round(args.control_frequency_hz))
-                ).write_videofile(
+                ImageSequenceClip(list(np.stack(video)), fps=int(round(args.control_frequency_hz))).write_videofile(
                     save_filename + ".mp4",
                     codec="libx264",
                 )
@@ -563,7 +491,7 @@ def main(args: Args):
                 print("No frames captured; skipping video export.")
 
             success = None
-            env._robot.gripper_open()
+            env.robot.gripper_open()
             while success is None:
                 raw = (
                     input(
@@ -582,9 +510,7 @@ def main(args: Args):
                 try:
                     numeric = float(raw)
                 except ValueError:
-                    print(
-                        f"Please enter y, n, or a numeric value in [0, 100], but got: {raw!r}"
-                    )
+                    print(f"Please enter y, n, or a numeric value in [0, 100], but got: {raw!r}")
                     continue
 
                 if 0.0 <= numeric <= 100.0:
@@ -610,9 +536,7 @@ def main(args: Args):
 
             if input("Do one more eval? (enter y or n) ").lower() != "y":
                 break
-            controller, gripper_state = _reset_robot(
-                env, controller, settle_s=args.controller_settle_s
-            )
+            controller, gripper_state = _reset_robot(env, controller, settle_s=args.controller_settle_s)
 
         os.makedirs("results", exist_ok=True)
         controller, gripper_state = _reset_robot(env, controller, settle_s=0.0)
@@ -621,7 +545,7 @@ def main(args: Args):
             if controller is not None:
                 _hold_current_joint_position(env, controller)
         with contextlib.suppress(Exception):
-            env._robot.panda.stop_controller()
+            env.robot.panda.stop_controller()
         with contextlib.suppress(Exception):
             env.close()
 
