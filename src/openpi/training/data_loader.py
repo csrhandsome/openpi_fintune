@@ -15,6 +15,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.franka_multirate import MultirateFrankaDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -148,9 +149,13 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    delta_timestamps = {
-        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-    }
+    if data_config.align_franka_action_trace and not np.isclose(dataset_meta.fps, 30.0, atol=0.01):
+        raise ValueError(f"ROS multirate training requires a 30 Hz LeRobot dataset, got {dataset_meta.fps} Hz")
+    delta_timestamps = (
+        {}
+        if data_config.align_franka_action_trace
+        else {key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys}
+    )
     delta_timestamps.update(
         {
             key: [delta / dataset_meta.fps for delta in delta_indices]
@@ -161,6 +166,9 @@ def create_torch_dataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps or None,
     )
+
+    if data_config.align_franka_action_trace:
+        dataset = MultirateFrankaDataset(dataset, action_horizon)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

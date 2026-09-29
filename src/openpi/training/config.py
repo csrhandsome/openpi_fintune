@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -20,6 +21,7 @@ import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.franka_ee_policy as franka_ee_policy
 import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -102,6 +104,9 @@ class DataConfig:
     # Additional per-key frame offsets (in units of dataset frames) to fetch from LeRobot.
     # Each offset is relative to the current timestep; negative values mean history frames.
     delta_indices: dict[str, Sequence[int]] = dataclasses.field(default_factory=dict)
+
+    # Read ROS 100 Hz action sidecars and align them with the 30 Hz camera frames.
+    align_franka_action_trace: bool = False
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -484,6 +489,8 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
     absolute joint position targets plus an absolute gripper command.
     """
 
+    align_action_trace: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
@@ -522,6 +529,42 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            align_franka_action_trace=self.align_action_trace,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaEEDataConfig(DataConfigFactory):
+    """Read 6D base-frame EE pose and 7D future pose/gripper actions from LeRobot."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/wrist_image_left": "wrist_image_left",
+                        "observation/ee_pose": "ee_pose",
+                        "observation/gripper_position": "gripper_position",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[franka_ee_policy.FrankaEEInputs(model_type=model_config.model_type)],
+            outputs=[franka_ee_policy.FrankaEEOutputs()],
+        ).push(
+            inputs=[franka_ee_policy.EEDeltaActions()],
+            outputs=[franka_ee_policy.EEAbsoluteActions()],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
         )
 
 
@@ -1144,6 +1187,62 @@ _CONFIGS = [
         save_interval=1000,
         # 这个是真正的保存的间隔
         # keep_period=1000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        # ROS collector: 100 Hz robot/VR trace aligned to 30 Hz camera frames.
+        # Set HF_LEROBOT_HOME to the collector's data/ directory when training locally.
+        name="pi0_base_joint_ros_30hz",
+        model=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotFrankaJointDataConfig(
+            repo_id=os.environ.get("FRANKA_ROS_DATASET_REPO_ID", "openpi/franka_lerobot_test"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=5,
+        save_interval=1000,
+        policy_metadata={"action_fps": 30.0, "action_horizon": 16, "action_space": "joint", "action_dim": 8},
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_base_ee_ros_30hz",
+        model=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotFrankaEEDataConfig(
+            repo_id=os.environ.get("FRANKA_ROS_DATASET_REPO_ID", "openpi/franka_lerobot_test"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=5,
+        save_interval=1000,
+        policy_metadata={"action_fps": 30.0, "action_horizon": 16, "action_space": "ee", "action_dim": 7},
         freeze_filter=pi0_config.Pi0Config(
             pi05=False,
             action_dim=32,
