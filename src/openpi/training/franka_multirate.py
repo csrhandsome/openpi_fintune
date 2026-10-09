@@ -58,8 +58,9 @@ def aligned_episode_actions(
     measured = np.asarray(
         [[*row["joint_position"], row["gripper_position"]] for row in rows], dtype=np.float32
     )
+    terminal = frames[-1] if "action_joint_position" in frames[-1] else rows[-1]
     final_action = np.asarray(
-        [*rows[-1]["action_joint_position"], rows[-1]["action_gripper_position"]], dtype=np.float32
+        [*terminal["action_joint_position"], terminal["action_gripper_position"]], dtype=np.float32
     )
     actions = measured[nearest]
     actions[target_ns > sample_ns[-1]] = final_action
@@ -76,9 +77,10 @@ class MultirateFrankaDataset:
         self.action_horizon = action_horizon
         self.episode_bounds = {}
         self.episode_actions = {}
-        for episode in range(dataset.meta.total_episodes):
-            start = int(dataset.episode_data_index["from"][episode])
-            end = int(dataset.episode_data_index["to"][episode])
+        for row in dataset.meta.episodes:
+            episode = int(row["episode_index"])
+            start = int(row["dataset_from_index"])
+            end = int(row["dataset_to_index"])
             self.episode_bounds[episode] = (start, end)
             self.episode_actions[episode] = aligned_episode_actions(
                 Path(dataset.root), episode, end - start, action_horizon
@@ -91,5 +93,7 @@ class MultirateFrankaDataset:
         item = self.dataset[index]
         episode = int(item["episode_index"])
         start, end = self.episode_bounds[episode]
-        item["actions"] = self.episode_actions[episode][index - start]
+        actions = self.episode_actions[episode][index - start]
+        item["action.joint_position"] = actions[..., :7]
+        item["action.gripper_position"] = actions[..., 7:]
         return item

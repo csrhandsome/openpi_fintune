@@ -1,46 +1,55 @@
-# Franka ROS 30 Hz training
+# Franka Panda 30 Hz training
 
-The ROS collector stores both `ee_pose` and `joint_position` observations in
-every LeRobot frame. Its `dataset.action_space` YAML setting chooses `actions`:
+The training/server environment uses Python 3.12 and `lerobot[dataset]==0.6.1`,
+matching the collector's v3.0 Parquet dataset format. Install with `uv sync --locked`.
+Both training and the normal policy server default to `pi0_base_ee_ros_30hz`.
 
-| `action_space` | LeRobot `actions` | Training config |
-| --- | --- | --- |
-| `ee` | `[x, y, z, roll, pitch, yaw, gripper_open]` (7D) | `pi0_base_ee_ros_30hz` |
-| `joint` | `[joint1, ..., joint7, gripper_open]` (8D) | `pi0_base_joint_ros_30hz` |
+The collector uses the observation/action fields in `data_collect/config/dataset/panda.yaml`.
+LeRobot disallows slashes in feature names, so dataset columns and Panda server requests
+use `observation.exterior_image`, `observation.wrist_image_left`, `observation.joint_position`,
+`observation.ee_pose`, `observation.ee_position`, `observation.gripper_position` and optional
+`observation.gripper_image_left` / `observation.gripper_image_right`.
 
-XYZ is in metres in the robot base frame. Roll, pitch and yaw are ZYX Euler
-angles in radians. Gripper is a logical 0/1 open state. Each frame's `actions`
-is the measured arm and gripper state at the next fresh camera pair, or the
-final measured state at the end of an episode. The first action in a training
-chunk therefore targets one 30 Hz step after the observation. The LeRobot
-loader reads `actions` directly with offsets 0 through 15. The 100 Hz
-`episode_XXXXXX.actions.jsonl` trace is retained for diagnostics and is not
-used by these training configs.
+The collector stores `action.joint_position[7]`, `action.ee_pose[6]` and
+`action.gripper_position[1]` separately. `pi0_rlt` and `pi0_base_ee_ros_30hz`
+read pose/gripper targets. The input transforms concatenate those targets
+into the model's internal 7D `actions`. No dataset YAML is loaded in this repository.
+XYZ uses metres and ZYX roll/pitch/yaw uses radians; gripper ratio is continuous, 0 closed and 1 open.
+Each row targets the next fresh camera observation; the terminal row uses the final measured state.
+The sync sidecar declares `action_semantics: next_camera_observation_measured_state`.
+An explicit `action_target_offset_frames: 1` is also accepted; other offsets are rejected.
 
-Run from this repository in the GPU environment with the collector's `data/`
-directory and the complete LeRobot repo id, including its date suffix:
+Create a new dataset date/root for the new columns. Old flat-column datasets require conversion.
+The 100 Hz action trace remains available for optional multirate alignment.
+
+Use the complete repo ID, including the collector's date suffix. Like the collector,
+the loader uses `<dataset home>/<repo ID basename>` without an organization directory.
+The default home is the sibling `data_collect/data/dataset` directory, resolved from
+the source location rather than the current working directory. `HF_LEROBOT_HOME`
+overrides that home; `OPENPI_DATASET_ROOT` overrides the complete dataset path.
+Existing nested `<home>/<org>/<dataset>` directories remain a fallback when no flat
+dataset exists. Task prompts are read from
+`meta/tasks.parquet`, and episode boundaries from the v3 episode metadata.
+
+Set `OPENPI_PYTORCH_WEIGHT_PATH` to an RLinf-layout Pi0 checkpoint. Run normalization
+and training with the same EE config:
 
 ```bash
-bash scripts/train_franka_ros_30hz.sh \
-  /data/codes/grade_two/my_projects/franka_control_ros2/data \
-  openpi/franka_lerobot_test \
-  ros_30hz
+# Defaults already select ../data_collect/data/dataset/franka_lerobot_test_100hz.
+# Set HF_LEROBOT_HOME and FRANKA_ROS_DATASET_REPO_ID for another dataset.
+export OPENPI_PYTORCH_WEIGHT_PATH=/path/to/model.safetensors
+uv run scripts/compute_norm_stats.py --config-name pi0_base_ee_ros_30hz
+uv run scripts/train.py --exp-name ros_30hz --num-workers 4
 ```
 
-The script checks the 30 Hz data and all episode timing metadata, chooses the
-EE or joint configuration from the action dimension, computes normalization
-statistics, and trains. Use a new dataset repo id/date after changing the
-action space or the frame action timing. Old recordings without
-`action_target_offset_frames: 1` cannot use this direct-action training path.
+For offline RL-token readout training, use `pi0_rlt` with an existing EE checkpoint
+as documented in `force_rlt_pytorch.md`. To train its VLA first, select the same
+`pi0_rlt` config for both normalization and `scripts/train.py`.
+The normal configs read the next-frame labels at 30 Hz.
 
-Serve an EE checkpoint for the ROS `inference.py` client:
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi0_base_ee_ros_30hz \
-  --policy.dir=checkpoints/pi0_base_ee_ros_30hz/ros_30hz/<step> \
-  --port=8001
-```
-
-The plain ROS inference client expects EE metadata and 7D actions. A joint
-checkpoint needs a separate joint action executor.
+Serve the latest EE checkpoint with `uv run scripts/serve_policy.py --port 8001`.
+Set `OPENPI_SERVER_CONFIG` and `OPENPI_SERVER_CHECKPOINT_DIR` to select another config
+and checkpoint. The EE server returns `actions[16,7]`: absolute base-frame pose
+and gripper ratio, with metadata `action_space=ee`, `action_fps=30`, `action_horizon=16`.
+The client must use the same action space, fps and horizon. The B/C actor server
+has its own joint-target protocol; see `force_rlt_pytorch.md`.

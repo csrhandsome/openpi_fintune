@@ -12,8 +12,8 @@
 
 | 现有代码 | 查到的接口/限制 | 迁移决定 |
 | --- | --- | --- |
-| `src/openpi/models/pi0.py`、`src/openpi/training/config.py` | 当前普通 Pi0 没有 `extract_prefix_embeddings` 等 RLT 接口；`pi0_base_joint_ros_30hz` 是 16 步、30 Hz、模型 32 维填充的 Franka 配置。 | 以**不读取指内图像**的 Pi0 checkpoint 为主实验 VLA 候选，先核对实际 checkpoint、相机输入、成功接近率和归一化资产。必要时训练仅用指定外部视角的 VLA；所有组冻结同一 checkpoint。 |
-| `src/openpi/models/pi0_force.py`、`src/openpi/policies/forcevla_policy.py` | 已有指内图像的 CBAM + GRU + MoE 融合，直接影响 VLA 动作；没有所要求的独立 ResNet 接触分支。 | **不作为 B/C 主对照底座**，否则 B 仍有指内信息或删输入会改动 VLA。保留为以后独立的端到端视觉接触模型比较。 |
+| `src/openpi/models/pi0.py`、`src/openpi/training/config.py` | 当前普通 Pi0 没有 `extract_prefix_embeddings` 等 RLT 接口；`pi0_rlt` 是 EE 动作空间的 Franka 配置（16 步、30 Hz、物理 7D 位姿/夹爪、模型填充 32D）；下述关节 actor 链路仍需 EE→关节参考适配。 | 以**不读取指内图像**的 Pi0 checkpoint 为主实验 VLA 候选，先核对实际 checkpoint、相机输入、成功接近率和归一化资产。必要时训练仅用指定外部视角的 VLA；所有组冻结同一 checkpoint。 |
+| 旧 JAX ForceVLA（已移除） | 原指内图像 CBAM + GRU + MoE 融合直接影响 VLA 动作，没有独立 ResNet 接触分支。 | 当前使用 PyTorch Pi0 底座和独立接触 actor。 |
 | `vla-scripts/realworld/franka_joint_main_rtc.py` | 现接入外部/腕部相机与关节/夹爪状态，输出前 7 维绝对关节目标及第 8 维夹爪命令，按 30 Hz 执行；没有指内相机接入、自动接触交接和回合奖励。`max_joint_delta=0`、`joint_velocity_limit=0` 默认代表未启用相应软件限制。 | 复用其相机请求、RTC 与 Franka 控制经验；新增接触控制器、双指相机采集、时间戳、硬联锁和日志。在线 RL 前把全部限制配置成经过空载验证的**非零物理值**。 |
 | `../openpi-RLT/src/openpi/models/rl_token.py`、`scripts/train_rlt.py`、`scripts/serve_rlt_policy.py` | readout 对 VLA 的 post-transformer prefix 做交叉注意力压缩与重建；服务返回 `z_rl`、`proprio`、`ref_chunk`。服务中 `PROPRIO_DIM=7`、`CHUNK_LEN=50`、`ACTION_DIM=7` 为硬编码。 | 移植模型/训练逻辑，服务输出长度和维度改从选定 checkpoint/运行配置推导；单独保存 readout，并校验 VLA hash 与 token 形状。 |
 | `../openpi-RLT/rlt_online_rl/src/rlt_online_rl/{networks,trainer,replay,inference,action_representation,config}.py` | JAX 固定方差 chunk actor、twin critic、target 网络、BC/Q/参考平滑正则、回放和 actor 服务；仅处理 `z_rl, proprio, ref_chunk`，没有双指观测。原动作表示和关节平滑项针对另一台机器人。 | 有选择地迁移算法核心与服务协议；所有 state/next-state、网络和 replay 加 `z_grip`，重写 Franka 动作适配与安全投影，不照搬 AgileX ROS 适配器及其物理参数。 |

@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pi0 model for PyTorch, aligned with JAX models/pi0.py.
-
-Flow-matching VLA: assembles Gemma / SigLIP / action expert and exposes the
-RLinf SFT ``forward(ForwardType.SFT, data=...)`` entry point. Task
-subclasses (eval / RL / DAgger / DSRL) inherit this module.
-"""
+"""RLinf's JAX-aligned Pi0/0.5 PyTorch network with OpenPI's call interface."""
 
 from __future__ import annotations
 
@@ -166,8 +161,8 @@ class PI0Pytorch(model.BaseModel):
             nn.init.zeros_(self.action_time_mlp_out.bias)
 
     def embed_prefix(
-        self, obs: model.Observation
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, obs: model.Observation, *, return_image_mask: bool = False
+    ) -> tuple[torch.Tensor, ...]:
         """Embed the prefix (images + language + optional point cloud).
 
         Returns:
@@ -178,6 +173,7 @@ class PI0Pytorch(model.BaseModel):
         tokens = []
         input_mask = []
         ar_mask = []
+        image_mask = []
 
         # Embed images through SigLIP in IMAGE_KEYS order (not dict iteration
         # order). Official OpenPI preprocess rebuilds cameras this way, then
@@ -194,6 +190,7 @@ class PI0Pytorch(model.BaseModel):
                     obs.image_masks[name], "b -> b s", s=image_tokens.shape[1]
                 )
             )
+            image_mask.append(input_mask[-1])
             ar_mask += [False] * image_tokens.shape[1]
 
         # Add language tokens
@@ -225,6 +222,9 @@ class PI0Pytorch(model.BaseModel):
         tokens = torch.cat(tokens, dim=1)
         input_mask = torch.cat(input_mask, dim=1)
         ar_mask = torch.tensor(ar_mask, device=tokens.device)
+        if return_image_mask:
+            # The image segment is contiguous and precedes language/point-cloud tokens.
+            return tokens, input_mask, ar_mask, torch.cat(image_mask, dim=1)
         return tokens, input_mask, ar_mask
 
     def embed_suffix(
@@ -328,6 +328,7 @@ class PI0Pytorch(model.BaseModel):
         Returns:
             loss: (B, action_horizon, action_dim) per-element MSE
         """
+        observation = model.Observation.from_observation_like(observation)
         B = actions.shape[0]
         device = actions.device
 
@@ -385,8 +386,8 @@ class PI0Pytorch(model.BaseModel):
         return torch.square(v_t - u_t)
 
     def build_prefix_cache(
-        self, observation: model.Observation
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple]:
+        self, observation: model.Observation, *, return_image_mask: bool = False
+    ) -> tuple[torch.Tensor, ...]:
         """Embed prefix tokens and run one LLM pass to build the KV cache.
 
         The caller is responsible for preprocessing the observation (image
@@ -399,7 +400,12 @@ class PI0Pytorch(model.BaseModel):
             prefix_mask: (B, prefix_len) bool mask of valid prefix positions.
             kv_cache:    per-layer KV cache to feed into subsequent suffix passes.
         """
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        if return_image_mask:
+            prefix_tokens, prefix_mask, prefix_ar_mask, image_mask = self.embed_prefix(
+                observation, return_image_mask=True
+            )
+        else:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = torch.cumsum(prefix_mask.int(), dim=1) - 1
         outputs, kv_cache = self.llm(
@@ -407,7 +413,20 @@ class PI0Pytorch(model.BaseModel):
             positions=positions,
             mask=prefix_attn_mask,
         )
+        if return_image_mask:
+            return outputs[0], prefix_mask, kv_cache, image_mask
         return outputs[0], prefix_mask, kv_cache
+
+    def extract_prefix_embeddings(
+        self, observation: model.Observation, *, image_only: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Post-transformer prefix states and valid-token mask for a frozen readout."""
+        observation = model.Observation.from_observation_like(observation)
+        observation = model.preprocess_observation(observation, train=False)
+        prefix, mask, _, image_mask = self.build_prefix_cache(observation, return_image_mask=True)
+        if image_only:
+            return prefix[:, : image_mask.shape[1]], image_mask
+        return prefix, mask
 
     def run_suffix(
         self,
@@ -514,9 +533,9 @@ class PI0Pytorch(model.BaseModel):
         Returns:
             actions: (B, action_horizon, action_dim)
         """
+        observation = model.Observation.from_observation_like(observation)
         observation = model.preprocess_observation(observation, train=False)
 
-        dt = -1.0 / num_steps
         B = observation.state.shape[0]
         device = observation.state.device
 
@@ -526,6 +545,39 @@ class PI0Pytorch(model.BaseModel):
             )
 
         _, prefix_mask, kv_cache = self.build_prefix_cache(observation)
+
+        return self._sample_actions_from_cache(observation, noise, kv_cache, prefix_mask, num_steps)
+
+    def sample_actions_with_prefix(
+        self,
+        observation: model.Observation,
+        *,
+        num_steps: int = 10,
+        noise: torch.Tensor | None = None,
+        rng: torch.Generator | None = None,
+        image_only: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return actions and readout input from the same preprocessed observation/cache."""
+        observation = model.Observation.from_observation_like(observation)
+        observation = model.preprocess_observation(observation, train=False)
+        batch = observation.state.shape[0]
+        if noise is None:
+            noise = torch.randn(
+                batch, self.action_horizon, self.action_dim,
+                device=observation.state.device, generator=rng,
+            )
+        prefix, mask, cache, image_mask = self.build_prefix_cache(observation, return_image_mask=True)
+        actions = self._sample_actions_from_cache(observation, noise, cache, mask, num_steps)
+        if image_only:
+            return actions, prefix[:, : image_mask.shape[1]], image_mask
+        return actions, prefix, mask
+
+    def _sample_actions_from_cache(self, observation, noise, kv_cache, prefix_mask, num_steps):
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
+        dt = -1.0 / num_steps
+        B = observation.state.shape[0]
+        device = observation.state.device
 
         x_t = noise
         t = 1.0
@@ -554,6 +606,32 @@ class PI0Pytorch(model.BaseModel):
     def is_gradient_checkpointing_enabled(self):
         return self.llm.gradient_checkpointing and self.img.encoder.gradient_checkpointing
 
+    def apply_lora_freeze(self):
+        """Match OpenPI's LoRA freeze filter for the two Gemma experts."""
+        freeze_pali = "lora" in self._config.paligemma_variant
+        freeze_expert = "lora" in self._config.action_expert_variant
+        if not (freeze_pali or freeze_expert):
+            return
+
+        for name, parameter in self.llm.named_parameters():
+            if "lora" in name:
+                continue
+            parts = name.split(".")
+            if parts[0] == "embedder":
+                parameter.requires_grad_(not freeze_pali)
+                continue
+            if parts[0] == "final_norms":
+                expert = int(parts[1])
+            elif parts[0] == "layers" and parts[2] == "attn":
+                expert = int(parts[4])
+            elif parts[0] == "layers":
+                expert = int(parts[3])
+            else:
+                raise ValueError(f"Unrecognized Gemma parameter: {name}")
+            parameter.requires_grad_(not (freeze_pali if expert == 0 else freeze_expert))
+
     def forward(self, observation, actions, *, train=True, rng=None):
+        # RLinf's SFT path disables activation checkpointing for this forward.
+        self.gradient_checkpointing_disable()
         observation = model.Observation.from_observation_like(observation)
         return self.compute_loss(observation, actions, train=train, rng=rng)

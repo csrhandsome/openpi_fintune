@@ -1,9 +1,28 @@
 from openpi_client import action_chunk_broker
+import numpy as np
 import pytest
+import torch
 
 from openpi.policies import aloha_policy
+from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
+
+
+def test_pytorch_policy_calls_sampling_with_observation():
+    class TorchModel(torch.nn.Module):
+        def sample_actions(self, observation):
+            assert isinstance(observation.state, torch.Tensor)
+            return torch.zeros(1, 2, 32)
+
+    policy = _policy.Policy(TorchModel(), is_pytorch=True, pytorch_device="cpu")
+    obs = {
+        "image": {},
+        "image_mask": {},
+        "state": np.zeros(32, dtype=np.float32),
+    }
+    result = policy.infer(obs)
+    assert result["actions"].shape == (2, 32)
 
 
 @pytest.mark.manual

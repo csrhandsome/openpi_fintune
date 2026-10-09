@@ -77,6 +77,7 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._rl_readout = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -89,6 +90,8 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        if self._rl_readout is not None and ("monotonic_ts" not in obs or "O_T_TCP" not in obs):
+            raise ValueError("RL-token requests require client monotonic_ts and measured O_T_TCP")
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         rtc_action_prefix = _first_present_flat(inputs, _RTC_ACTION_PREFIX_KEYS)
@@ -126,10 +129,20 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        if self._is_pytorch_model:
+            with torch.no_grad():
+                if self._rl_readout is None:
+                    actions = self._sample_actions(observation, **sample_kwargs)
+                else:
+                    actions, prefix, prefix_mask = self._model.sample_actions_with_prefix(
+                        observation, **sample_kwargs
+                    )
+                    if list(prefix.shape[1:]) != self._metadata["prefix_shape"]:
+                        raise ValueError("Readout prefix shape differs from training protocol")
+                    rl_tokens = self._rl_readout.encode(prefix, prefix_mask)
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        outputs = {"state": inputs["state"], "actions": actions}
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
@@ -137,10 +150,44 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if self._rl_readout is not None:
+            physical_actions = np.asarray(outputs["actions"])
+            action_space = self._metadata.get("action_space", "joint")
+            if action_space not in ("ee", "joint"):
+                raise ValueError(f"Unsupported RL-token action space: {action_space}")
+            physical_action_dim = 7 if action_space == "ee" else 8
+            if physical_actions.ndim != 2 or physical_actions.shape[1] != physical_action_dim:
+                raise ValueError(f"Physical VLA {action_space} actions must have shape [H,{physical_action_dim}]")
+            outputs["z_rlt"] = rl_tokens[0].detach().float().cpu().numpy().reshape(-1)
+            if action_space == "joint":
+                outputs["ref_q"] = physical_actions[:, :7].copy()
+            outputs["ref_chunk"] = physical_actions.copy()
+            outputs["ref_obs_ts"] = obs.get("monotonic_ts")
+            # Wall-clock timestamp is for logging. Age checks use the client's
+            # echoed monotonic observation timestamp, never a remote clock.
+            outputs["ref_generation_ts"] = time.time()
+            outputs["ref_anchor_TCP"] = obs.get("O_T_TCP")
+            for key in ("episode_id", "step_id", "external_frame_id"):
+                if key in obs:
+                    outputs[key] = obs[key]
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def attach_rl_readout(self, readout, *, metadata: dict[str, Any]) -> None:
+        """Enable shared-prefix RL-token inference for a frozen PyTorch Pi0."""
+        if not self._is_pytorch_model:
+            raise TypeError("RL-token readout requires a PyTorch Pi0 policy")
+        if readout.config.input_dim != self._model.llm.configs[0].width:
+            raise ValueError("Readout input dimension does not match VLA prefix width")
+        self._rl_readout = readout.to(self._pytorch_device).eval()
+        self._model.eval()
+        for parameter in self._model.parameters():
+            parameter.requires_grad = False
+        for parameter in self._rl_readout.parameters():
+            parameter.requires_grad = False
+        self._metadata.update(metadata)
 
     @property
     def metadata(self) -> dict[str, Any]:

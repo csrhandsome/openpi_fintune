@@ -5,10 +5,9 @@ import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
-from datasets.features import features as hf_features
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -16,18 +15,10 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 from openpi.training.franka_multirate import MultirateFrankaDataset
+from openpi.training.lerobot_utils import resolve_dataset_root
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
-
-
-def _ensure_legacy_list_feature() -> None:
-    # HF Datasets <3.0 stored fixed-size sequences with the "List" feature type.
-    if "List" not in hf_features._FEATURE_TYPES:
-        hf_features._FEATURE_TYPES["List"] = hf_features.Sequence
-
-
-_ensure_legacy_list_feature()
 
 
 class Dataset(Protocol[T_co]):
@@ -148,7 +139,8 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    root = resolve_dataset_root(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     if data_config.align_franka_action_trace and not np.isclose(dataset_meta.fps, 30.0, atol=0.01):
         raise ValueError(f"ROS multirate training requires a 30 Hz LeRobot dataset, got {dataset_meta.fps} Hz")
     delta_timestamps = (
@@ -164,6 +156,7 @@ def create_torch_dataset(
     )
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=dataset_meta.root,
         delta_timestamps=delta_timestamps or None,
     )
 
@@ -171,7 +164,8 @@ def create_torch_dataset(
         dataset = MultirateFrankaDataset(dataset, action_horizon)
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        tasks = {int(index): str(task) for task, index in dataset_meta.tasks["task_index"].items()}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks)])
 
     return dataset
 
@@ -389,8 +383,8 @@ def create_rlds_data_loader(
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
     """
-    if framework == "pytorch":
-        raise NotImplementedError("PyTorch RLDS data loader is not supported yet")
+    if framework == "pytorch" and torch.distributed.is_initialized():
+        raise NotImplementedError("Distributed PyTorch RLDS loading requires dataset sharding")
     dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
@@ -398,6 +392,7 @@ def create_rlds_data_loader(
         dataset,
         sharding=sharding,
         num_batches=num_batches,
+        framework=framework,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -434,7 +429,7 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
+        if framework == "jax" and jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
@@ -520,14 +515,16 @@ class RLDSDataLoader:
         *,
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
+        framework: str = "jax",
     ):
         self._dataset = dataset
         self._num_batches = num_batches
+        self._framework = framework
 
-        if jax.process_count() > 1:
+        if framework == "jax" and jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if sharding is None:
+        if sharding is None and framework == "jax":
             # Use data parallel sharding by default.
             sharding = jax.sharding.NamedSharding(
                 jax.sharding.Mesh(jax.devices(), ("B",)),
@@ -549,7 +546,10 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                if self._framework == "pytorch":
+                    yield jax.tree.map(torch.as_tensor, batch)
+                else:
+                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
 class DataLoaderImpl(DataLoader):

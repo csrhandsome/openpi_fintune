@@ -7,6 +7,7 @@ import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 from openpi.policies.droid_policy import _parse_image
+from openpi.policies.panda_policy import with_panda_actions
 
 
 def _wrap_radians(angles: np.ndarray) -> np.ndarray:
@@ -18,12 +19,13 @@ class FrankaEEInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
+        data = with_panda_actions(data, "ee_pose")
         if self.model_type not in (_model.ModelType.PI0, _model.ModelType.PI05):
             raise ValueError(f"Unsupported Franka EE model type: {self.model_type}")
-        ee_pose = np.asarray(data["observation/ee_pose"], dtype=np.float32).reshape(6)
-        gripper = np.asarray(data["observation/gripper_position"], dtype=np.float32).reshape(1)
-        base_image = _parse_image(data["observation/exterior_image_1_left"])
-        wrist_image = _parse_image(data["observation/wrist_image_left"])
+        ee_pose = np.asarray(data["observation.ee_pose"], dtype=np.float32).reshape(6)
+        gripper = np.asarray(data["observation.gripper_position"], dtype=np.float32).reshape(1)
+        base_image = _parse_image(data["observation.exterior_image"])
+        wrist_image = _parse_image(data["observation.wrist_image_left"])
         result = {
             "state": np.concatenate([ee_pose, gripper]),
             "image": {

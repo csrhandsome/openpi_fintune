@@ -130,12 +130,11 @@ TrainConfig(
             prompt_from_task=True,
         ),
     ),
-    # Load the pi0 base model checkpoint.
-    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    # Pass the RLinf-layout PyTorch base checkpoint with --pytorch-weight-path.
+    requires_pytorch_weights=True,
     num_train_steps=30_000,
 )
 ```
-
 
 
 

@@ -7,45 +7,30 @@ import difflib
 import logging
 import os
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias
+import sys
+from typing import Any, Literal, Protocol, override
 
 import etils.epath as epath
-import flax.nnx as nnx
-from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
-import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.franka_ee_policy as franka_ee_policy
-import openpi.policies.forcevla_policy as forcevla_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.panda_policy as panda_policy
 import openpi.shared.download as _download
-import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
-import openpi.training.optimizer as _optimizer
-import openpi.training.weight_loaders as weight_loaders
+import openpi.training.optimizer_pytorch as _optimizer
 import openpi.transforms as _transforms
 
-ModelType: TypeAlias = _model.ModelType
-# Work around a tyro issue with using nnx.filterlib.Filter directly.
-Filter: TypeAlias = nnx.filterlib.Filter
-
-
-def _freeze_except_trainable(*patterns: str) -> Filter:
-    if not patterns:
-        return nnx.All(nnx.Param)
-    return nnx.All(
-        nnx.Param,
-        nnx.Not(nnx.Any(*(nnx_utils.PathRegex(pattern) for pattern in patterns))),
-    )
+ModelType = _model.ModelType
 
 
 @dataclasses.dataclass(frozen=True)
@@ -485,8 +470,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 @dataclasses.dataclass(frozen=True)
 class LeRobotFrankaJointDataConfig(DataConfigFactory):
     """
-    Config for custom DROID dataset in LeRobot format where ``actions`` stores
-    absolute joint position targets plus an absolute gripper command.
+    Panda LeRobot data with split absolute joint and gripper action targets.
     """
 
     align_action_trace: bool = False
@@ -497,21 +481,21 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
+                        "observation.exterior_image": "observation.exterior_image",
+                        "observation.wrist_image_left": "observation.wrist_image_left",
+                        "observation.joint_position": "observation.joint_position",
+                        "observation.gripper_position": "observation.gripper_position",
+                        "action.joint_position": "action.joint_position",
+                        "action.gripper_position": "action.gripper_position",
+                        "prompt": "prompt",
                         "episode_index": "episode_index",
                         "frame_index": "frame_index",
-                        "actions": "actions",
-                        "prompt": "prompt",
                     }
                 )
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[panda_policy.PandaJointInputs(model_type=model_config.model_type)],
             outputs=[droid_policy.DroidOutputs()],
         )
         # Joint targets are stored as absolute positions, so convert the first 7
@@ -528,6 +512,7 @@ class LeRobotFrankaJointDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
+            action_sequence_keys=("action.joint_position", "action.gripper_position"),
             model_transforms=model_transforms,
             align_franka_action_trace=self.align_action_trace,
         )
@@ -543,11 +528,12 @@ class LeRobotFrankaEEDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/ee_pose": "ee_pose",
-                        "observation/gripper_position": "gripper_position",
-                        "actions": "actions",
+                        "observation.exterior_image": "observation.exterior_image",
+                        "observation.wrist_image_left": "observation.wrist_image_left",
+                        "observation.ee_pose": "observation.ee_pose",
+                        "observation.gripper_position": "observation.gripper_position",
+                        "action.ee_pose": "action.ee_pose",
+                        "action.gripper_position": "action.gripper_position",
                         "prompt": "prompt",
                     }
                 )
@@ -564,72 +550,8 @@ class LeRobotFrankaEEDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
+            action_sequence_keys=("action.ee_pose", "action.gripper_position"),
             model_transforms=ModelTransformFactory()(model_config),
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotForcevlaDataConfig(DataConfigFactory):
-    """
-    This config is used to configure transforms that are applied at various parts of the data pipeline.
-    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
-    comments below.
-    """
-
-    # Load action chunks from LeRobot and attach temporal gripper history separately.
-    action_sequence_keys: Sequence[str] = ("actions",)
-    force_history: int = 4
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.force_history <= 0:
-            raise ValueError("force_history must be > 0")
-
-        force_history_indices = tuple(range(-(self.force_history - 1), 1))
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/gripper_image_left": "gripper_image_left",
-                        "observation/gripper_image_right": "gripper_image_right",
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-        data_transforms = _transforms.Group(
-            inputs=[
-                forcevla_policy.Forcevla_inputs(
-                    action_dim=model_config.action_dim,
-                    model_type=model_config.model_type,
-                )
-            ],
-            outputs=[forcevla_policy.Forcevla_outputs()],
-        )
-        # Joint targets are stored as absolute joint positions and an absolute gripper command.
-        delta_action_mask = _transforms.make_bool_mask(7, -1)
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
-            delta_indices={
-                "gripper_image_left": force_history_indices,
-                "gripper_image_right": force_history_indices,
-            },
         )
 
 
@@ -647,21 +569,17 @@ class TrainConfig:
     # define additional attributes.
     model: _model.BaseModelConfig = dataclasses.field(default_factory=pi0_config.Pi0Config)
 
-    # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
-    weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
-
-    # Optional path to a PyTorch checkpoint to load weights from.
-    pytorch_weight_path: str | None = None
+    # RLinf-layout model.safetensors checkpoint. Supply through the CLI for fine-tuning configs.
+    pytorch_weight_path: str | None = dataclasses.field(
+        default_factory=lambda: os.environ.get("OPENPI_PYTORCH_WEIGHT_PATH")
+    )
+    requires_pytorch_weights: tyro.conf.Suppress[bool] = False
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
-    lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
-    optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
-    ema_decay: float | None = 0.99
-
-    # Specifies which weights should be frozen.
-    freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+    lr_schedule: _optimizer.CosineDecaySchedule = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
+    optimizer: _optimizer.AdamW = dataclasses.field(default_factory=_optimizer.AdamW)
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -699,12 +617,6 @@ class TrainConfig:
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
-    # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
-    # device memory will be reduced but training could potentially be slower.
-    # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
-    # data parallel between 2 groups of devices.
-    fsdp_devices: int = 1
-
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -716,11 +628,6 @@ class TrainConfig:
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
-
-    @property
-    def trainable_filter(self) -> nnx.filterlib.Filter:
-        """Get the filter for the trainable parameters."""
-        return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
 
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
@@ -839,9 +746,8 @@ _CONFIGS = [
             ),
             extra_delta_transform=True,
         ),
-        # Here you define which pre-trained checkpoint you want to load to initialize the model.
-        # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # Fine-tuning requires an RLinf-layout Pi0 PyTorch checkpoint at --pytorch-weight-path.
+        requires_pytorch_weights=True,
         # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
         # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
@@ -855,17 +761,8 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=30_000,
-        # The freeze filter defines which parameters should be frozen during training.
-        # We have a convenience function in the model config that returns the default freeze filter
-        # for the given model config for LoRA finetuning. Just make sure it matches the model config
-        # you chose above.
-        freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_fast_libero",
@@ -885,8 +782,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        # Note that we load the pi0-FAST base model checkpoint here.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -904,18 +800,8 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=30_000,
-        # Again, make sure to match the model config above when extracting the freeze filter
-        # that specifies which parameters should be frozen during LoRA finetuning.
-        freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7,
-            action_horizon=10,
-            max_token_len=180,
-            paligemma_variant="gemma_2b_lora",
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
     ),
     TrainConfig(
         name="pi05_libero",
@@ -933,9 +819,7 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        requires_pytorch_weights=True,
         num_train_steps=30_000,
     ),
     #
@@ -969,7 +853,7 @@ _CONFIGS = [
                 ]
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=20_000,
     ),
     TrainConfig(
@@ -998,7 +882,7 @@ _CONFIGS = [
                 ]
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=20_000,
         batch_size=64,
     ),
@@ -1021,7 +905,7 @@ _CONFIGS = [
             rlds_data_dir="<path_to_droid_rlds_dataset>",
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        requires_pytorch_weights=True,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -1055,7 +939,7 @@ _CONFIGS = [
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        requires_pytorch_weights=True,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -1089,7 +973,7 @@ _CONFIGS = [
                 asset_id="droid",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        requires_pytorch_weights=True,
         num_train_steps=20_000,
         batch_size=32,
     ),
@@ -1113,18 +997,10 @@ _CONFIGS = [
                 asset_id="franka_droid_lerobot_20260130_161202",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        requires_pytorch_weights=True,
         num_train_steps=10_000,
         batch_size=6,
         save_interval=500,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
     ),
     TrainConfig(
         # LoRA fine-tuning for Pi0 (full model) on custom DROID-style LeRobot dataset.
@@ -1146,18 +1022,10 @@ _CONFIGS = [
                 asset_id="franka_droid_lerobot_20260130_161202",
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_droid/params"),
+        requires_pytorch_weights=True,
         num_train_steps=5_000,
         batch_size=5,  # Reduced batch size for larger pi0 model
         save_interval=1000,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=False,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
     ),
     TrainConfig(
         # LoRA fine-tuning for Pi0-base on a custom DROID-style LeRobot dataset
@@ -1181,25 +1049,17 @@ _CONFIGS = [
                 asset_id="franka_lerobot_6_19_audio",  # 这里为之前compute的产物的地址
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=30_000,
         batch_size=5,
         save_interval=1000,
         # 这个是真正的保存的间隔
         # keep_period=1000,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=False,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
     ),
     TrainConfig(
-        # ROS collector: 100 Hz robot/VR trace aligned to 30 Hz camera frames.
-        # Set HF_LEROBOT_HOME to the collector's data/ directory when training locally.
-        name="pi0_base_joint_ros_30hz",
+        # EE VLA configuration used by offline RL-token readout training.
+        # Local datasets default to the sibling data_collect/data/dataset directory.
+        name="pi0_rlt",
         model=pi0_config.Pi0Config(
             pi05=False,
             action_dim=32,
@@ -1207,23 +1067,16 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
-        data=LeRobotFrankaJointDataConfig(
-            repo_id=os.environ.get("FRANKA_ROS_DATASET_REPO_ID", "openpi/franka_lerobot_test"),
+        data=LeRobotFrankaEEDataConfig(
+            repo_id=os.environ.get("FRANKA_ROS_DATASET_REPO_ID", "openpi/franka_lerobot_test_100hz"),
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        requires_pytorch_weights=True,
+        exp_name="ros_30hz",
         num_train_steps=30_000,
         batch_size=5,
         save_interval=1000,
-        policy_metadata={"action_fps": 30.0, "action_horizon": 16, "action_space": "joint", "action_dim": 8},
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=False,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
+        policy_metadata={"action_fps": 30.0, "action_horizon": 16, "action_space": "ee", "action_dim": 7},
     ),
     TrainConfig(
         name="pi0_base_ee_ros_30hz",
@@ -1235,38 +1088,15 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotFrankaEEDataConfig(
-            repo_id=os.environ.get("FRANKA_ROS_DATASET_REPO_ID", "openpi/franka_lerobot_test"),
+            repo_id=os.environ.get("FRANKA_ROS_DATASET_REPO_ID", "openpi/franka_lerobot_test_100hz"),
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        requires_pytorch_weights=True,
+        exp_name="ros_30hz",
         num_train_steps=30_000,
         batch_size=5,
         save_interval=1000,
         policy_metadata={"action_fps": 30.0, "action_horizon": 16, "action_space": "ee", "action_dim": 7},
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=False,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # TODO:之后要添加的力的config
-    TrainConfig(
-        name="pi0_base_forcevla_joint_lora",
-        model=pi0_force.Pi0_GuidanceConfig(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotForcevlaDataConfig(
-            repo_id="flexiv_peel_cucumber_inputForce",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=50_000,
-        freeze_filter=pi0_force.Pi0_GuidanceConfig(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        ema_decay=None,
-        batch_size=4,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
@@ -1279,7 +1109,7 @@ _CONFIGS = [
             default_prompt="Transfer cube",
             use_delta_joint_actions=False,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        requires_pytorch_weights=True,
         num_train_steps=20_000,
     ),
     #
@@ -1301,7 +1131,7 @@ _CONFIGS = [
         data=FakeDataConfig(),
         batch_size=2,
         model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
+        requires_pytorch_weights=True,
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
@@ -1325,10 +1155,18 @@ _CONFIGS = [
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
+_TORCH_TRAIN_CONFIGS_DICT = {
+    name: config for name, config in _CONFIGS_DICT.items() if type(config.model) is pi0_config.Pi0Config
+}
+DEFAULT_TRAIN_CONFIG = "pi0_base_ee_ros_30hz"
 
 
-def cli() -> TrainConfig:
-    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _CONFIGS_DICT.items()})
+def cli(args: Sequence[str] | None = None) -> TrainConfig:
+    """Select a PyTorch training config; default to the Franka EE config."""
+    args = list(sys.argv[1:] if args is None else args)
+    if not args or args[0].startswith("-"):
+        args.insert(0, DEFAULT_TRAIN_CONFIG)
+    return tyro.extras.overridable_config_cli({k: (k, v) for k, v in _TORCH_TRAIN_CONFIGS_DICT.items()}, args=args)
 
 
 def get_config(config_name: str) -> TrainConfig:

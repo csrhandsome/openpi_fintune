@@ -8,8 +8,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.droid_policy as droid_policy
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.optimizer as _optimizer
-import openpi.training.weight_loaders as weight_loaders
+import openpi.training.optimizer_pytorch as _optimizer
 import openpi.transforms as _transforms
 
 ModelType: TypeAlias = _model.ModelType
@@ -51,9 +50,7 @@ def get_polaris_configs():
                 rlds_data_dir="<path_to_droid_rlds_dataset>",
                 action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(
-                "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/params"
-            ),
+            requires_pytorch_weights=True,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=5e-5,
@@ -96,9 +93,7 @@ def get_polaris_configs():
                 rlds_data_dir="<path_to_droid_rlds_dataset>",
                 action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(
-                "gs://openpi-assets/checkpoints/polaris/pi0_fast_droid_jointpos_polaris/params"
-            ),
+            requires_pytorch_weights=True,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=5e-5,
@@ -141,9 +136,7 @@ def get_polaris_configs():
                 rlds_data_dir="<path_to_droid_rlds_dataset>",
                 action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(
-                "gs://openpi-assets/checkpoints/polaris/pi0_droid_jointpos_polaris/params"
-            ),
+            requires_pytorch_weights=True,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=5e-5,
@@ -186,9 +179,7 @@ def get_polaris_configs():
                 rlds_data_dir="<path_to_droid_rlds_dataset>",
                 action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(
-                "gs://openpi-assets/checkpoints/polaris/pi0_droid_jointpos_100k_polaris/params"
-            ),
+            requires_pytorch_weights=True,
             lr_schedule=_optimizer.CosineDecaySchedule(
                 warmup_steps=1_000,
                 peak_lr=5e-5,

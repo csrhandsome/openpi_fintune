@@ -21,7 +21,7 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 
 ## Requirements
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. The PyTorch trainer supports data parallel training with `torchrun` on one or more nodes; its per-GPU memory use depends on the local batch size.
 
 | Mode               | Memory Required | Example GPU        |
 | ------------------ | --------------- | ------------------ |
@@ -32,6 +32,12 @@ To run the models in this repository, you will need an NVIDIA GPU with at least 
 The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
 
 ## Installation
+
+The model and training environment uses Python 3.12 and `lerobot[dataset]==0.6.1`
+with the v3.0 dataset format, matching `data_collect`. Run `uv sync --locked` after
+updating an existing checkout; the default Franka training and policy server use
+`pi0_base_ee_ros_30hz` (30 Hz, 16 steps, 7D pose/gripper actions). See
+[the Panda data and inference setup](docs/franka_ros_30hz.md).
 
 When cloning this repo, make sure to update submodules:
 
@@ -144,9 +150,9 @@ To fine-tune a base model on your own data, you need to define configs for data 
 
 - [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
 - [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
+- [`TrainConfig`](src/openpi/training/config.py): Defines PyTorch fine-tuning hyperparameters, data config, and checkpoint path.
 
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
+The PyTorch trainer uses [π₀ and π₀.₅ configs](src/openpi/training/config.py) on LIBERO data. The π₀-FAST configs remain available for inference.
 
 Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
 
@@ -154,13 +160,13 @@ Before we can run training, we need to compute the normalization statistics for 
 uv run scripts/compute_norm_stats.py --config-name pi05_libero
 ```
 
-Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
+Now we can kick off training with the following command. Fine-tuning configs require an RLinf-layout PyTorch checkpoint; the `--overwrite` flag replaces checkpoints from the same experiment:
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
+uv run scripts/train.py pi05_libero --exp-name=my_experiment --pytorch-weight-path=/path/to/model.safetensors --overwrite
 ```
 
-The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
+The command logs training progress and saves checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. Training currently supports π₀ and π₀.₅; π₀-FAST and the JAX force guidance model are not supported by this PyTorch trainer.
 
 **Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
 
@@ -189,54 +195,27 @@ We provide more examples for how to fine-tune and run inference with our models 
 
 ## PyTorch Support
 
-openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
+The π₀ and π₀.₅ PyTorch network is ported from RLinf's JAX-aligned implementation. The OpenPI data transforms, normalization, DDP trainer, and policy interface remain in use. Current limits are:
 
 - The π₀-FAST model
 - FP16 training is not supported; the PyTorch entrypoint uses bfloat16 or float32.
 - FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
 - EMA (exponential moving average) weights during training
 
-### Embodied-aligned PI0 training details
+### Training behavior
 
-The PyTorch PI0 path follows the embodied implementation for memory and numerical behavior:
+The model uses RLinf's direct SigLIP and dual-expert Gemma modules. The training loss is flow-matching MSE over the full network action horizon and padded action dimension. Existing Gemma LoRA variants train their low-rank parameters while the matching base Gemma weights are frozen.
 
-- The full policy is cast to the configured training dtype. RMSNorm statistics/modulation and attention softmax are computed in float32 where required; attention probabilities are cast back to the value dtype.
-- Joint attention explicitly computes q/k in float32, while the suffix hidden states and action projection remain in the model dtype. The flow-matching MSE casts both prediction and target to float32 before reduction.
-- Timesteps accept `[B]` or per-action `[B, H]`; the default batch timestep is expanded to `[B, H]`, which keeps RTC-compatible conditioning available.
-- Before DDP and optimizer construction, the trainer removes the action expert token embedding and `lm_head`, removes an optional `future_teacher`, and freezes the action expert last-layer norms, q/o projections, MLP projections, and final norm.
-- Floating-point batch tensors are moved to the selected training dtype while token ids and masks retain their integer/bool dtypes. TF32 is enabled on CUDA.
+The default precision uses bf16 for most Gemma and SigLIP weights, with fp32 vision stem, normalization, action projections, and flow-matching loss. The SFT path follows RLinf's checkpointing behavior. The launcher uses PyTorch DDP for multiple GPUs.
 
-The current launcher still uses PyTorch DDP; DeepSpeed/ZeRO is not required for this implementation.
+Set `pytorch_weight_path` to a base checkpoint in RLinf's layout before fine-tuning. It must contain `model.safetensors` with `llm.*`, `img.*`, and action projection keys. Dataset `norm_stats.json` is selected by the data config. A checkpoint produced by the old `examples/convert_jax_model_to_pytorch.py` has a different key layout and cannot initialize this model.
 
 ### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
-
-### Converting JAX Models to PyTorch
-
-To convert a JAX model checkpoint to PyTorch format:
-
-```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /path/to/jax/checkpoint \
-    --config_name <config name> \
-    --output_path /path/to/converted/pytorch/checkpoint
-```
+Install the project dependencies with `uv sync`. The RLinf-backed network does not require patching the installed Transformers package.
 
 ### Running Inference with PyTorch
 
-The PyTorch implementation uses the same API as the JAX version - you only need to change the checkpoint path to point to the converted PyTorch model:
+The policy API accepts an RLinf-layout PyTorch checkpoint directory:
 
 ```python
 from openpi.training import config as _config
@@ -267,32 +246,26 @@ uv run scripts/serve_policy.py policy:checkpoint \
 
 To finetune a model in PyTorch:
 
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
+1. Obtain base weights in RLinf's JAX-aligned PyTorch layout (`model.safetensors` with `llm.*` and `img.*` keys, such as `pi0_base_pytorch_new`). The older `examples/convert_jax_model_to_pytorch.py` writes the Transformers-based layout and cannot initialize this model.
 
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
+2. Pass `--pytorch-weight-path` with that directory or its `model.safetensors` file, or set `pytorch_weight_path` in the training config. Keep the dataset's `norm_stats.json` configured separately in the data config. Pi0/0.5 LoRA variants initialize any absent LoRA parameters and freeze the matching Gemma base weights.
 
 3. Launch training using one of these modes:
 
 ```bash
 # Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
+uv run scripts/train.py <config_name> --exp-name <run_name> --pytorch-weight-path /path/to/model.safetensors --save-interval <interval>
 
 # Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
+uv run scripts/train.py debug --exp-name pytorch_test
+uv run scripts/train.py debug --exp-name pytorch_test --resume  # Resume from latest checkpoint
 
 # Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train.py <config_name> --exp-name <run_name> --pytorch-weight-path /path/to/model.safetensors
 
 # Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train.py pi0_aloha_sim --exp-name pytorch_ddp_test --pytorch-weight-path /path/to/model.safetensors
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train.py pi0_aloha_sim --exp-name pytorch_ddp_test --resume
 
 # Multi-Node Training:
 uv run torchrun \
@@ -301,22 +274,14 @@ uv run torchrun \
     --node_rank=<rank_of_node> \
     --master_addr=<master_ip> \
     --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
+    scripts/train.py <config_name> --exp-name=<run_name> --pytorch-weight-path=/path/to/model.safetensors --save-interval <interval>
 ```
 
 ### Precision Settings
 
-JAX and PyTorch implementations handle precision as follows:
-
-**JAX:**
-1. Inference: most weights and computations in bfloat16, with a few computations in float32 for stability
-2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
-
-**PyTorch:**
-1. Inference: the model uses bfloat16 weights by default, with numerically sensitive attention/time computations upcast as needed.
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. FP16 mixed precision is not supported.
-
-With torch.compile, inference speed is comparable between JAX and PyTorch.
+PyTorch handles precision as follows:
+1. Inference and training use RLinf's direct Gemma/SigLIP network. The default `bfloat16` setting keeps most backbone weights in bf16 while keeping normalization, the vision stem, and action/flow projections in fp32.
+2. Set `pytorch_training_precision` to `float32` for a full fp32 model. The SFT loss is the mean flow-matching MSE over the configured action horizon and padded action dimensions, as in RLinf.
 
 ## Troubleshooting
 
@@ -325,7 +290,7 @@ We will collect common issues and their solutions here. If you encounter an issu
 | Issue                                     | Resolution                                                                                                                                                                                   |
 | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may want to consider disabling EMA.        |
+| Training runs out of GPU memory           | Reduce `--batch-size` or use a GPU with more memory. `torchrun` uses data parallel training, so each GPU still needs room for model and optimizer states. |
 | Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
 | Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
 | Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |

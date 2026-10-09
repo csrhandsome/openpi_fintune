@@ -35,7 +35,7 @@ uv run --group rlds scripts/compute_norm_stats.py --config-name pi05_full_droid_
 
 Run training:
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run --group rlds scripts/train.py pi05_full_droid_finetune --exp-name=my_experiment --overwrite
+uv run --group rlds scripts/train.py pi05_full_droid_finetune --exp-name=my_experiment --pytorch-weight-path=/path/to/model.safetensors --overwrite
 ```
 
 **Note**: The original pi0.5-DROID model was trained with joint velocity actions.
@@ -45,7 +45,7 @@ Thus, we do not recommend training with joint velocity actions and instead use j
 
 ## Compute Requirements
 
-Our DROID training config requires approximately 2 days on 8x H100 GPUs for convergence (100k iterations, bs256, approx. 1 epoch).
+The PyTorch RLDS loader currently supports a single training process. Multi-GPU RLDS training needs distributed dataset sharding.
 If you start from PaliGemma instead of pi0 initialization, plan with ~5 days on 8x H100s (240k iterations, i.e. 3 epochs).
 
 We have experimented with LoRA for cheaper finetuning, but haven't found the policies to perform well so far.
@@ -99,8 +99,7 @@ You can modify the config easily to work with other base models, or use your cus
 
 To launch training:
 ```
-uv run scripts/train.py pi05_droid_finetune --exp-name=my_experiment --overwrite
+uv run scripts/train.py pi05_droid_finetune --exp-name=my_experiment --pytorch-weight-path=/path/to/model.safetensors --overwrite
 ```
 
 Once trained, you can follow the instructions in [`examples/droid/README.md`](examples/droid/README.md) to serve the policy and run it on the robot.
-
