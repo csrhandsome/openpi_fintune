@@ -1,0 +1,115 @@
+# RL-token：sft 联合训练 VLA/readout；actor_critic 普通 RL；force 接触 actor 对照。
+name: pi0_rlt
+mode: rlt
+project_name: openpi
+exp_name: readout
+
+# 模型、动作表示、相机和数据预处理必须与已有 VLA checkpoint 一致。
+model:
+  type: pi0
+  pi05: false
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  is_lora: true            # false：全参微调；true：RLinf PEFT all-linear，基础权重冻结
+  lora_rank: 32
+  action_dim: 32
+  action_horizon: 16
+  max_token_len: 48
+data:
+  type: franka
+  action_space: ee_delta
+  action_dim: 7
+  motion_dim: null
+  gripper_dim: 1
+  repo_id: openpi/franka_lerobot_test_100hz
+  prompt_from_task: true
+  assets:
+    assets_dir: null       # readout 强制读取 rlt.vla_checkpoint/assets
+    asset_id: null
+
+train:
+  assets_base_dir: ./data/assets
+  checkpoint_base_dir: ./checkpoints
+  seed: 42
+  batch_size: 5             # 一次优化器更新的全局 batch；sft 使用，actor/force 用各自的 batch
+  micro_batch_size: 1       # 每张卡一次前向的 batch；累积步数 = batch_size / (micro_batch_size * GPU 数)
+  num_workers: 2
+  num_train_steps: 5000
+  log_interval: 100
+  save_interval: 1000
+  overwrite: false
+  resume: false
+  wandb_enabled: false
+
+rlt:
+  stage: sft               # sft / actor_critic / force；显式选路径，各 stage 独立运行
+  vla_checkpoint: null     # 必填：含 model.safetensors 和 assets/ 的已有 VLA checkpoint 目录
+  output_dir: null         # 默认 checkpoints/pi0_rlt/readout；保存配套 EMA VLA/readout 和可恢复的训练状态
+  embed_dim: 2048          # 与 Gemma 2B 宽度相同则不做输入/输出投影；改小会加两层 Linear
+  alpha: 0                 # 0：冻结 VLA，只训 readout；>0：loss = L_readout + alpha * L_vla
+  num_tokens: 1
+  num_layers: 2
+  num_heads: 8
+  max_prefix_len: 1024
+  device: auto             # auto / cpu / cuda / cuda:0
+  force:
+    enabled: false         # force stage：true 真实指内特征，false 恒零对照；actor_critic 须匹配 replay/checkpoint；sft 不使用
+    input: rgb             # rgb / features
+    feature_dim: 12288
+    weights: null
+    roi: [0, 0, 224, 224]
+    max_skew_s: 0.02
+    max_age_s: 0.2
+  # 仅 stage=force 使用。须把 data 改成 action_space: joint、action_dim: 8，
+  # 并使用匹配的关节 VLA/readout 和 JSONL 接触回放；当前默认 EE 数据不能直接用于 force。
+  # force.enabled 只控制指内特征，不会自动切换 stage。
+  force_stage:
+    policy: actor          # actor：独立训练/部署小网络；vla：服务直接返回冻结 VLA 参考，无需训练
+    replay_path: ./runs/openpi_rlt/force/replay.jsonl  # 与普通 replay.directory 的 Pickle 回放不同
+    checkpoint_path: ./runs/openpi_rlt/force/actor_critic.pt # 不同指内特征对照分别设置路径
+    readout_dir: null      # 服务必需：匹配的关节 readout；null 时回退到 rlt.output_dir/readout_dir
+    batch_size: 64
+    hidden_dim: 256        # force actor/critic 共用的网络规格，独立于下方普通 actor/critic
+    layers: 2
+    fixed_std: 0.02
+    max_reference_offset_rad: 0.05 # 关节参考残差上限，按设备确认后设置
+    gamma: 0.99
+    tau: 0.005
+    actor_lr: 3.0e-4
+    critic_lr: 3.0e-4
+    bc_weight: 1.0
+    smooth_weight: 0.0
+  replay:
+    directory: ./runs/openpi_rlt/replay
+    capacity: 200000
+  actor_checkpoint: null    # actor_critic / force 续训或加载指定 actor 时填写
+  action_representation: absolute
+  action_norm_stats: null
+  learner:
+    checkpoint_path: ./runs/openpi_rlt/actor_critic.pt
+    batch_size: 128
+    actor_lr: 1.0e-4
+    critic_lr: 1.0e-4
+    actor_update_period: 2
+    actor_q_reduction: q1
+    optimizer: adam
+    weight_decay: 0.0
+    target_update_period: null # 默认跟随 actor_update_period
+    delta_weight: 0.0
+    smooth_action_dims: 6
+    bc_weight: 5.0
+    q_weight: 0.1
+  actor:
+    hidden_dim: 256
+    layers: 2
+    fixed_std: 0.002
+    max_reference_offset: 0.05
+    input_projection: true
+    output_mode: direct
+  critic:
+    input_projection: true
+    hidden_dim: 256
+    layers: 2
+
+policy_metadata:
+  action_fps: 30.0

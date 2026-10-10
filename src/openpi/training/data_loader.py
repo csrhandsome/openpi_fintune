@@ -1,15 +1,13 @@
 from collections.abc import Iterator, Sequence
-import logging
 import multiprocessing
 import os
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import Protocol, SupportsIndex, TypeVar
 
-import jax
-import jax.numpy as jnp
 import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+from torch.utils._pytree import tree_map
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -84,13 +82,13 @@ class IterableTransformedDataset(IterableDataset[T_co]):
                 batch_size = next(v.shape[0] for v in sample.values())
 
                 # Split batch into individual samples using tree_map
-                individual_samples = [jax.tree.map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
+                individual_samples = [tree_map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
 
                 # Transform each sample
                 transformed = [self._transform(s) for s in individual_samples]
 
                 # Recombine batch with tree_map
-                yield jax.tree.map(lambda *x: np.stack(x, axis=0), *transformed)
+                yield tree_map(lambda *x: np.stack(x, axis=0), *transformed)
             else:
                 yield self._transform(sample)
 
@@ -99,30 +97,26 @@ class IterableTransformedDataset(IterableDataset[T_co]):
 
 
 class FakeDataset(Dataset):
+    """Deterministic NumPy fixtures for exercising the PyTorch training pipeline."""
+
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
-        self._observation_spec, self._action_spec = model_config.inputs_spec()
+        self._model_config = model_config
 
     def __getitem__(self, index: SupportsIndex) -> dict:
-        rng = jax.random.key(index.__index__())
+        rng = np.random.default_rng(index.__index__())
+        config = self._model_config
 
-        def make_from_spec(spec: jax.ShapeDtypeStruct):
-            nonlocal rng
-            rng, data_rng = jax.random.split(rng)
-            # Remove the batch dimension.
-            shape = spec.shape[1:]
-            if spec.dtype == jnp.float32:
-                return jax.random.uniform(data_rng, shape=shape, minval=-1.0, maxval=1.0)
-            if spec.dtype == jnp.int32:
-                return jax.random.randint(data_rng, shape=shape, minval=0, maxval=2048)
-            return jnp.zeros(shape=shape, dtype=spec.dtype)
-
-        observation = jax.tree.map(make_from_spec, self._observation_spec)
-        action = jax.tree.map(make_from_spec, self._action_spec)
+        def image():
+            return rng.uniform(-1, 1, (*_model.IMAGE_RESOLUTION, 3)).astype(np.float32)
 
         return {
-            **observation.to_dict(),
-            "actions": action,
+            "image": {key: image() for key in _model.IMAGE_KEYS},
+            "image_mask": dict.fromkeys(_model.IMAGE_KEYS, np.True_),
+            "state": rng.uniform(-1, 1, (config.action_dim,)).astype(np.float32),
+            "tokenized_prompt": rng.integers(0, 2048, (config.max_token_len,), dtype=np.int32),
+            "tokenized_prompt_mask": np.ones(config.max_token_len, dtype=bool),
+            "actions": rng.uniform(-1, 1, (config.action_horizon, config.action_dim)).astype(np.float32),
         }
 
     def __len__(self) -> int:
@@ -242,48 +236,32 @@ def transform_iterable_dataset(
 def create_data_loader(
     config: _config.TrainConfig,
     *,
-    sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
-    framework: Literal["jax", "pytorch"] = "jax",
+    batch_size: int | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a data loader for training.
-
-    Args:
-        config: The training configuration.
-        sharding: The sharding to use for the data loader (JAX only).
-        shuffle: Whether to shuffle the data.
-        num_batches: Determines the number of batches to return.
-        skip_norm_stats: Whether to skip data normalization.
-        framework: The framework to use ("jax" or "pytorch").
-    """
     data_config = config.data.create(config.assets_dirs, config.model)
-    logging.info(f"data_config: {data_config}")
-
+    batch_size = config.batch_size if batch_size is None else batch_size
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
-            action_horizon=config.model.action_horizon,
-            batch_size=config.batch_size,
-            sharding=sharding,
+            config.model.action_horizon,
+            batch_size,
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
-            framework=framework,
         )
     return create_torch_data_loader(
         data_config,
-        model_config=config.model,
-        action_horizon=config.model.action_horizon,
-        batch_size=config.batch_size,
-        sharding=sharding,
+        config.model,
+        config.model.action_horizon,
+        batch_size,
         shuffle=shuffle,
         num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
-        framework=framework,
     )
 
 
@@ -293,67 +271,33 @@ def create_torch_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
-    sharding: jax.sharding.Sharding | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
-    framework: str = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a data loader for training.
-
-    Args:
-        data_config: The data configuration.
-        action_horizon: The action horizon.
-        batch_size: The batch size.
-        sharding: The sharding to use for the data loader. If None, the data loader will
-            use a single device sharding.
-        skip_norm_stats: Whether to skip data normalization.
-        shuffle: Whether to shuffle the data.
-        num_batches: Determines the number of batches to return. If the number exceeds the
-            number of batches in the dataset, the data loader will loop over the dataset.
-            If not provided, will iterate over the dataset indefinitely.
-        num_workers: The number of worker processes to use. If zero, the data loader will
-            execute in the main process.
-        seed: The seed to use for shuffling the data.
-    """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
-
-    # Use TorchDataLoader for both frameworks
-    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
-    # For JAX, divide by process count
+    dataset = transform_dataset(
+        create_torch_dataset(data_config, action_horizon, model_config), data_config, skip_norm_stats=skip_norm_stats
+    )
     sampler = None
-    if framework == "pytorch":
-        if torch.distributed.is_initialized():
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                num_replicas=torch.distributed.get_world_size(),
-                rank=torch.distributed.get_rank(),
-                shuffle=shuffle,
-                drop_last=True,
-            )
-            local_batch_size = batch_size // torch.distributed.get_world_size()
-        else:
-            local_batch_size = batch_size
-    else:
-        local_batch_size = batch_size // jax.process_count()
-
-    logging.info(f"local_batch_size: {local_batch_size}")
-    data_loader = TorchDataLoader(
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    if batch_size <= 0 or batch_size % world_size:
+        raise ValueError(f"Global batch_size={batch_size} must be positive and divisible by world_size={world_size}")
+    if world_size > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=world_size, rank=torch.distributed.get_rank(), shuffle=shuffle, drop_last=True
+        )
+    loader = TorchDataLoader(
         dataset,
-        local_batch_size=local_batch_size,
-        sharding=None if framework == "pytorch" else sharding,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+        local_batch_size=batch_size // world_size,
+        shuffle=sampler is None and shuffle,
         sampler=sampler,
         num_batches=num_batches,
         num_workers=num_workers,
         seed=seed,
-        framework=framework,
     )
-
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, loader)
 
 
 def create_rlds_data_loader(
@@ -361,41 +305,15 @@ def create_rlds_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
-    sharding: jax.sharding.Sharding | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
-    framework: str = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create an RLDS data loader for training.
-
-    Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
-
-    Args:
-        data_config: The data configuration.
-        action_horizon: The action horizon.
-        batch_size: The batch size.
-        sharding: The sharding to use for the data loader. If None, the data loader will
-            use a single device sharding.
-        skip_norm_stats: Whether to skip data normalization.
-        shuffle: Whether to shuffle the data.
-        num_batches: Determines the number of batches to return. If the number exceeds the
-            number of batches in the dataset, the data loader will loop over the dataset.
-            If not provided, will iterate over the dataset indefinitely.
-    """
-    if framework == "pytorch" and torch.distributed.is_initialized():
+    if torch.distributed.is_initialized():
         raise NotImplementedError("Distributed PyTorch RLDS loading requires dataset sharding")
     dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
-
-    data_loader = RLDSDataLoader(
-        dataset,
-        sharding=sharding,
-        num_batches=num_batches,
-        framework=framework,
-    )
-
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, RLDSDataLoader(dataset, num_batches=num_batches))
 
 
 class TorchDataLoader:
@@ -406,20 +324,17 @@ class TorchDataLoader:
         dataset,
         local_batch_size: int,
         *,
-        sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
         sampler: torch.utils.data.Sampler | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
-        framework: str = "jax",
     ):
         """Create a PyTorch data loader.
 
         Args:
             dataset: The dataset to load.
             local_batch_size: The local batch size for each process.
-            sharding: The sharding to use for the data loader.
             shuffle: Whether to shuffle the data.
             num_batches: If provided, determines the number of returned batches. If the
                 number is larger than the number of batches in the dataset, the data loader
@@ -429,20 +344,8 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if framework == "jax" and jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
-
-        if len(dataset) < local_batch_size:
-            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
-
-        # Store sharding - None for PyTorch, JAX sharding for JAX
-        self._sharding = sharding
-        if sharding is None and framework == "jax":
-            # Use data parallel sharding by default for JAX only.
-            self._sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
+        if local_batch_size <= 0 or len(dataset) < local_batch_size:
+            raise ValueError(f"Local batch size ({local_batch_size}) is invalid for dataset size ({len(dataset)}).")
         self._num_batches = num_batches
 
         mp_context = None
@@ -481,26 +384,18 @@ class TorchDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
-                # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-                if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
-                else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                yield tree_map(torch.as_tensor, batch)
 
 
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
-    # Make sure to convert to numpy arrays before stacking since some of the incoming elements
-    # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    return tree_map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Tell JAX inside the worker process not to preallocate the GPU memory."""
-    # NOTE: This is called after jax is imported inside the worker process. This
-    # means that this approach will not work for selecting the backend.
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    # Shared transforms import JAX; keep worker imports on CPU.
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    np.random.seed(torch.initial_seed() % (2**32))
 
 
 class RLDSDataLoader:
@@ -513,25 +408,9 @@ class RLDSDataLoader:
         self,
         dataset: DroidRldsDataset,
         *,
-        sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
-        framework: str = "jax",
     ):
         self._dataset = dataset
-        self._num_batches = num_batches
-        self._framework = framework
-
-        if framework == "jax" and jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
-
-        if sharding is None and framework == "jax":
-            # Use data parallel sharding by default.
-            sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
-
-        self._sharding = sharding
         self._num_batches = num_batches
 
     def __iter__(self):
@@ -546,10 +425,7 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
-                if self._framework == "pytorch":
-                    yield jax.tree.map(torch.as_tensor, batch)
-                else:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                yield tree_map(torch.as_tensor, batch)
 
 
 class DataLoaderImpl(DataLoader):

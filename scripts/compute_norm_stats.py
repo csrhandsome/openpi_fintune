@@ -13,6 +13,7 @@ import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+from openpi.training.validation import validate_dataset
 import openpi.transforms as transforms
 
 
@@ -27,7 +28,7 @@ def _norm_stats_transforms(data_config: _config.DataConfig) -> list[transforms.D
     return [
         *data_config.repack_transforms.inputs,
         *data_transforms,
-        # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+        # Strings are unnecessary for normalization statistics.
         RemoveStrings(),
     ]
 
@@ -85,27 +86,28 @@ def create_rlds_dataloader(
 
 
 def main(
-    config_name: str,
+    config: str = "config/train/openpi.yaml",
     max_frames: int | None = None,
     *,
     batch_size: int | None = None,
 ):
-    config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    settings = _config.get_config(config)
+    validate_dataset(settings)
+    data_config = settings.data.create(settings.assets_dirs, settings.model)
 
-    effective_batch_size = batch_size if batch_size is not None else config.batch_size
+    effective_batch_size = batch_size if batch_size is not None else settings.batch_size
 
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, effective_batch_size, max_frames
+            data_config, settings.model.action_horizon, effective_batch_size, max_frames
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
             data_config,
-            config.model.action_horizon,
+            settings.model.action_horizon,
             effective_batch_size,
-            config.model,
-            config.num_workers,
+            settings.model,
+            settings.num_workers,
             max_frames,
         )
 
@@ -118,7 +120,7 @@ def main(
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = settings.assets_dirs / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

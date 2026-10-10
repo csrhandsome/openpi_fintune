@@ -5,26 +5,27 @@ We provide utilities for running openpi models remotely. This is useful for runn
 
 ## Starting a remote policy server
 
-The default server serves the latest `pi0_base_ee_ros_30hz/ros_30hz` checkpoint
-on port 8001. Its Panda requests use `observation.exterior_image`,
-`observation.wrist_image_left`, `observation.ee_pose[6]`,
-`observation.gripper_position[1]`, and `prompt`. Responses contain absolute
-EE/gripper `actions[16,7]` at 30 Hz. See [Panda setup](franka_ros_30hz.md)
-for the LeRobot 0.6.1/v3.0 dataset and checkpoint configuration.
-
-To start a remote policy server, you can simply run the following command:
+The server reads `config/server/openpi.yaml`, references its training YAML, and selects its latest PyTorch checkpoint.
+Panda requests use `observation.exterior_image`, `observation.wrist_image_left`,
+`observation.ee_pose`, `observation.gripper_position`, and `prompt`.
+The YAML's action layout determines physical action dimensions. EE-delta models
+return absolute EE/gripper actions. See [Panda setup](franka_ros_30hz.md).
 
 ```bash
-uv run scripts/serve_policy.py --env=[ROS | DROID | ALOHA | LIBERO]
+uv run scripts/server.py --config config/server/openpi.yaml --port 8001
+uv run scripts/server.py --config config/server/openpi.yaml --checkpoint /path/to/checkpoint
+uv run scripts/server.py --config config/train/openpi_rlt.yaml --port 8001
 ```
 
-The `env` argument specifies which $\pi_0$ checkpoint should be loaded. Under the hood, this script will execute a command like the following, which you can use to start a policy server, e.g. for checkpoints you trained yourself (here an example for the DROID environment):
+The RLT YAML supplies `rlt.vla_checkpoint` and the readout directory. This mode
+returns `z_rlt` and `ref_chunk` from the current observation, alongside `actions`.
+All checkpoints must contain PyTorch `model.safetensors`; training configurations
+come from YAML files under the repository-root `config/train/` directory.
 
-```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi0_fast_droid --policy.dir=gs://openpi-assets/checkpoints/pi0_fast_droid
-```
-
-This will start a policy server that will serve the policy specified by the `config` and `dir` arguments. The policy will be served on the specified port (default: 8001).
+For online actor training or frozen actor evaluation, use `config/server/openpi_rlt.yaml`.
+This server requires episode lifecycle and executed-action feedback through `RLTClientPolicy`;
+see [RLT online serving](rlt_online.md). A standalone readout server using the training YAML
+continues to execute VLA actions.
 
 ## Querying the remote policy server from your robot code
 

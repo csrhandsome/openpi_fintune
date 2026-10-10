@@ -41,12 +41,14 @@ dependencies = [
     "modelscope>=1.38.1",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "pyyaml>=6.0.2",
     "matplotlib>=3.10.3",
     "crcmod>=1.7",
     "moviepy>=2.2.1",
     "panda-python>=0.8.1",
     "spatialmath-python>=1.1.15",
     "pyrealsense2>=2.56.5.9235",
+    "peft>=0.19,<0.20",
 ]
 
 
@@ -146,4 +148,4 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 markers = ["manual: should be run manually."]
-testpaths = ["src", "scripts"]
+testpaths = ["src/openpi/tests"]

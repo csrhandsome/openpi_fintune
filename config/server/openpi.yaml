@@ -1,0 +1,8 @@
+# 普通 VLA 推理。相对路径均从仓库根目录解析。
+mode: vla
+train_config: config/train/openpi.yaml  # 复用模型、相机、动作布局和预处理
+checkpoint: null                      # null：读取该训练配置的最新数字 checkpoint
+device: auto
+host: 0.0.0.0
+port: 8001
+record: false

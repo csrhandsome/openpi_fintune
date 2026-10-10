@@ -204,34 +204,6 @@ class Embedder(nn.Module):
 
 
 # TODO: try use sdpa_attn
-class HeadwiseLoRALinear(nn.Linear):
-    """Low-rank update for JAX Gemma's per-head attention einsums."""
-
-    def __init__(self, in_features, out_features, groups, config, *, output_split=False):
-        super().__init__(in_features, out_features, bias=False)
-        self.groups = groups
-        self.output_split = output_split
-        self.scaling = config.scaling_value
-        if output_split:
-            self.lora_a = nn.Parameter(torch.empty(groups, in_features // groups, config.rank))
-            self.lora_b = nn.Parameter(torch.empty(groups, config.rank, out_features))
-        else:
-            self.lora_a = nn.Parameter(torch.empty(groups, in_features, config.rank))
-            self.lora_b = nn.Parameter(torch.empty(groups, config.rank, out_features // groups))
-        nn.init.normal_(self.lora_a, std=0.01)
-        nn.init.normal_(self.lora_b, std=0.01)
-
-    def forward(self, x):
-        base = super().forward(x)
-        if self.output_split:
-            x = x.reshape(*x.shape[:-1], self.groups, self.in_features // self.groups)
-            update = torch.einsum("...gi,gir,gro->...o", x, self.lora_a.to(x.dtype), self.lora_b.to(x.dtype))
-        else:
-            update = torch.einsum("...i,gir,gro->...go", x, self.lora_a.to(x.dtype), self.lora_b.to(x.dtype))
-            update = update.flatten(start_dim=-2)
-        return base + update * self.scaling
-
-
 class Attention(nn.Module):
     """Multi-expert Grouped Query Attention with RoPE and LoRA."""
 
@@ -254,33 +226,37 @@ class Attention(nn.Module):
 
         for config in configs:
             lora_cfg = config.lora_configs.get("attn")
-            def projection(in_features, out_features, groups, output_split=False):
-                if lora_cfg is None:
-                    return nn.Linear(in_features, out_features, bias=False)
-                return HeadwiseLoRALinear(
-                    in_features, out_features, groups, lora_cfg,
-                    output_split=output_split,
-                )
+            # TODO: add lora attn support
+            if lora_cfg is not None:
+                raise NotImplementedError
             if config.num_kv_heads == config.num_heads:
                 # Combined QKV projection
                 self.q_proj.append(
-                    projection(config.width, 3 * config.num_heads * config.head_dim, 3 * config.num_heads)
+                    nn.Linear(
+                        config.width, 3 * config.num_heads * config.head_dim, bias=False
+                    )
                 )
                 self.k_proj.append(None)  # handled by q_proj
                 self.v_proj.append(None)
             else:
                 self.q_proj.append(
-                    projection(config.width, config.num_heads * config.head_dim, config.num_heads)
+                    nn.Linear(
+                        config.width, config.num_heads * config.head_dim, bias=False
+                    )
                 )
                 self.k_proj.append(
-                    projection(config.width, config.num_kv_heads * config.head_dim, config.num_kv_heads)
+                    nn.Linear(
+                        config.width, config.num_kv_heads * config.head_dim, bias=False
+                    )
                 )
                 self.v_proj.append(
-                    projection(config.width, config.num_kv_heads * config.head_dim, config.num_kv_heads)
+                    nn.Linear(
+                        config.width, config.num_kv_heads * config.head_dim, bias=False
+                    )
                 )
 
             self.o_proj.append(
-                projection(config.num_heads * config.head_dim, config.width, config.num_heads, output_split=True)
+                nn.Linear(config.num_heads * config.head_dim, config.width, bias=False)
             )
 
         # Initialize weights

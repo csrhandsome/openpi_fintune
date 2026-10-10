@@ -1,300 +1,99 @@
-# openpi
+# openpi-force
 
-openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
+本仓库基于 Physical Intelligence 的 openpi，使用 RLinf 对齐的 PyTorch Pi0/Pi05 训练 VLA，并提供 VLA/readout 联合训练。任务参数放在仓库根目录 `config/train/`；RL-token 第一阶段的联合 loss、增强、EMA 等使用代码默认值，详见 [实现对齐说明](docs/pytorch_alignment.md)。
 
-Currently, this repo contains three types of models:
-- the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
-- the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
-- the [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05), an upgraded version of π₀ with better open-world generalization trained with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation). Note that, in this repository, we currently only support the flow matching head for both $\pi_{0.5}$ training and inference.
+## 环境
 
-For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
-
-This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
-
-## Updates
-
-- [Sept 2025] We released PyTorch support in openpi.
-- [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
-- [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
-
-
-## Requirements
-
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. The PyTorch trainer supports data parallel training with `torchrun` on one or more nodes; its per-GPU memory use depends on the local batch size.
-
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
-
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
-
-## Installation
-
-The model and training environment uses Python 3.12 and `lerobot[dataset]==0.6.1`
-with the v3.0 dataset format, matching `data_collect`. Run `uv sync --locked` after
-updating an existing checkout; the default Franka training and policy server use
-`pi0_base_ee_ros_30hz` (30 Hz, 16 steps, 7D pose/gripper actions). See
-[the Panda data and inference setup](docs/franka_ros_30hz.md).
-
-When cloning this repo, make sure to update submodules:
+Python 3.12，LeRobot 0.6.1（v3.0 Parquet 数据集），PyTorch 2.7.1。
 
 ```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
-
-# Or if you already cloned the repo:
-git submodule update --init --recursive
+uv sync --locked
 ```
 
-We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
+底层共享模型和变换仍有 JAX 兼容依赖；训练、优化器、数据加载和 checkpoint 保存使用 PyTorch。
+
+## 配置与入口
+
+| 配置 | 用途 | 默认保存目录 |
+| --- | --- | --- |
+| `config/train/openpi.yaml` | 普通 VLA 训练，`mode: vla` | `checkpoints/openpi/ee/<step>/` |
+| `config/train/openpi_rlt.yaml` | `mode: rlt`；`stage: sft / actor_critic / force` 选择 readout、普通 RL 或接触 actor | `checkpoints/pi0_rlt/readout/` 或 `runs/openpi_rlt/` |
+| `config/server/openpi.yaml` | 普通 VLA 推理，引用训练 YAML | — |
+| `config/server/openpi_rlt.yaml` | RLT 在线训练/actor 评估、可选触觉输入 | `runs/openpi_rlt/` |
+
+YAML 记录模型结构、数据集、动作表示、物理动作维度、预训练权重、batch、学习率、训练步数、日志/保存间隔、精度和输出路径。相对路径均从仓库根目录解析。需要另一个实验时，在 `config/train/` 复制一份 YAML 并修改参数。
+
+`scripts/train.py` 读取训练配置后选择 VLA、readout、普通 actor–critic 或 force 接触训练；`scripts/server.py` 读取 `config/server/` 里的服务 YAML，引用训练配置组装普通 VLA、RLT 或 force 服务。显式传入 `stage: force` 的训练 YAML 也会直接组装接触服务。具体实现位于 `src/openpi/training/` 和 `src/openpi/serving/`。
+
+## 动作表示与维度
+
+在 YAML 的 `data` 下设置：
+
+```yaml
+data:
+  type: franka
+  action_space: ee_delta  # joint / ee / ee_delta
+  action_dim: 7          # 物理动作维度，训练开始时检查
+  motion_dim: null       # 每臂默认：EE 为 6，joint 为 7
+  gripper_dim: 1         # 每臂夹爪维度
+```
+
+`joint` 使用绝对关节位置目标；`ee` 使用绝对 XYZ/RPY 目标；`ee_delta` 从数据集的绝对 XYZ/RPY 转换为相对当前观测的增量，RPY 差值折返到 `[-π, π)`。EE-delta 推理还原为绝对位姿，夹爪始终保持绝对值。
+
+EE 单臂为 `6+1=7`，双臂为 `(6+1)*2=14`。双臂数据字段分别为 `action.ee_pose[12]` 和 `action.gripper_position[2]`，输入时组合成每臂连续的 `[pose, gripper]` 块。joint 单臂默认 `7+1=8`。启动时先校验数据集 `meta/info.json` 中的真实 action 维度；不匹配时在加载模型权重之前报错。
+
+`model.action_dim: 32` 表示模型内部 padding，必须不小于 `data.action_dim`，不作为数据集动作维度。
+
+## 普通 VLA 训练
+
+先在 `openpi.yaml` 设置 `data.repo_id`。`pytorch_weight_path` 默认是 `data/checkpoints/torch/pi0_base`。那里没有 RLinf 布局的 `model.safetensors` 时，训练会用 RLinf 的转换脚本把 `jax_weight_path`（默认官方 `gs://openpi-assets/checkpoints/pi0_base`）转一次再开始微调；已有文件则直接加载。数据集路径由 `HF_LEROBOT_HOME` 或 `OPENPI_DATASET_ROOT` 控制，详见 [Franka 数据说明](docs/franka_ros_30hz.md)。
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+uv run scripts/compute_norm_stats.py --config config/train/openpi.yaml
+uv run scripts/train.py --config config/train/openpi.yaml
 ```
 
-NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
-
-**Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
-
-
-
-
-## Model Checkpoints
-
-### Base Models
-We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
-
-| Model        | Use Case    | Description                                                                                                 | Checkpoint Path                                |
-| ------------ | ----------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| $\pi_0$      | Fine-Tuning | Base [π₀ model](https://www.physicalintelligence.company/blog/pi0) for fine-tuning                | `gs://openpi-assets/checkpoints/pi0_base`      |
-| $\pi_0$-FAST | Fine-Tuning | Base autoregressive [π₀-FAST model](https://www.physicalintelligence.company/research/fast) for fine-tuning | `gs://openpi-assets/checkpoints/pi0_fast_base` |
-| $\pi_{0.5}$    | Fine-Tuning | Base [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05) for fine-tuning    | `gs://openpi-assets/checkpoints/pi05_base`      |
-
-### Fine-Tuned Models
-We also provide "expert" checkpoints for various robot platforms and tasks. These models are fine-tuned from the base models above and intended to run directly on the target robot. These may or may not work on your particular robot. Since these checkpoints were fine-tuned on relatively small datasets collected with more widely available robots, such as ALOHA and the DROID Franka setup, they might not generalize to your particular setup, though we found some of these, especially the DROID checkpoint, to generalize quite broadly in practice.
-
-| Model                    | Use Case    | Description                                                                                                                                                                                              | Checkpoint Path                                       |
-| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| $\pi_0$-FAST-DROID       | Inference   | $\pi_0$-FAST model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): can perform a wide range of simple table-top manipulation tasks 0-shot in new scenes on the DROID robot platform | `gs://openpi-assets/checkpoints/pi0_fast_droid`       |
-| $\pi_0$-DROID            | Fine-Tuning | $\pi_0$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): faster inference than $\pi_0$-FAST-DROID, but may not follow language commands as well                                | `gs://openpi-assets/checkpoints/pi0_droid`            |
-| $\pi_0$-ALOHA-towel      | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can fold diverse towels 0-shot on ALOHA robot platforms                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_towel`      |
-| $\pi_0$-ALOHA-tupperware | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can unpack food from a tupperware container                                                                                                             | `gs://openpi-assets/checkpoints/pi0_aloha_tupperware` |
-| $\pi_0$-ALOHA-pen-uncap  | Inference   | $\pi_0$ model fine-tuned on public [ALOHA](https://dit-policy.github.io/) data: can uncap a pen                                                                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap`  |
-| $\pi_{0.5}$-LIBERO      | Inference   | $\pi_{0.5}$ model fine-tuned for the [LIBERO](https://libero-project.github.io/datasets) benchmark: gets state-of-the-art performance (see [LIBERO README](examples/libero/README.md)) | `gs://openpi-assets/checkpoints/pi05_libero`      |
-| $\pi_{0.5}$-DROID      | Inference / Fine-Tuning | $\pi_{0.5}$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/) with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation): fast inference and good language-following | `gs://openpi-assets/checkpoints/pi05_droid`      |
-
-
-By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
-
-
-
-
-## Running Inference for a Pre-Trained Model
-
-Our pre-trained model checkpoints can be run with a few lines of code (here our $\pi_0$-FAST-DROID model):
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-
-# Create a trained policy.
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference on a dummy example.
-example = {
-    "observation/exterior_image_1_left": ...,
-    "observation/wrist_image_left": ...,
-    ...
-    "prompt": "pick up the fork"
-}
-action_chunk = policy.infer(example)["actions"]
-```
-You can also test this out in the [example notebook](examples/inference.ipynb).
-
-We provide detailed step-by-step examples for running inference of our pre-trained checkpoints on [DROID](examples/droid/README.md) and [ALOHA](examples/aloha_real/README.md) robots.
-
-**Remote Inference**: We provide [examples and code](docs/remote_inference.md) for running inference of our models **remotely**: the model can run on a different server and stream actions to the robot via a websocket connection. This makes it easy to use more powerful GPUs off-robot and keep robot and policy environments separate.
-
-**Test inference without a robot**: We provide a [script](examples/simple_client/README.md) for testing inference without a robot. This script will generate a random observation and run inference with the model. See [here](examples/simple_client/README.md) for more details.
-
-
-
-
-
-## Fine-Tuning Base Models on Your Own Data
-
-We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-project.github.io/datasets) as a running example for how to fine-tune a base model on your own data. We will explain three steps:
-1. Convert your data to a LeRobot dataset (which we use for training)
-2. Defining training configs and running training
-3. Spinning up a policy server and running inference
-
-### 1. Convert your data to a LeRobot dataset
-
-We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
+支持临时覆盖运行参数，实际生效的配置会保存到运行目录和每个 checkpoint 的 `config.yaml`：
 
 ```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
+uv run scripts/train.py --config config/train/openpi.yaml --batch-size 8 --exp-name example
+uv run scripts/train.py --config config/train/openpi.yaml --exp-name example --resume
+uv run torchrun --standalone --nproc_per_node=2 scripts/train.py \
+  --config config/train/openpi.yaml --batch-size 8
 ```
 
-**Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
+batch 为全局 batch，DDP 按进程数均分。普通 checkpoint 包含 `model.safetensors`、`optimizer.pt`、`metadata.pt`、`config.yaml` 和归一化资产。
 
-### 2. Defining training configs and running training
+## 离线 RL-token 训练与服务
 
-To fine-tune a base model on your own data, you need to define configs for data processing and training. We provide example configs with detailed comments for LIBERO below, which you can modify for your own dataset:
-
-- [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
-- [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines PyTorch fine-tuning hyperparameters, data config, and checkpoint path.
-
-The PyTorch trainer uses [π₀ and π₀.₅ configs](src/openpi/training/config.py) on LIBERO data. The π₀-FAST configs remain available for inference.
-
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
+在 `openpi_rlt.yaml` 设置 `rlt.vla_checkpoint`，并保持模型结构和动作表示与该 VLA 原训练一致。readout 强制读取该 checkpoint 的 `assets/` 归一化统计，只更新 readout 权重。
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
+uv run scripts/train.py --config config/train/openpi_rlt.yaml
+uv run scripts/server.py --config config/train/openpi_rlt.yaml --port 8001
 ```
 
-Now we can kick off training with the following command. Fine-tuning configs require an RLinf-layout PyTorch checkpoint; the `--overwrite` flag replaces checkpoints from the same experiment:
+readout 输出目录包含 `readout.safetensors`、`manifest.json` 和 `config.yaml`；每到 `save_interval` 也保存步骤子目录。推理按当前观测生成 `z_rlt`，并返回物理空间的 `ref_chunk`。当前 readout 训练使用单进程，不支持 resume。
+
+普通 VLA 服务默认选取 YAML 保存目录中的最新 PyTorch checkpoint；也可指定现有 checkpoint：
 
 ```bash
-uv run scripts/train.py pi05_libero --exp-name=my_experiment --pytorch-weight-path=/path/to/model.safetensors --overwrite
+uv run scripts/server.py --config config/server/openpi.yaml --checkpoint /path/to/checkpoint --port 8001
 ```
 
-The command logs training progress and saves checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. Training currently supports π₀ and π₀.₅; π₀-FAST and the JAX force guidance model are not supported by this PyTorch trainer.
+后续接触 actor 的代码和协议见 [Force RLT](docs/force_rlt_pytorch.md)。旧的上游环境配置名称和 JAX checkpoint 不能直接传给新的训练/服务入口。
 
-**Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
+RLT 在线模式默认由 VLA 收集经验，至少 600 条已标注 transition、20000 次 learner 更新且 actor 快照就绪后，在下一 episode 切换到 actor。`rlt.mode: eval` 固定 actor 权重；train/inference 共用 `rlt.force.enabled`。启动、执行反馈协议与客户端示例见 [RLT 在线说明](docs/rlt_online.md)。
 
-### 3. Spinning up a policy server and running inference
+## 测试
 
-Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
+全部测试集中在 `src/openpi/tests/`，按 training、serving、policies、models、models_pytorch、rlt、shared、client 分目录。
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest src/openpi/tests/training src/openpi/tests/serving \
+  src/openpi/tests/models_pytorch src/openpi/tests/rlt/force_rlt -m 'not manual'
 ```
 
-This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
+禁用自动插件可避免本机 ROS pytest 插件的额外依赖。真实设备连接检查为手动工具：`python -m openpi.tests.manual.connection`。
 
-For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
-
-If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).
-
-
-
-### More Examples
-
-We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:
-- [ALOHA Simulator](examples/aloha_sim)
-- [ALOHA Real](examples/aloha_real)
-- [UR5](examples/ur5)
-
-## PyTorch Support
-
-The π₀ and π₀.₅ PyTorch network is ported from RLinf's JAX-aligned implementation. The OpenPI data transforms, normalization, DDP trainer, and policy interface remain in use. Current limits are:
-
-- The π₀-FAST model
-- FP16 training is not supported; the PyTorch entrypoint uses bfloat16 or float32.
-- FSDP (fully-sharded data parallelism) training
-- EMA (exponential moving average) weights during training
-
-### Training behavior
-
-The model uses RLinf's direct SigLIP and dual-expert Gemma modules. The training loss is flow-matching MSE over the full network action horizon and padded action dimension. Existing Gemma LoRA variants train their low-rank parameters while the matching base Gemma weights are frozen.
-
-The default precision uses bf16 for most Gemma and SigLIP weights, with fp32 vision stem, normalization, action projections, and flow-matching loss. The SFT path follows RLinf's checkpointing behavior. The launcher uses PyTorch DDP for multiple GPUs.
-
-Set `pytorch_weight_path` to a base checkpoint in RLinf's layout before fine-tuning. It must contain `model.safetensors` with `llm.*`, `img.*`, and action projection keys. Dataset `norm_stats.json` is selected by the data config. A checkpoint produced by the old `examples/convert_jax_model_to_pytorch.py` has a different key layout and cannot initialize this model.
-
-### Setup
-Install the project dependencies with `uv sync`. The RLinf-backed network does not require patching the installed Transformers package.
-
-### Running Inference with PyTorch
-
-The policy API accepts an RLinf-layout PyTorch checkpoint directory:
-
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = "/path/to/converted/pytorch/checkpoint"
-
-# Create a trained policy (automatically detects PyTorch format)
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference (same API as JAX)
-action_chunk = policy.infer(example)["actions"]
-```
-
-### Policy Server with PyTorch
-
-The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir=/path/to/converted/pytorch/checkpoint
-```
-
-### Finetuning with PyTorch
-
-To finetune a model in PyTorch:
-
-1. Obtain base weights in RLinf's JAX-aligned PyTorch layout (`model.safetensors` with `llm.*` and `img.*` keys, such as `pi0_base_pytorch_new`). The older `examples/convert_jax_model_to_pytorch.py` writes the Transformers-based layout and cannot initialize this model.
-
-2. Pass `--pytorch-weight-path` with that directory or its `model.safetensors` file, or set `pytorch_weight_path` in the training config. Keep the dataset's `norm_stats.json` configured separately in the data config. Pi0/0.5 LoRA variants initialize any absent LoRA parameters and freeze the matching Gemma base weights.
-
-3. Launch training using one of these modes:
-
-```bash
-# Single GPU training:
-uv run scripts/train.py <config_name> --exp-name <run_name> --pytorch-weight-path /path/to/model.safetensors --save-interval <interval>
-
-# Example:
-uv run scripts/train.py debug --exp-name pytorch_test
-uv run scripts/train.py debug --exp-name pytorch_test --resume  # Resume from latest checkpoint
-
-# Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train.py <config_name> --exp-name <run_name> --pytorch-weight-path /path/to/model.safetensors
-
-# Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train.py pi0_aloha_sim --exp-name pytorch_ddp_test --pytorch-weight-path /path/to/model.safetensors
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train.py pi0_aloha_sim --exp-name pytorch_ddp_test --resume
-
-# Multi-Node Training:
-uv run torchrun \
-    --nnodes=<num_nodes> \
-    --nproc_per_node=<gpus_per_node> \
-    --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> \
-    --master_port=<port> \
-    scripts/train.py <config_name> --exp-name=<run_name> --pytorch-weight-path=/path/to/model.safetensors --save-interval <interval>
-```
-
-### Precision Settings
-
-PyTorch handles precision as follows:
-1. Inference and training use RLinf's direct Gemma/SigLIP network. The default `bfloat16` setting keeps most backbone weights in bf16 while keeping normalization, the vision stem, and action/flow projections in fp32.
-2. Set `pytorch_training_precision` to `float32` for a full fp32 model. The SFT loss is the mean flow-matching MSE over the configured action horizon and padded action dimensions, as in RLinf.
-
-## Troubleshooting
-
-We will collect common issues and their solutions here. If you encounter an issue, please check here first. If you can't find a solution, please file an issue on the repo (see [here](CONTRIBUTING.md) for guidelines).
-
-| Issue                                     | Resolution                                                                                                                                                                                   |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Reduce `--batch-size` or use a GPU with more memory. `torchrun` uses data parallel training, so each GPU still needs room for model and optimizer states. |
-| Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
-| Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
-| CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
-| Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
-| Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
-| Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+普通 RLT 的 episode 奖励、Pickle replay 构建与独立 actor/critic 训练见 [RLT 使用说明](src/openpi/rlt/README.md)。

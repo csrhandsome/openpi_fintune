@@ -1,0 +1,76 @@
+# 冻结 VLA/readout；在线训练小 actor–critic 或评估已训练 actor。
+# 客户端须使用 openpi_client.rlt_client_policy.RLTClientPolicy 回传执行结果。
+mode: rlt                   # rlt：普通在线 RL；force：读取 train_config 的 force/force_stage 部署接触策略
+train_config: config/train/openpi_rlt.yaml
+checkpoint: null             # 默认 train YAML 的 rlt.vla_checkpoint；须设置其中一处
+readout: null                # force 默认 rlt.force_stage.readout_dir；其余默认 train YAML 的 rlt.output_dir/readout_dir
+device: auto
+host: 0.0.0.0
+port: 8001
+record: false
+
+# 下方仅 mode=rlt 使用；mode=force 的 actor、指内开关和 vla 模式统一读取 train YAML。
+rlt:
+  mode: online_rl            # online_rl：自动 warmup → online；eval：固定 actor，不训练
+  actor_checkpoint: null     # 恢复训练或 eval 时填写；eval 必填
+  chunk_len: 10              # 每次最多执行 E 步；必须 <= VLA 的 action_horizon
+  proprio_dim: null          # 默认物理 action_dim；自定义状态须传 observation.proprio
+  action_representation: absolute  # actor 的变换；VLA 输出/执行反馈均为物理绝对目标
+  action_norm_stats: null
+  deterministic: false      # eval 建议 true
+  critical_phase_only: false # true 时每次 infer 须明确传 in_critical_phase
+
+  collect:
+    enabled: true           # false：不收集；online_rl 须已有足够的 replay
+  force:
+    enabled: false          # 仅 actor/critic 接收触觉；VLA/readout 始终不接收
+    input: rgb              # rgb：服务端编码四帧左右指历史；features：客户端提供 z_grip
+    feature_dim: 12288       # RGB: 4*2*3*512；features 模式可指定自己的维度
+    weights: null            # RGB + enabled=true 必填：本地 ResNet-18 权重
+    roi: [0, 0, 224, 224]
+    max_skew_s: 0.02
+    max_age_s: 0.2
+  replay:
+    directory: ./runs/openpi_rlt/replay
+    capacity: 200000
+  reward:
+    success_reward: 1.0
+    failure_reward: 0.0
+    step_reward: 0.0
+  warmup:
+    min_transitions: 600     # 统计已标注、提交到 buffer 的 chunk transition 数
+    updates: 20000          # learner 更新次数，actor 每 actor_update_period 次更新一次
+  learner:
+    batch_size: 128
+    gamma: 0.99
+    tau: 0.005
+    actor_lr: 1.0e-4
+    critic_lr: 1.0e-4
+    actor_update_period: 2
+    actor_q_reduction: q1    # 与 openpi-RLT 一致；min 可使用双 Q 的最小值
+    optimizer: adam
+    weight_decay: 0.0
+    target_update_period: null # 默认随 actor 更新；1 表示每次 critic 更新
+    delta_weight: 0.0        # 物理动作相邻步增量与 BC target 的偏差
+    smooth_action_dims: 6    # 默认前六维；多臂布局应按实际动作定义调整
+    reference_dropout: 0.5
+    warmup_bc_weight: 10.0
+    warmup_q_weight: 0.1
+    bc_weight: 5.0           # online 阶段
+    q_weight: 0.1
+    grad_updates_per_cycle: 5 # 收集完成 warmup 后，每新增 transition 的更新预算
+    publish_interval: 500    # 发布推理 actor 参数；warmup 达标时额外立即发布
+    checkpoint_interval: 1000
+    checkpoint_path: ./runs/openpi_rlt/actor_critic.pt
+    freeze_after_warmup: false
+  actor:
+    hidden_dim: 256
+    layers: 2
+    fixed_std: 0.002
+    max_reference_offset: 0.05 # actor 变换空间中的残差幅度
+    input_projection: true
+    output_mode: direct     # 预测 E 步，剩余 H-E 步沿用 VLA reference；residual 可使用残差输出
+  critic:
+    input_projection: true
+    hidden_dim: 256
+    layers: 2

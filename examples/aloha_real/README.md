@@ -1,3 +1,5 @@
+> 本分支使用 `scripts/train.py` / `scripts/server.py` 和 `config/train/*.yaml`。运行本例前，先在该目录创建匹配机器人和 PyTorch checkpoint 的 YAML；旧的 Python 配置名称与 JAX 权重不可直接使用。参见根目录 README。
+
 # Run Aloha (Real Robot)
 
 This example demonstrates how to run with a real robot using an [ALOHA setup](https://github.com/tonyzhaozh/aloha). See [here](../../docs/remote_inference.md) for instructions on how to load checkpoints and run inference. We list the relevant checkpoint paths for each provided fine-tuned model below.
@@ -40,7 +42,7 @@ roslaunch aloha ros_nodes.launch
 Terminal window 3:
 
 ```bash
-uv run scripts/serve_policy.py --env ALOHA --default_prompt='take the toast out of the toaster'
+uv run scripts/server.py --config config/train/<robot>.yaml --default_prompt='take the toast out of the toaster'
 ```
 
 ## **ALOHA Checkpoint Guide**

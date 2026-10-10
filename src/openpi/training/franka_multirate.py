@@ -43,9 +43,10 @@ def aligned_episode_actions(
 
     if action_horizon <= 0:
         raise ValueError("action_horizon must be positive")
-    target_ns = frame_ns[:, None] + np.rint(
-        np.arange(1, action_horizon + 1, dtype=np.float64) * (1e9 / 30.0)
-    ).astype(np.int64)[None, :]
+    target_ns = (
+        frame_ns[:, None]
+        + np.rint(np.arange(1, action_horizon + 1, dtype=np.float64) * (1e9 / 30.0)).astype(np.int64)[None, :]
+    )
     right = np.searchsorted(sample_ns, target_ns)
     left = np.clip(right - 1, 0, len(rows) - 1)
     right = np.clip(right, 0, len(rows) - 1)
@@ -55,9 +56,7 @@ def aligned_episode_actions(
     # next-measured action, matching LeRobot's end-of-episode chunk padding.
     if np.any((target_ns <= sample_ns[-1]) & (skew_ms > max_skew_ms)):
         raise ValueError(f"Camera/action timestamp skew exceeds {max_skew_ms:g} ms in {sync_path}")
-    measured = np.asarray(
-        [[*row["joint_position"], row["gripper_position"]] for row in rows], dtype=np.float32
-    )
+    measured = np.asarray([[*row["joint_position"], row["gripper_position"]] for row in rows], dtype=np.float32)
     terminal = frames[-1] if "action_joint_position" in frames[-1] else rows[-1]
     final_action = np.asarray(
         [*terminal["action_joint_position"], terminal["action_gripper_position"]], dtype=np.float32

@@ -1,3 +1,5 @@
+> 本分支使用 `scripts/train.py` / `scripts/server.py` 和 `config/train/*.yaml`。运行本例前，先在该目录创建匹配机器人和 PyTorch checkpoint 的 YAML；旧的 Python 配置名称与 JAX 权重不可直接使用。参见根目录 README。
+
 # Training on DROID
 
 Here we describe how to fine-tune the pi0.5 model on the *full* DROID dataset. This is an approximate open-source reproduction of the pi05-DROID training pipeline.
@@ -30,7 +32,7 @@ First, change the `rlds_data_dir` path in your `TrainConfig` to the directory th
 
 Then, compute normalization statistics (this will take ~10 minutes):
 ```bash
-uv run --group rlds scripts/compute_norm_stats.py --config-name pi05_full_droid_finetune --max-frames 10_000_000
+uv run --group rlds scripts/compute_norm_stats.py --config pi05_full_droid_finetune --max-frames 10_000_000
 ```
 
 Run training:

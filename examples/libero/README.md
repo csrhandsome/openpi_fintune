@@ -1,3 +1,5 @@
+> 本分支使用 `scripts/train.py` / `scripts/server.py` 和 `config/train/*.yaml`。运行本例前，先在该目录创建匹配机器人和 PyTorch checkpoint 的 YAML；旧的 Python 配置名称与 JAX 权重不可直接使用。参见根目录 README。
+
 # LIBERO Benchmark
 
 This example runs the LIBERO benchmark: https://github.com/Lifelong-Robot-Learning/LIBERO
@@ -23,7 +25,7 @@ SERVER_ARGS="--env LIBERO" docker compose -f examples/libero/compose.yml up --bu
 MUJOCO_GL=glx SERVER_ARGS="--env LIBERO" docker compose -f examples/libero/compose.yml up --build
 ```
 
-You can customize the loaded checkpoint by providing additional `SERVER_ARGS` (see `scripts/serve_policy.py`), and the LIBERO task suite by providing additional `CLIENT_ARGS` (see `examples/libero/main.py`).
+You can customize the loaded checkpoint by providing additional `SERVER_ARGS` (see `scripts/server.py`), and the LIBERO task suite by providing additional `CLIENT_ARGS` (see `examples/libero/main.py`).
 For example:
 
 ```bash
@@ -58,7 +60,7 @@ Terminal window 2:
 
 ```bash
 # Run the server
-uv run scripts/serve_policy.py --env LIBERO
+uv run scripts/server.py --config config/train/<robot>.yaml
 ```
 
 ## Results

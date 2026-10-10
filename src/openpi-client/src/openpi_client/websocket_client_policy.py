@@ -30,9 +30,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
 
-    def _wait_for_server(
-        self, timeout: Optional[float] = None
-    ) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
+    def _wait_for_server(self, timeout: Optional[float] = None) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -51,6 +49,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                         # Real-world policy inference can take >20s (e.g. first-call JIT).
                         ping_timeout=300,
                         open_timeout=10,
+                        proxy=None,
                         **connect_kwargs,
                     )
                 except TypeError:
@@ -64,12 +63,16 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 time.sleep(5)
 
     @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
+    def infer(self, obs: Dict, *, retry_on_disconnect: bool = True) -> Dict:  # noqa: UP006
         data = self._packer.pack(obs)
         try:
             self._ws.send(data)
             response = self._ws.recv()
         except websockets.exceptions.ConnectionClosed:
+            if not retry_on_disconnect:
+                raise RuntimeError(
+                    "Connection lost during RLT request; reconnect and resolve/abort the episode"
+                ) from None
             # Reconnect once on transient disconnects (e.g. server restart).
             # Cap the wait so a dead server fails the eval instead of hanging.
             self._ws, self._server_metadata = self._wait_for_server(timeout=120)
@@ -83,3 +86,6 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     @override
     def reset(self) -> None:
         pass
+
+    def close(self) -> None:
+        self._ws.close()

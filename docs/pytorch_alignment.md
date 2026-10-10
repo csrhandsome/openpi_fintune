@@ -1,0 +1,64 @@
+# PyTorch、LoRA 与 RLT 训练对齐
+
+当前实现对照本机 RLinf `61ba34e6` 和 openpi-RLT `c1e40ac3`。普通 VLA 使用 RLinf 的 PyTorch Pi0/Pi0.5 主干、flow matching 和 Euler sampler；第一阶段的 readout 使用 openpi-RLT 的 cross-attention encoder/decoder。
+
+## VLA 精度与 LoRA
+
+训练和推理加载都使用 `pytorch_training_precision`，默认 `bfloat16`。Gemma/SigLIP 主干采用 BF16，动作与时间投影、Gemma norm、视觉 patch embedding 和位置 embedding 保持 FP32，与 RLinf 的选择性转换一致。`float32` 会同时恢复权重和计算 dtype，避免参数 dtype 与输入 dtype 不一致。
+
+`*_lora` 模型名称默认启用 RLinf 的 PEFT `all-linear` 分支。也可以通过 `model.is_lora` 显式开启或关闭；`model.lora_rank` 默认 32。所有基础参数冻结，适配器的 alpha 等于 rank，dropout 为 0，A 使用 Gaussian 初始化，B 初始化为零。RLinf 的原生 attention LoRA 分支没有实现，因此不再构造之前添加的 headwise adapter。
+
+基础 checkpoint 先严格加载，再注入零更新 PEFT；完整 PEFT checkpoint 先注入适配器，再严格恢复。旧 headwise PyTorch checkpoint 会被明确拒绝，不会被当作新 PEFT checkpoint 使用。
+
+## JAX checkpoint 转换
+
+旧脚本生成 `paligemma_with_expert.*` 参数，而当前主干要求 `llm.*` 和 `img.*`。旧版 `strict=False` 会漏载主干并保存随机初始化的权重。新版直接输出 RLinf 布局，在写入前检查完整参数集合及形状，并应用相同精度规则。
+
+```bash
+uv run examples/convert_jax_model_to_pytorch.py \
+  --checkpoint-dir /path/to/jax_checkpoint \
+  --config-name config/train/openpi.yaml \
+  --output-path /path/to/new_torch_checkpoint \
+  --precision bfloat16
+```
+
+`config/train/openpi.yaml` 在 `pytorch_weight_path` 下没有 `model.safetensors` 时，用从 RLinf 复制的 `src/openpi/models_pytorch/jax_to_openpi.py` 把 `jax_weight_path` 转一次，写成 fp32，然后训练再按精度策略转 bf16。文件已经存在则不再转换。默认来源是 `gs://openpi-assets/checkpoints/pi0_base`；`model.pi05: true` 时改为 `pi05_base`。官方权重是 dense 主干，训练加载后再挂零更新 PEFT。
+
+上面的手动命令会按训练 YAML 做严格校验，并把原生 JAX LoRA 合并进 dense 权重。优化器状态不会迁移。转换会复制 normalization assets。已经由旧脚本导出的文件无法恢复被丢弃的主干，必须从原始 JAX checkpoint 重新转换。
+
+## 第一阶段代码默认值
+
+这些默认值属于 RL-token 第一阶段，普通 `mode: vla` 不使用它们；其中的增强、调度和优化器是通用训练机制，也用于普通 VLA。为了补齐联合训练能力，第一阶段默认同时更新 VLA 的可训练参数和 readout：
+
+| 项目 | 默认行为 |
+| --- | --- |
+| loss | `L_readout + 1.0 * L_vla`；readout 输入 stop-gradient |
+| 图像 | 训练时启用 RLinf 图像增强；只重建 post-transformer 图像 token |
+| mask | VLA 保留有效相机/文本 attention mask；readout 和重建 loss 不使用 mask，与参考训练调用 `None` 一致 |
+| 学习率 | warmup 1000 步，peak `2.5e-5`，cosine 到第 30000 步的 `2.5e-6` |
+| 优化器 | AdamW，betas `(0.9, 0.95)`，eps `1e-8`，weight decay `1e-10`，全局梯度裁剪 1 |
+| EMA | decay `0.99`，同时维护 VLA/readout |
+| 恢复 | 全局 `resume: true` 恢复模型、优化器、EMA、数据位置、随机状态和 step |
+
+`training/rlt.py` 的 `ReadoutDefaults` 控制联合 loss、增强、mask 和 EMA；不增加对应 YAML 开关。参考仓库也支持 `alpha=0` 的冻结 VLA 路径，这里保留为代码选项。已有通用学习率/优化器配置仍可覆盖；readout 的 `rlt.learning_rate` 为该阶段 peak learning rate。
+
+每个数字 checkpoint 同时保存匹配的 EMA `model.safetensors`、`readout.safetensors`、assets 和 `training_state.pt`。推理传入 readout 根目录时选择最新完整数字 checkpoint，并使用其中配套的 VLA，避免根目录导出过程中混用两步的权重。旧 readout 由于 query、位置参数、GeGLU、norm 和投影结构变化，需要重新训练。
+
+## 第二阶段 YAML 配置
+
+`config/train/openpi_rlt.yaml` 和 `config/server/openpi_rlt.yaml` 提供相同的小网络设置：
+
+| 字段 | 默认值与用途 |
+| --- | --- |
+| `rlt.actor.input_projection` / `rlt.critic.input_projection` | `true`：z/proprio/action 分别投影到 256/64/256，使用非 affine LayerNorm、eps `1e-6` |
+| `rlt.actor.output_mode` | `direct`：直接预测 E 步，H-E 尾部沿用 VLA reference；`residual` 可使用残差输出 |
+| `rlt.learner.actor_q_reduction` | `q1`：actor loss 使用 Q1；`min` 可改为两个 Q 的最小值；TD target 始终使用 min Q |
+| `rlt.learner.optimizer` / `weight_decay` | `adam` / `0.0`；也支持 `adamw` |
+| `rlt.learner.target_update_period` | `null`：随 actor 更新；可指定 critic 更新计数周期 |
+| `rlt.learner.delta_weight` / `smooth_action_dims` | `0.0` / `6`：在物理空间比较预测和 BC target 的相邻步增量，忽略 padding；多臂动作应按实际布局调整 |
+
+全有效 E 步情况下，这些网络和损失对应参考普通 RLT。当前还保留短 chunk mask、多臂输入、可选触觉和 H 步服务协议；这些是本项目扩展。旧 actor/critic checkpoint 结构不兼容，新格式为 `openpi-rlt-learner-v2`。独立 `force_rlt` B/C 实验网络保持自己的实现。
+
+## 验证范围
+
+使用真实小 Gemma/SigLIP 检查 Pi0/Pi0.5 × FP32/BF16 的完整转换、严格加载和 PEFT checkpoint 恢复；联合训练检查连续两步与一步后恢复的 VLA/readout/EMA 和随机状态一致。readout 的 token、重建、loss 和梯度与参考 Flax block 数值对照通过；普通 actor/critic 固定参数与本机 openpi-RLT 的误差小于 `1e-6`。这些检查验证了代码路径，尚未验证完整 2B GPU 训练的任务成功率。

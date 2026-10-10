@@ -47,7 +47,7 @@ def _infer_delay_from_prefix(prefix) -> np.ndarray:
 class Policy(BasePolicy):
     def __init__(
         self,
-        model: _model.BaseModel,
+        model: Any,
         *,
         rng: at.KeyArrayLike | None = None,
         transforms: Sequence[_transforms.DataTransformFn] = (),
@@ -90,7 +90,9 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        if self._rl_readout is not None and ("monotonic_ts" not in obs or "O_T_TCP" not in obs):
+        if self._rl_readout is not None and self._metadata.get("require_reference_anchor", True) and (
+            "monotonic_ts" not in obs or "O_T_TCP" not in obs
+        ):
             raise ValueError("RL-token requests require client monotonic_ts and measured O_T_TCP")
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
@@ -155,11 +157,11 @@ class Policy(BasePolicy):
             action_space = self._metadata.get("action_space", "joint")
             if action_space not in ("ee", "joint"):
                 raise ValueError(f"Unsupported RL-token action space: {action_space}")
-            physical_action_dim = 7 if action_space == "ee" else 8
+            physical_action_dim = self._metadata.get("action_dim", 7 if action_space == "ee" else 8)
             if physical_actions.ndim != 2 or physical_actions.shape[1] != physical_action_dim:
                 raise ValueError(f"Physical VLA {action_space} actions must have shape [H,{physical_action_dim}]")
             outputs["z_rlt"] = rl_tokens[0].detach().float().cpu().numpy().reshape(-1)
-            if action_space == "joint":
+            if action_space == "joint" and physical_action_dim == 8:
                 outputs["ref_q"] = physical_actions[:, :7].copy()
             outputs["ref_chunk"] = physical_actions.copy()
             outputs["ref_obs_ts"] = obs.get("monotonic_ts")
