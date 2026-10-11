@@ -90,6 +90,12 @@ def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch):  # noqa: F8
         config, num_train_steps=1, rlt=dataclasses.replace(config.rlt, output_dir=str(tmp_path / "resumed"))
     )
     rlt.train(resumed)
+    # Single-process checkpoints predating DDP have neither field.
+    old_path = tmp_path / "resumed/1/training_state.pt"
+    old_state = torch.load(old_path, weights_only=True)
+    old_state.pop("rng_by_rank")
+    old_state["settings"].pop("num_gpus")
+    torch.save(old_state, old_path)
     rlt.train(dataclasses.replace(resumed, num_train_steps=2, resume=True))
     final = torch.load(tmp_path / "resumed/2/training_state.pt", weights_only=True)
     for module in ("vla", "readout"):

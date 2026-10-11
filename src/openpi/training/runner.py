@@ -4,6 +4,8 @@ from openpi.training.config import TrainConfig
 
 
 def train(config: TrainConfig) -> None:
+    if config.mode == "rlt" and config.rlt.stage != "sft" and config.num_gpus != 1:
+        raise ValueError("actor_critic and force use one process; set train.num_gpus: 1")
     if config.mode == "vla":
         from openpi.training import vla
 

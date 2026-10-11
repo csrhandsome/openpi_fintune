@@ -38,7 +38,8 @@ train:
   checkpoint_base_dir: ./checkpoints  # 保存至 checkpoints/openpi/ee/<step>/
   seed: 42
   batch_size: 5             # 一次优化器更新的全局 batch
-  micro_batch_size: 1       # 每张卡一次前向的 batch；累积步数 = batch_size / (micro_batch_size * GPU 数)
+  micro_batch_size: 1       # 每张卡一次前向的 batch；累积步数 = batch_size / (micro_batch_size * num_gpus)
+  num_gpus: 1               # 启动 DDP；每卡保留完整 VLA，分配不同数据并同步梯度，不切分模型
   num_workers: 2
   num_train_steps: 30000
   log_interval: 100

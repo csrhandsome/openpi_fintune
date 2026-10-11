@@ -1,8 +1,8 @@
 """Openpi-RLT Stage 1 defaults, joint VLA/readout training, EMA and resume."""
 
+import contextlib
 import dataclasses
 import json
-import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -10,6 +10,7 @@ import tempfile
 import numpy as np
 from safetensors.torch import save_file
 import torch
+import torch.distributed as dist
 
 from openpi.models_pytorch.rl_token import RLTokenConfig
 from openpi.models_pytorch.rl_token import RLTokenReadout
@@ -56,6 +57,59 @@ def _next(iterator, loader):
         return next(iterator), iterator
 
 
+class _Stage1Model(torch.nn.Module):
+    """Run both losses through DDP.forward, keeping export modules unwrapped."""
+
+    def __init__(self, vla, readout, defaults):
+        super().__init__()
+        self.vla = vla
+        self.readout = readout
+        self.defaults = defaults
+
+    def forward(self, observation, actions):
+        if self.defaults.alpha > 0:
+            per_element, prefix, mask = self.vla.compute_loss_with_prefix(
+                observation, actions, train=self.defaults.augment_images
+            )
+            vla_loss = per_element.mean()
+        else:
+            with torch.no_grad():
+                prefix, mask = self.vla.extract_prefix_embeddings(
+                    observation, image_only=True, train=self.defaults.augment_images
+                )
+            vla_loss = prefix.new_zeros(())
+        reconstruction, tokens = self.readout.reconstruction_loss(prefix.detach().float(), mask)
+        loss = reconstruction + self.defaults.alpha * vla_loss
+        return loss, reconstruction.detach(), vla_loss.detach(), tokens.detach(), prefix.detach()
+
+
+def _rng_state():
+    numpy_state = np.random.get_state()
+    return {
+        "rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "numpy_rng": (numpy_state[0], torch.from_numpy(numpy_state[1].astype(np.int64)), *numpy_state[2:]),
+    }
+
+
+def _restore_rng(saved):
+    torch.set_rng_state(saved["rng"].cpu())
+    if saved["cuda_rng"] and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([value.cpu() for value in saved["cuda_rng"]])
+    numpy_rng = saved["numpy_rng"]
+    np.random.set_state((numpy_rng[0], numpy_rng[1].cpu().numpy().astype(np.uint32), *numpy_rng[2:]))
+
+
+def _wrap(module, device):
+    if not any(parameter.requires_grad for parameter in module.parameters()):
+        return module
+    return torch.nn.parallel.DistributedDataParallel(
+        module,
+        device_ids=[device.index] if getattr(device, "type", None) == "cuda" else None,
+        find_unused_parameters=True,
+    )
+
+
 def _latest(output):
     candidates = [path for path in output.iterdir() if path.name.isdecimal() and (path / "training_state.pt").is_file()]
     if not candidates:
@@ -68,8 +122,21 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
     if config.mode != "rlt":
         raise ValueError("Readout backend requires mode=rlt")
     validate_dataset(config)
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise ValueError("Readout training currently requires a single process")
+    world_size = train_config.require_world_size(config)
+    use_ddp = world_size > 1
+    if use_ddp:
+        from openpi.training.vla import cleanup_ddp
+        from openpi.training.vla import setup_ddp
+
+        _, _, device = setup_ddp()
+        if config.rlt.device == "cpu":
+            raise ValueError("train.num_gpus > 1 cannot use rlt.device: cpu")
+        is_main = dist.get_rank() == 0
+    else:
+        is_main = True
+        device = config.rlt.device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
     if config.rlt.vla_checkpoint is None:
         raise ValueError("Set rlt.vla_checkpoint to an existing PyTorch VLA checkpoint directory")
     checkpoint = train_config.local_path(config.rlt.vla_checkpoint)
@@ -94,11 +161,10 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
     config = dataclasses.replace(config, data=data)
     if data.create(config.assets_dirs, config.model).norm_stats is None:
         raise ValueError(f"VLA normalization stats missing under {checkpoint / 'assets'}")
-    if config.overwrite and not config.resume and output.exists():
+    if is_main and config.overwrite and not config.resume and output.exists():
         shutil.rmtree(output)
-    device = config.rlt.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if use_ddp:
+        dist.barrier()
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     vla = config.model.load_pytorch(config, str(weight_path)).to(device)
@@ -142,6 +208,7 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         "seed": config.seed,
         "batch_size": config.batch_size,
         "micro_batch_size": config.micro_batch_size,
+        "num_gpus": config.num_gpus,
         "dataset": config.data.repo_id,
         "data": train_config.to_dict(config)["data"],
         "num_workers": config.num_workers,
@@ -150,7 +217,9 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
     saved = None
     if config.resume:
         saved = torch.load(_latest(output) / "training_state.pt", map_location=device, weights_only=True)
-        if saved["settings"] != settings:
+        saved_settings = {**saved["settings"]}
+        saved_settings.setdefault("num_gpus", 1)  # Checkpoints predating DDP were single-process.
+        if saved_settings != settings:
             raise ValueError("Stage 1 resume settings differ from the saved training state")
         vla.load_state_dict(saved["vla"], strict=True)
         readout.load_state_dict(saved["readout"], strict=True)
@@ -158,19 +227,28 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         ema, start_step = saved["ema"], saved["step"]
     if start_step > config.num_train_steps:
         raise ValueError("num_train_steps is smaller than the resumed step")
-    micro_batch, accumulation = train_config.gradient_accumulation(config, 1)
-    loader = data_loader.create_data_loader(config, shuffle=True, batch_size=micro_batch)
+    training_model = _Stage1Model(vla, readout, defaults)
+    if use_ddp:
+        training_model = _wrap(training_model, device)
+        # Initialize identical weights, then use independent augmentation/noise streams.
+        torch.manual_seed(config.seed + dist.get_rank())
+        np.random.seed(config.seed + dist.get_rank())
+    micro_batch, accumulation = train_config.gradient_accumulation(config, world_size)
+    loader = data_loader.create_data_loader(config, shuffle=True, batch_size=micro_batch * world_size)
     iterator = iter(loader)
     # TorchDataLoader owns a separately seeded generator. Replaying consumed
     # batches restores its position without consuming training noise/augmentation RNG.
     for _ in range(start_step * accumulation):
         _, iterator = _next(iterator, loader)
     if saved is not None:
-        torch.set_rng_state(saved["rng"].cpu())
-        if saved["cuda_rng"] and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all([value.cpu() for value in saved["cuda_rng"]])
-        numpy_rng = saved["numpy_rng"]
-        np.random.set_state((numpy_rng[0], numpy_rng[1].cpu().numpy().astype(np.uint32), *numpy_rng[2:]))
+        if "rng_by_rank" in saved:
+            if len(saved["rng_by_rank"]) != world_size:
+                raise ValueError("Stage 1 resume requires the saved number of ranks")
+            _restore_rng(saved["rng_by_rank"][dist.get_rank() if use_ddp else 0])
+        elif use_ddp:
+            raise ValueError("Distributed Stage 1 checkpoint is missing per-rank RNG states")
+        else:
+            _restore_rng(saved)
         del saved
     metadata = config.policy_metadata or {}
     action_space = metadata.get(
@@ -198,6 +276,13 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         manifest["physical_joint_dim"] = 7
 
     def save(step):
+        local_rng = _rng_state()
+        rng_by_rank = [local_rng]
+        if use_ddp:
+            rng_by_rank = [None] * world_size if is_main else None
+            dist.gather_object(local_rng, rng_by_rank, dst=0)
+        if not is_main:
+            return
         output.mkdir(parents=True, exist_ok=True)
         directory = output / str(step)
         temporary = Path(tempfile.mkdtemp(prefix=".stage1-", dir=output))
@@ -206,7 +291,6 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
                 save_file(
                     {key: value.detach().cpu().contiguous() for key, value in ema[name].items()}, temporary / filename
                 )
-            numpy_state = np.random.get_state()
             torch.save(
                 {
                     "step": step,
@@ -215,9 +299,8 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
                     "readout": readout.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "ema": ema,
-                    "rng": torch.get_rng_state(),
-                    "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-                    "numpy_rng": (numpy_state[0], torch.from_numpy(numpy_state[1].astype(np.int64)), *numpy_state[2:]),
+                    **local_rng,  # Preserve compatibility with single-process checkpoints.
+                    "rng_by_rank": rng_by_rank,
                 },
                 temporary / "training_state.pt",
             )
@@ -241,7 +324,7 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
                 shutil.rmtree(temporary)
 
     tracking = None
-    if config.wandb_enabled:
+    if is_main and config.wandb_enabled:
         import wandb
 
         tracking = wandb.init(project=config.project_name, name=config.exp_name, config=train_config.to_dict(config))
@@ -252,26 +335,18 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
             group["lr"] = learning_rate
         optimizer.zero_grad(set_to_none=True)
         totals = []
-        for _ in range(accumulation):
+        for micro_index in range(accumulation):
             (observation, actions), iterator = _next(iterator, loader)
             observation = Observation.from_observation_like(observation)
             observation = Observation.from_dict(_device_tree(observation.to_dict(), device))
             if defaults.alpha > 0:
                 actions = actions.to(device=device, dtype=torch.float32)
-                per_element, prefix, mask = vla.compute_loss_with_prefix(
-                    observation, actions, train=defaults.augment_images
-                )
-                vla_loss = per_element.mean()
-            else:
-                with torch.no_grad():
-                    prefix, mask = vla.extract_prefix_embeddings(
-                        observation, image_only=True, train=defaults.augment_images
-                    )
-                vla_loss = prefix.new_zeros(())
-            reconstruction, tokens = readout.reconstruction_loss(prefix.detach().float(), mask)
-            loss = reconstruction + defaults.alpha * vla_loss
-            totals.append((loss.detach(), reconstruction.detach(), vla_loss.detach(), tokens.detach()))
-            (loss / accumulation).backward()
+            # All-reduce once per optimizer step, after the last micro-batch.
+            sync = training_model.no_sync() if use_ddp and micro_index + 1 < accumulation else contextlib.nullcontext()
+            with sync:
+                loss, reconstruction, vla_loss, tokens, prefix = training_model(observation, actions)
+                (loss / accumulation).backward()
+            totals.append((loss.detach(), reconstruction, vla_loss, tokens))
         torch.nn.utils.clip_grad_norm_(parameters, config.optimizer.clip_gradient_norm)
         optimizer.step()
         loss = torch.stack([item[0] for item in totals]).mean()
@@ -293,16 +368,22 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
             "token_std": float(tokens.std()),
         }
         manifest.update(prefix_shape=list(prefix.shape[1:]), final_reconstruction_mse=metrics["rlt_loss"])
-        if (step + 1) % config.log_interval == 0 or step == start_step:
+        if is_main and ((step + 1) % config.log_interval == 0 or step == start_step):
             print(json.dumps({"step": step + 1, **metrics}))
             if tracking is not None:
                 tracking.log(metrics, step=step + 1)
         if (step + 1) % config.save_interval == 0:
             save(step + 1)
             last_saved = step + 1
+            if use_ddp:
+                dist.barrier()
     if last_saved != config.num_train_steps:
-        if start_step == config.num_train_steps:
+        if is_main and start_step == config.num_train_steps:
             manifest.update(json.loads((_latest(output) / "manifest.json").read_text()))
         save(config.num_train_steps)
+    if use_ddp:
+        dist.barrier()
     if tracking is not None:
         tracking.finish()
+    if use_ddp:
+        cleanup_ddp()

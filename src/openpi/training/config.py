@@ -54,6 +54,7 @@ _TRAIN_FIELD_ORDER = (
     "seed",
     "batch_size",
     "micro_batch_size",
+    "num_gpus",
     "num_workers",
     "num_train_steps",
     "log_interval",
@@ -128,6 +129,7 @@ class TrainConfig:
     batch_size: int = 5
     # Per-GPU forward batch. None keeps one optimizer step equal to batch_size.
     micro_batch_size: int | None = None
+    num_gpus: int = 1
     num_workers: int = 2
     num_train_steps: int = 30_000
     log_interval: int = 100
@@ -160,7 +162,7 @@ class TrainConfig:
             value = getattr(self, key)
             if not isinstance(value, str) or not value or value in (".", "..") or pathlib.Path(value).name != value:
                 raise ValueError(f"{key} must be a nonempty directory name")
-        for key in ("batch_size", "num_train_steps", "log_interval", "save_interval"):
+        for key in ("batch_size", "num_train_steps", "log_interval", "save_interval", "num_gpus"):
             _positive_int(key, getattr(self, key))
         if self.micro_batch_size is not None:
             _positive_int("micro_batch_size", self.micro_batch_size)
@@ -250,6 +252,20 @@ def _find_config(config_name: str | pathlib.Path) -> pathlib.Path:
         if len(matches) == 1:
             return matches[0]
     raise FileNotFoundError(f"Training YAML not found: {path}. Configs live under {TRAIN_CONFIG_DIR}")
+
+
+def require_world_size(config: TrainConfig) -> int:
+    """Return the process count selected by train.num_gpus.
+
+    scripts/train.py starts that many processes. A manual torchrun launch must use the same count.
+    """
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world != config.num_gpus:
+        raise ValueError(
+            f"train.num_gpus is {config.num_gpus}, but WORLD_SIZE is {world}. "
+            "Run scripts/train.py so it starts the configured number of processes."
+        )
+    return world
 
 
 def gradient_accumulation(config: TrainConfig, world_size: int) -> tuple[int, int]:

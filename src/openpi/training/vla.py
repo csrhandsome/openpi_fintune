@@ -24,9 +24,9 @@ import wandb
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
+from openpi.training.base_weights import ensure_pytorch_base_weights
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
-from openpi.training.base_weights import ensure_pytorch_base_weights
 from openpi.training.validation import validate_dataset
 
 
@@ -154,7 +154,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         return
 
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps:
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -321,7 +321,7 @@ def train_loop(config: _config.TrainConfig):
         raise ValueError(f"Torch training supports Pi0Config only; got {type(config.model).__name__}.")
     model_cfg = dataclasses.replace(config.model, dtype=config.pytorch_training_precision)
     validate_dataset(config)
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    world_size = _config.require_world_size(config)
     _config.gradient_accumulation(config, world_size)
     if (
         not config.resume
@@ -372,9 +372,11 @@ def train_loop(config: _config.TrainConfig):
             if not any(key.startswith("llm.") for key in keys) or not any(key.startswith("img.") for key in keys):
                 raise ValueError(f"Expected RLinf-layout Pi0 weights with llm.* and img.* keys: {base_model_path}")
 
-    if not resuming and config.overwrite and config.checkpoint_dir.exists():
+    if is_main and not resuming and config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+    if use_ddp:
+        dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
@@ -473,7 +475,6 @@ def train_loop(config: _config.TrainConfig):
             device_ids=[device.index] if device.type == "cuda" else None,
             find_unused_parameters=True,
             gradient_as_bucket_view=True,
-            static_graph=world_size >= 8,
         )
 
     # Optimizer + learning rate schedule from config
@@ -538,10 +539,6 @@ def train_loop(config: _config.TrainConfig):
 
     data_iter = iter(loader)
     while global_step < config.num_train_steps:
-        # Set epoch for distributed training
-        if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
-
         for pg in optim.param_groups:
             pg["lr"] = lr_schedule(global_step)
         logged_loss = 0.0
@@ -553,16 +550,16 @@ def train_loop(config: _config.TrainConfig):
                 observation, actions = next(data_iter)
             observation = move_tree_to_device_dtype(observation, device, weight_dtype)
             actions = actions.to(device=device, dtype=weight_dtype)
-            losses = model(observation, actions)
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-            raw_loss = losses.mean()
-            logged_loss += float(raw_loss.detach())
             # All-reduce only on the last micro-batch so DDP averages the full step once.
             sync = model.no_sync() if use_ddp and micro_index + 1 < accumulation else contextlib.nullcontext()
             with sync:
+                losses = model(observation, actions)
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                raw_loss = losses.mean()
+                logged_loss += float(raw_loss.detach())
                 (raw_loss / accumulation).backward()
 
         loss = logged_loss / accumulation
@@ -572,9 +569,7 @@ def train_loop(config: _config.TrainConfig):
             log_memory_usage(device, global_step, "after_backward")
 
         # Gradient clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            trainable_parameters, max_norm=config.optimizer.clip_gradient_norm
-        )
+        grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=config.optimizer.clip_gradient_norm)
 
         # Optimizer step
         optim.step()
@@ -636,9 +631,7 @@ def train_loop(config: _config.TrainConfig):
         # Update progress bar
         if pbar is not None:
             pbar.update(1)
-            pbar.set_postfix(
-                {"loss": f"{loss:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
-            )
+            pbar.set_postfix({"loss": f"{loss:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step})
 
     # Close progress bar
     if pbar is not None:

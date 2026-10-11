@@ -51,11 +51,13 @@ def test_yaml_cli_and_paths_are_independent_of_cwd(tmp_path, monkeypatch):
     assert default.name == "openpi"
     assert default.model.is_lora is True
     assert default.model.lora_rank == 32
+    assert default.num_gpus == 1
     assert config.gradient_accumulation(default, 1) == (1, default.batch_size)
     readout = config.get_config("openpi_rlt")
     assert readout.model.is_lora is True
     assert readout.rlt.embed_dim == 2048
     assert readout.rlt.alpha == 0.0
+    assert readout.num_gpus == 1
     assert default.assets_dirs == config.REPO_ROOT / "data/assets/openpi"
     selected = config.cli(
         [

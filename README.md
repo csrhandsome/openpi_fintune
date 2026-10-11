@@ -1,6 +1,6 @@
 # openpi-force
 
-本仓库基于 Physical Intelligence 的 openpi，使用 RLinf 对齐的 PyTorch Pi0/Pi05 训练 VLA，并提供 VLA/readout 联合训练。任务参数放在仓库根目录 `config/train/`；RL-token 第一阶段的联合 loss、增强、EMA 等使用代码默认值，详见 [实现对齐说明](docs/pytorch_alignment.md)。
+本仓库基于 Physical Intelligence 的 openpi，使用 RLinf 对齐的 PyTorch Pi0/Pi05 训练 VLA，并提供 readout 与可选的 VLA/readout 联合训练。任务参数放在仓库根目录 `config/train/`；RL-token 第一阶段默认 `rlt.alpha: 0`，冻结 VLA，只训练 readout，详见 [实现对齐说明](docs/pytorch_alignment.md)。
 
 ## 环境
 
@@ -58,11 +58,12 @@ uv run scripts/train.py --config config/train/openpi.yaml
 ```bash
 uv run scripts/train.py --config config/train/openpi.yaml --batch-size 8 --exp-name example
 uv run scripts/train.py --config config/train/openpi.yaml --exp-name example --resume
+uv run scripts/train.py --config config/train/openpi.yaml --num-gpus 2 --batch-size 8
 uv run torchrun --standalone --nproc_per_node=2 scripts/train.py \
-  --config config/train/openpi.yaml --batch-size 8
+  --config config/train/openpi.yaml --num-gpus 2 --batch-size 8
 ```
 
-batch 为全局 batch，DDP 按进程数均分。普通 checkpoint 包含 `model.safetensors`、`optimizer.pt`、`metadata.pt`、`config.yaml` 和归一化资产。
+`train.batch_size` 是每次优化器更新的全局 batch，`train.micro_batch_size` 是每卡一次前向的 batch。`train.num_gpus` 控制自动启动的 DDP 进程数；例如 batch 8、micro batch 1、两卡时累积四次后更新。每卡保留完整模型，DDP 不切分模型权重。普通 checkpoint 包含 `model.safetensors`、`optimizer.pt`、`metadata.pt`、`config.yaml` 和归一化资产。
 
 ## 离线 RL-token 训练与服务
 
@@ -73,7 +74,7 @@ uv run scripts/train.py --config config/train/openpi_rlt.yaml
 uv run scripts/server.py --config config/train/openpi_rlt.yaml --port 8001
 ```
 
-readout 输出目录包含 `readout.safetensors`、`manifest.json` 和 `config.yaml`；每到 `save_interval` 也保存步骤子目录。推理按当前观测生成 `z_rlt`，并返回物理空间的 `ref_chunk`。当前 readout 训练使用单进程，不支持 resume。
+readout 输出目录包含配套 EMA `model.safetensors`、`readout.safetensors`、`manifest.json` 和 `config.yaml`；定期与结束时保存步骤子目录及可恢复的 `training_state.pt`。推理按当前观测生成 `z_rlt`，并返回物理空间的 `ref_chunk`。readout 第一阶段支持 DDP 和 `train.resume: true`；`rlt.alpha > 0` 时联合训练 VLA。
 
 普通 VLA 服务默认选取 YAML 保存目录中的最新 PyTorch checkpoint；也可指定现有 checkpoint：
 

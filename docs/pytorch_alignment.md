@@ -28,21 +28,29 @@ uv run examples/convert_jax_model_to_pytorch.py \
 
 ## 第一阶段代码默认值
 
-这些默认值属于 RL-token 第一阶段，普通 `mode: vla` 不使用它们；其中的增强、调度和优化器是通用训练机制，也用于普通 VLA。为了补齐联合训练能力，第一阶段默认同时更新 VLA 的可训练参数和 readout：
+这些默认值属于 RL-token 第一阶段，普通 `mode: vla` 不使用它们；其中的增强、调度和优化器也用于普通 VLA。第一阶段默认冻结 VLA，只训练 readout；`rlt.alpha > 0` 时同时更新 VLA 的可训练参数：
 
 | 项目 | 默认行为 |
 | --- | --- |
-| loss | `L_readout + 1.0 * L_vla`；readout 输入 stop-gradient |
+| loss | `L_readout + rlt.alpha * L_vla`，默认 `alpha=0`；readout 输入 stop-gradient |
 | 图像 | 训练时启用 RLinf 图像增强；只重建 post-transformer 图像 token |
 | mask | VLA 保留有效相机/文本 attention mask；readout 和重建 loss 不使用 mask，与参考训练调用 `None` 一致 |
 | 学习率 | warmup 1000 步，peak `2.5e-5`，cosine 到第 30000 步的 `2.5e-6` |
 | 优化器 | AdamW，betas `(0.9, 0.95)`，eps `1e-8`，weight decay `1e-10`，全局梯度裁剪 1 |
 | EMA | decay `0.99`，同时维护 VLA/readout |
-| 恢复 | 全局 `resume: true` 恢复模型、优化器、EMA、数据位置、随机状态和 step |
+| 恢复 | `train.resume: true` 恢复模型、优化器、EMA、数据位置、各 rank 随机状态和 step |
 
-`training/rlt.py` 的 `ReadoutDefaults` 控制联合 loss、增强、mask 和 EMA；不增加对应 YAML 开关。参考仓库也支持 `alpha=0` 的冻结 VLA 路径，这里保留为代码选项。已有通用学习率/优化器配置仍可覆盖；readout 的 `rlt.learning_rate` 为该阶段 peak learning rate。
+`rlt.alpha` 控制联合 loss。`training/rlt.py` 的 `ReadoutDefaults` 保留增强、mask 和 EMA 默认值。`rlt.embed_dim` 默认 2048，与 Gemma 2B 宽度一致，不增加输入/输出投影；设为不同宽度时增加两层 Linear。已有通用学习率/优化器配置仍可覆盖；readout 的 `rlt.learning_rate` 为该阶段 peak learning rate。
 
 每个数字 checkpoint 同时保存匹配的 EMA `model.safetensors`、`readout.safetensors`、assets 和 `training_state.pt`。推理传入 readout 根目录时选择最新完整数字 checkpoint，并使用其中配套的 VLA，避免根目录导出过程中混用两步的权重。旧 readout 由于 query、位置参数、GeGLU、norm 和投影结构变化，需要重新训练。
+
+## 多卡与梯度累积
+
+普通 VLA 和 `rlt.stage: sft` 使用 PyTorch DDP。`scripts/train.py` 按 `train.num_gpus` 自动启动进程；每卡保留完整模型，读取不同数据，同步梯度。这里没有实现 RLinf 的 FSDP 参数/优化器分片；DDP 不能解决单卡放不下完整模型的问题。RLinf 的 `NO_SHARD` 配置同样复制模型，分片能力取决于它的具体配置。
+
+与 RLinf 一样，累积次数为 `train.batch_size / (train.micro_batch_size * train.num_gpus)`，必须整除。例如全局 batch 8、每卡 micro batch 1、两卡时，累积四次再更新一次。默认 batch 5 不能直接配两卡或四卡。前向和反向都放在 DDP `no_sync` 内，最后一次 micro batch 才同步；数据 sampler 每个 epoch 重新洗牌。RLT 的冻结与联合路径通过同一个 DDP 模块计算 loss。
+
+RLT checkpoint 保存每个 rank 的 CPU、CUDA 和 NumPy RNG 状态，恢复时各自加载。恢复要求保持卡数、batch 和其他训练设置一致。旧单进程 checkpoint 的随机状态仍可恢复；没有各 rank 随机状态的旧多进程 checkpoint 会明确报错。
 
 ## 第二阶段 YAML 配置
 

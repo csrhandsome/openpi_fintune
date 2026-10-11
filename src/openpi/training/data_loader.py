@@ -286,7 +286,12 @@ def create_torch_data_loader(
         raise ValueError(f"Global batch_size={batch_size} must be positive and divisible by world_size={world_size}")
     if world_size > 1:
         sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=torch.distributed.get_rank(), shuffle=shuffle, drop_last=True
+            dataset,
+            num_replicas=world_size,
+            rank=torch.distributed.get_rank(),
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=True,
         )
     loader = TorchDataLoader(
         dataset,
@@ -374,7 +379,10 @@ class TorchDataLoader:
 
     def __iter__(self):
         num_items = 0
+        epoch = 0
         while True:
+            if isinstance(self._data_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                self._data_loader.sampler.set_epoch(epoch)
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
@@ -385,6 +393,7 @@ class TorchDataLoader:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
                 yield tree_map(torch.as_tensor, batch)
+            epoch += 1
 
 
 def _collate_fn(items):
