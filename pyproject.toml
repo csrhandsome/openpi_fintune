@@ -27,8 +27,10 @@ dependencies = [
     "orbax-checkpoint==0.11.13",
     "pillow>=11.0.0",
     "sentencepiece>=0.2.0",
-    "torch==2.7.1",
-    "torchvision==0.22.1",
+    # PyPI's default 2.7.1 wheel is CUDA 12.6 and has no sm_120 kernels.
+    # RTX 5090 needs the CUDA 12.8 build from the PyTorch index below.
+    "torch==2.7.1+cu128",
+    "torchvision==0.22.1+cu128",
     "torchcodec>=0.3,<0.5; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "tqdm-loggable>=0.2",
     "typing-extensions>=4.12.2",
@@ -77,9 +79,16 @@ environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The optional RLDS environment uses TensorFlow 2.18 alongside LeRobot's NumPy 2.
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "tensorflow==2.18.1"]
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.uv.sources]
 openpi-client = { workspace = true }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.uv.workspace]
 members = ["src/openpi-client"]

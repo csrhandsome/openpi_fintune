@@ -10,6 +10,8 @@ import torch
 from torch.utils._pytree import tree_map
 
 import openpi.models.model as _model
+from openpi.training.collector_frames import LegacyCollectorFrames
+from openpi.training.collector_frames import sequence_keys
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 from openpi.training.franka_multirate import MultirateFrankaDataset
@@ -137,10 +139,13 @@ def create_torch_dataset(
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
     if data_config.align_franka_action_trace and not np.isclose(dataset_meta.fps, 30.0, atol=0.01):
         raise ValueError(f"ROS multirate training requires a 30 Hz LeRobot dataset, got {dataset_meta.fps} Hz")
+    # Cameras with dtype "video" are decoded from videos/<key>/*.mp4 by LeRobot.
+    # Retained collector datasets store one combined actions column instead of action.*.
+    keys, legacy_actions = sequence_keys(dataset_meta.features, data_config.action_sequence_keys)
     delta_timestamps = (
         {}
         if data_config.align_franka_action_trace
-        else {key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys}
+        else {key: [t / dataset_meta.fps for t in range(action_horizon)] for key in keys}
     )
     delta_timestamps.update(
         {
@@ -152,7 +157,12 @@ def create_torch_dataset(
         data_config.repo_id,
         root=dataset_meta.root,
         delta_timestamps=delta_timestamps or None,
+        # Policies consume uint8 images; avoid converting decoded MP4 pixels to
+        # float32 only to convert them back before preprocessing.
+        return_uint8=True,
     )
+    if legacy_actions:
+        dataset = LegacyCollectorFrames(dataset)
 
     if data_config.align_franka_action_trace:
         dataset = MultirateFrankaDataset(dataset, action_horizon)
