@@ -80,6 +80,11 @@ environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "tensorflow==2.18.1"]
 
 [[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
