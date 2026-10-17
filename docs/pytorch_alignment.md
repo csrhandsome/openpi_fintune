@@ -6,9 +6,18 @@
 
 训练和推理加载都使用 `pytorch_training_precision`，默认 `bfloat16`。Gemma/SigLIP 主干采用 BF16，动作与时间投影、Gemma norm、视觉 patch embedding 和位置 embedding 保持 FP32，与 RLinf 的选择性转换一致。`float32` 会同时恢复权重和计算 dtype，避免参数 dtype 与输入 dtype 不一致。
 
-`*_lora` 模型名称默认启用 RLinf 的 PEFT `all-linear` 分支。也可以通过 `model.is_lora` 显式开启或关闭；`model.lora_rank` 默认 32。所有基础参数冻结，适配器的 alpha 等于 rank，dropout 为 0，A 使用 Gaussian 初始化，B 初始化为零。RLinf 的原生 attention LoRA 分支没有实现，因此不再构造之前添加的 headwise adapter。
+FP32 保留参数直接维持 FP32，不先经 BF16 再转回，避免完整 checkpoint 恢复时截断视觉或 norm 权重的精度。
 
-基础 checkpoint 先严格加载，再注入零更新 PEFT；完整 PEFT checkpoint 先注入适配器，再严格恢复。旧 headwise PyTorch checkpoint 会被明确拒绝，不会被当作新 PEFT checkpoint 使用。
+`model.is_lora` 显式开启或关闭 LoRA；未设置时，`*_lora` 模型名称启用 LoRA。`model.lora_mode` 选择训练范围：
+
+| 模式 | Gemma 语言模型与动作专家 | 视觉编码器与外部动作/状态/时间投影 |
+| --- | --- | --- |
+| `lora_only`（默认，所有原始权重冻结） | PEFT 线性层 LoRA；基础参数冻结 | 线性层 PEFT LoRA；基础参数冻结 |
+| `openpi` | PEFT 线性层 LoRA；基础参数冻结 | 无 adapter，原始参数全部可训练 |
+
+`openpi` 对应官方 JAX 示例只冻结 `llm` 非 LoRA 权重的训练范围；Gemma 的 adapter 仍使用 PEFT，不复刻 JAX 原生 headwise/FFN LoRA 的参数结构、初始化或各 expert 的 rank，也不改变现有 BF16/FP32 策略。因此两种框架的训练轨迹不保证一致。`model.lora_rank` 默认 32，控制当前两种模式的 PEFT rank；alpha 等于 rank，dropout 为 0，A 使用 Gaussian 初始化，B 初始化为零。RLinf 的原生 attention LoRA 分支没有实现，因此不再构造之前添加的 headwise adapter。`is_lora: false` 时不注入 adapter，保持全参训练。
+
+基础 checkpoint 先严格加载，再注入零更新 PEFT；完整 PEFT checkpoint 先按配置模式注入适配器，再严格恢复。两种模式的 checkpoint 参数结构不同，加载和续训须保持模式与 rank 一致。切换模式时使用 dense 基础权重和新的实验目录。旧配置没有 `lora_mode` 时按 `lora_only` 加载，保持原有的 all-linear LoRA 训练范围。旧 headwise PyTorch checkpoint 会被明确拒绝，不会被当作新 PEFT checkpoint 使用。
 
 ## JAX checkpoint 转换
 
@@ -48,7 +57,7 @@ uv run examples/convert_jax_model_to_pytorch.py \
 
 普通 VLA 和 `rlt.stage: sft` 使用 PyTorch DDP。`scripts/train.py` 按 `train.num_gpus` 自动启动进程；每卡保留完整模型，读取不同数据，同步梯度。这里没有实现 RLinf 的 FSDP 参数/优化器分片；DDP 不能解决单卡放不下完整模型的问题。RLinf 的 `NO_SHARD` 配置同样复制模型，分片能力取决于它的具体配置。
 
-与 RLinf 一样，累积次数为 `train.batch_size / (train.micro_batch_size * train.num_gpus)`，必须整除。例如全局 batch 8、每卡 micro batch 1、两卡时，累积四次再更新一次。默认 batch 5 不能直接配两卡或四卡。前向和反向都放在 DDP `no_sync` 内，最后一次 micro batch 才同步；数据 sampler 每个 epoch 重新洗牌。RLT 的冻结与联合路径通过同一个 DDP 模块计算 loss。
+普通 VLA YAML 默认 `train.micro_batch_size: null`，不做梯度累积，每卡一次处理 `train.batch_size / train.num_gpus` 个样本；单卡 batch 5 就是整批 5 条一起计算。设为整数后，累积次数为 `train.batch_size / (train.micro_batch_size * train.num_gpus)`，必须整除。梯度累积也可用于单卡：batch 5、micro batch 1、单卡时累积五次；batch 8、micro batch 1、两卡时累积四次。RLT YAML 仍显式使用 micro batch 1。默认 batch 5 不能直接配两卡或四卡。前向和反向都放在 DDP `no_sync` 内，最后一次 micro batch 才同步；数据 sampler 每个 epoch 重新洗牌。RLT 的冻结与联合路径通过同一个 DDP 模块计算 loss。
 
 RLT checkpoint 保存每个 rank 的 CPU、CUDA 和 NumPy RNG 状态，恢复时各自加载。恢复要求保持卡数、batch 和其他训练设置一致。旧单进程 checkpoint 的随机状态仍可恢复；没有各 rank 随机状态的旧多进程 checkpoint 会明确报错。
 

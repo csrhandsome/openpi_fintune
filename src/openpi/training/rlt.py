@@ -219,6 +219,8 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         saved = torch.load(_latest(output) / "training_state.pt", map_location=device, weights_only=True)
         saved_settings = {**saved["settings"]}
         saved_settings.setdefault("num_gpus", 1)  # Checkpoints predating DDP were single-process.
+        saved_settings["model"] = {**saved_settings["model"]}
+        saved_settings["model"].setdefault("lora_mode", "lora_only")
         if saved_settings != settings:
             raise ValueError("Stage 1 resume settings differ from the saved training state")
         vla.load_state_dict(saved["vla"], strict=True)

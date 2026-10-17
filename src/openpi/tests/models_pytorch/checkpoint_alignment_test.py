@@ -183,7 +183,9 @@ def test_complete_jax_conversion_and_runtime_load(tiny_backbone, tmp_path, monke
 
 
 @pytest.mark.parametrize("precision", ["float32", "bfloat16"])
-def test_peft_initial_output_and_checkpoint_roundtrip(tiny_backbone, tmp_path, precision):
+@pytest.mark.parametrize("lora_mode", ["lora_only", "openpi"])
+@pytest.mark.parametrize("pi05", [False, True])
+def test_peft_initial_output_and_checkpoint_roundtrip(tiny_backbone, tmp_path, precision, lora_mode, pi05):
     del tiny_backbone
     config = pi0_config.Pi0Config(
         paligemma_variant="dummy",
@@ -191,26 +193,93 @@ def test_peft_initial_output_and_checkpoint_roundtrip(tiny_backbone, tmp_path, p
         dtype=precision,
         action_horizon=2,
         is_lora=True,
+        lora_mode=lora_mode,
         lora_rank=2,
+        pi05=pi05,
     )
     model = pi0_pytorch.PI0Pytorch(config)
     model.to_bfloat16_for_selected_params(precision)
     inputs = torch.randn(2, 32)
     expected = model.action_in_proj(inputs).detach()
     model.apply_lora_freeze()
+    model.to_bfloat16_for_selected_params(precision)
     torch.testing.assert_close(model.action_in_proj(inputs), expected, rtol=0, atol=0)
-    assert all("lora_" in name for name, parameter in model.named_parameters() if parameter.requires_grad)
+    for name, parameter in model.named_parameters():
+        assert parameter.requires_grad == ("lora_" in name or (lora_mode == "openpi" and not name.startswith("llm.")))
     with torch.no_grad():
-        model.action_in_proj.lora_B["default"].weight.normal_()
+        model.llm.layers[0].attn.q_proj[0].lora_B["default"].weight.normal_()
+        if lora_mode == "openpi":
+            model.img.stem.weight.add_(0.1)
+            model.action_in_proj.weight.add_(0.1)
+        else:
+            model.action_in_proj.lora_B["default"].weight.normal_()
     path = tmp_path / "model.safetensors"
     save_file(model.state_dict(), path)
     settings = type("Settings", (), {"model": config, "pytorch_training_precision": precision})()
     restored = config.load_pytorch(settings, path)
     torch.testing.assert_close(restored.action_in_proj(inputs), model.action_in_proj(inputs), rtol=0, atol=0)
     assert load_file(path).keys() == restored.state_dict().keys()
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(restored.state_dict()[name], parameter, rtol=0, atol=0)
+    assert {name for name, p in restored.named_parameters() if p.requires_grad} == {
+        name for name, p in model.named_parameters() if p.requires_grad
+    }
+    other_mode = dataclasses.replace(config, lora_mode="openpi" if lora_mode == "lora_only" else "lora_only")
+    with pytest.raises(RuntimeError, match="Missing key|Unexpected key"):
+        other_mode.load_pytorch(
+            type("Settings", (), {"model": other_mode, "pytorch_training_precision": precision})(), path
+        )
     base = dataclasses.replace(config, is_lora=False)
     with pytest.raises(ValueError, match="PEFT checkpoint requires"):
         base.load_pytorch(type("Settings", (), {"model": base, "pytorch_training_precision": precision})(), path)
+
+
+@pytest.mark.parametrize("lora_mode", ["lora_only", "openpi"])
+@pytest.mark.parametrize("precision", ["float32", "bfloat16"])
+def test_lora_training_updates_selected_weights(tiny_backbone, lora_mode, precision):
+    del tiny_backbone
+    config = pi0_config.Pi0Config(
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_horizon=2,
+        dtype=precision,
+        is_lora=True,
+        lora_mode=lora_mode,
+        lora_rank=2,
+    )
+    network = pi0_pytorch.PI0Pytorch(config)
+    # Real training loads a pretrained, nonzero SigLIP output head.
+    with torch.no_grad():
+        network.img.head.weight.normal_(std=0.02)
+    network.to_bfloat16_for_selected_params(precision)
+    network.apply_lora_freeze()
+    network.to_bfloat16_for_selected_params(precision)
+    parameters = dict(network.named_parameters())
+    before = {name: parameter.detach().clone() for name, parameter in parameters.items()}
+    observation = torch_model.Observation(
+        images={key: torch.randn(1, 224, 224, 3) for key in torch_model.IMAGE_KEYS},
+        image_masks={key: torch.ones(1, dtype=torch.bool) for key in torch_model.IMAGE_KEYS},
+        state=torch.randn(1, 32),
+        tokenized_prompt=torch.ones(1, 2, dtype=torch.long),
+        tokenized_prompt_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+    optimizer = torch.optim.AdamW([p for p in network.parameters() if p.requires_grad], lr=0.01)
+    network(observation, torch.randn(1, 2, 32), train=False).mean().backward()
+    if lora_mode == "openpi":
+        for name in ("img.stem.weight", "img.encoder.layers.0.attn.in_proj_weight", "action_out_proj.weight"):
+            assert parameters[name].grad is not None
+            assert parameters[name].grad.abs().sum() > 0
+    optimizer.step()
+    for name, parameter in parameters.items():
+        if not parameter.requires_grad:
+            assert parameter.grad is None
+            torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+    if lora_mode == "openpi":
+        assert not torch.equal(network.img.stem.weight, before["img.stem.weight"])
+        assert not torch.equal(network.action_out_proj.weight, before["action_out_proj.weight"])
+        assert not any("lora_" in name for name in parameters if not name.startswith("llm."))
+    adapter = "llm.layers.0.attn.q_proj.0.lora_B.default.weight"
+    assert not torch.equal(parameters[adapter], before[adapter])
 
 
 def test_jax_native_lora_is_merged_before_conversion(tiny_backbone):

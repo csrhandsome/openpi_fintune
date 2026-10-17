@@ -11,9 +11,11 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: Variant = "gemma_2b"
     action_expert_variant: Variant = "gemma_300m"
-    # PyTorch uses RLinf's PEFT all-linear adapter path. Legacy *_lora
-    # variants select that path when is_lora is unspecified.
+    # Legacy *_lora variants enable adapters when is_lora is unspecified.
     is_lora: bool | None = None
+    # openpi trains vision/projections directly; lora_only freezes all base weights.
+    # Both modes use PEFT adapters for the Gemma backbone.
+    lora_mode: Literal["lora_only", "openpi"] = "lora_only"
     lora_rank: int = 32
 
     # Set the model specific defaults.
@@ -32,6 +34,8 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("lora_rank must be a positive integer")
         if self.is_lora is not None and type(self.is_lora) is not bool:
             raise ValueError("is_lora must be boolean or None")
+        if self.lora_mode not in ("lora_only", "openpi"):
+            raise ValueError("lora_mode must be lora_only or openpi")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:

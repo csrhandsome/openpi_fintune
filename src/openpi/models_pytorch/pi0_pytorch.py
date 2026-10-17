@@ -445,25 +445,19 @@ class PI0Pytorch(model.BaseModel):
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
         """OpenPI ``PaliGemmaWithExpertModel.to_bfloat16_for_selected_params``.
 
-        OpenPI calls ``self.to(dtype)`` on ``paligemma_with_expert`` only
-        (SigLIP + PaliGemma Gemma + action-expert Gemma), then restores a
-        subset of those weights to fp32. Action / value heads live outside
-        that module and must not be converted — so this uses ``llm`` +
-        ``img``, never ``self.to()``.
+        Apply the OpenPI dtype selection to SigLIP and both Gemma experts.
+        Keep fp32 parameters in fp32 throughout conversion so restoring trained
+        vision weights does not round them through bf16. External heads retain
+        their dtype.
         """
         self.embed_dtype = _str_to_dtype(precision)
         self.llm.embed_dtype = self.embed_dtype
         self.img.dtype_mm = self.embed_dtype
-        # Same branch order as OpenPI: bf16 converts then falls through to
-        # the fp32 restore; float32 converts and returns.
-        if precision == "bfloat16":
-            self.llm.to(dtype=torch.bfloat16)
-            self.img.to(dtype=torch.bfloat16)
-        elif precision == "float32":
+        if precision == "float32":
             self.llm.to(dtype=torch.float32)
             self.img.to(dtype=torch.float32)
             return
-        else:
+        if precision != "bfloat16":
             raise ValueError(f"Invalid precision: {precision}")
 
         # 1:1 with OpenPI's substring list. Names come from
@@ -488,8 +482,8 @@ class PI0Pytorch(model.BaseModel):
         for name, param in self.named_parameters():
             if not (name.startswith(("llm.", "img."))):
                 continue
-            if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
+            dtype = torch.float32 if any(selector in name for selector in params_to_keep_float32) else torch.bfloat16
+            param.data = param.data.to(dtype=dtype)
 
     def sample_actions(
         self,
@@ -582,7 +576,7 @@ class PI0Pytorch(model.BaseModel):
         return self.llm.gradient_checkpointing and self.img.encoder.gradient_checkpointing
 
     def apply_lora_freeze(self):
-        """Enable RLinf's PEFT all-linear adapters and freeze base weights."""
+        """Apply PEFT adapters and the configured LoRA training scope."""
         weights.enable_lora(self)
 
     def load_weights(self, state):

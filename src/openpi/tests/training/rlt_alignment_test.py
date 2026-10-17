@@ -17,7 +17,8 @@ from openpi.training import config as train_config
 from openpi.training import rlt
 
 
-def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("lora_mode", ["lora_only", "openpi"])
+def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch, lora_mode):  # noqa: F811
     del tiny_backbone
     config = train_config.get_config("openpi_rlt")
     base_config = dataclasses.replace(
@@ -33,7 +34,7 @@ def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch):  # noqa: F8
     torch.manual_seed(12)
     base = PI0Pytorch(base_config)
     save_file(base.state_dict(), checkpoint / "model.safetensors")
-    model_config = dataclasses.replace(base_config, is_lora=True, lora_rank=2)
+    model_config = dataclasses.replace(base_config, is_lora=True, lora_mode=lora_mode, lora_rank=2)
     config = dataclasses.replace(
         config,
         name="joint-fixture",
@@ -74,6 +75,8 @@ def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch):  # noqa: F8
     full = torch.load(tmp_path / "full/2/training_state.pt", weights_only=True)
     assert any(name.endswith("lora_B.default.weight") and value.count_nonzero() for name, value in full["vla"].items())
     for name, original in base.state_dict().items():
+        if lora_mode == "openpi" and not name.startswith("llm."):
+            continue
         key = name if name in full["vla"] else name.rsplit(".", 1)[0] + ".base_layer." + name.rsplit(".", 1)[1]
         torch.testing.assert_close(full["vla"][key], original, rtol=0, atol=0)
     for module, filename in (("vla", "model.safetensors"), ("readout", "readout.safetensors")):
@@ -95,6 +98,8 @@ def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch):  # noqa: F8
     old_state = torch.load(old_path, weights_only=True)
     old_state.pop("rng_by_rank")
     old_state["settings"].pop("num_gpus")
+    if lora_mode == "lora_only":
+        old_state["settings"]["model"].pop("lora_mode")
     torch.save(old_state, old_path)
     rlt.train(dataclasses.replace(resumed, num_train_steps=2, resume=True))
     final = torch.load(tmp_path / "resumed/2/training_state.pt", weights_only=True)

@@ -9,7 +9,8 @@ model:
   pi05: false
   paligemma_variant: gemma_2b
   action_expert_variant: gemma_300m
-  is_lora: true            # false：全参微调；true：RLinf PEFT all-linear，基础权重冻结
+  is_lora: true            # false：全参微调；true：按 lora_mode 选择训练范围
+  lora_mode: lora_only     # lora_only：所有原始权重冻结，只训 LoRA；openpi：Gemma LoRA，视觉/动作/状态/时间投影全参更新
   lora_rank: 32
   action_dim: 32           # 模型内部 padding，必须 >= data.action_dim
   action_horizon: 50
@@ -38,7 +39,7 @@ train:
   checkpoint_base_dir: ./checkpoints  # 保存至 checkpoints/openpi/ee/<step>/
   seed: 42
   batch_size: 5             # 一次优化器更新的全局 batch
-  micro_batch_size: 1       # 每张卡一次前向的 batch；累积步数 = batch_size / (micro_batch_size * num_gpus)
+  micro_batch_size: null    # null：每卡一次处理 batch_size / num_gpus，不累积；整数：每卡前向 batch，单/多卡均可累积
   num_gpus: 1               # 启动 DDP；每卡保留完整 VLA，分配不同数据并同步梯度，不切分模型
   num_workers: 2
   num_train_steps: 30000

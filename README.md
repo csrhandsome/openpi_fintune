@@ -63,7 +63,16 @@ uv run torchrun --standalone --nproc_per_node=2 scripts/train.py \
   --config config/train/openpi.yaml --num-gpus 2 --batch-size 8
 ```
 
-`train.batch_size` 是每次优化器更新的全局 batch，`train.micro_batch_size` 是每卡一次前向的 batch。`train.num_gpus` 控制自动启动的 DDP 进程数；例如 batch 8、micro batch 1、两卡时累积四次后更新。每卡保留完整模型，DDP 不切分模型权重。普通 checkpoint 包含 `model.safetensors`、`optimizer.pt`、`metadata.pt`、`config.yaml` 和归一化资产。
+`model.is_lora: true` 时，用 `model.lora_mode` 选择训练范围：
+
+| 设置 | Gemma 语言模型与动作专家 | SigLIP | 动作、状态、时间投影 |
+| --- | --- | --- | --- |
+| `lora_mode: lora_only`（默认） | PEFT LoRA，基础权重冻结 | 线性层 PEFT LoRA，基础权重冻结 | PEFT LoRA，基础权重冻结 |
+| `lora_mode: openpi` | PEFT LoRA，基础权重冻结 | 更新原始权重 | 更新原始权重 |
+
+例如 `uv run scripts/train.py --config config/train/openpi.yaml --model.lora-mode openpi`。`openpi` 模式兼容官方 JAX 示例的视觉/投影训练范围，Gemma adapter 仍使用当前 PEFT 实现，不是官方 JAX 原生 LoRA 的逐算子移植。`model.lora_rank` 控制两种模式的 PEFT rank；`model.is_lora: false` 时全参训练。完整 PEFT checkpoint 必须使用原来的模式和 rank 加载、续训；切换模式应从 dense 基础权重开启新实验。
+
+`train.batch_size` 是每次优化器更新的全局 batch。普通 VLA 的 `train.micro_batch_size` 默认 `null`：每卡一次处理 `batch_size / num_gpus` 个样本，反传一次就更新；单卡默认一次处理全部 5 条。显式设为整数才指定每卡一次前向的 batch，并按 `batch_size / (micro_batch_size * num_gpus)` 次累积后更新，要求整除。梯度累积可用于单卡或多卡：batch 5、micro batch 1、单卡时累积五次；batch 8、micro batch 1、两卡时累积四次。`train.num_gpus` 控制自动启动的 DDP 进程数；每卡保留完整模型，DDP 不切分模型权重。普通 checkpoint 包含 `model.safetensors`、`optimizer.pt`、`metadata.pt`、`config.yaml` 和归一化资产。
 
 ## 离线 RL-token 训练与服务
 

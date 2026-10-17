@@ -51,8 +51,10 @@ def test_yaml_cli_and_paths_are_independent_of_cwd(tmp_path, monkeypatch):
     assert default.name == "openpi"
     assert default.model.is_lora is True
     assert default.model.lora_rank == 32
+    assert default.model.lora_mode == "lora_only"
     assert default.num_gpus == 1
-    assert config.gradient_accumulation(default, 1) == (1, default.batch_size)
+    assert default.micro_batch_size is None
+    assert config.gradient_accumulation(default, 1) == (default.batch_size, 1)
     readout = config.get_config("openpi_rlt")
     assert readout.model.is_lora is True
     assert readout.rlt.embed_dim == 2048
@@ -87,6 +89,7 @@ def test_yaml_cli_and_paths_are_independent_of_cwd(tmp_path, monkeypatch):
         {"mode": "jax"},
         {"model": {"type": "pi0_fast"}},
         {"model": {"freeze_filter": "anything"}},
+        {"model": {"lora_mode": "anything"}},
         {"optimizer": {"type": "optax"}},
     ],
 )
@@ -146,10 +149,29 @@ def test_absolute_targets_and_delta_roundtrip(space, dim):
 
 
 def test_effective_snapshot_roundtrip(tmp_path):
-    settings = config.cli(["--batch-size", "8", "--exp-name", "snapshot"])
+    settings = config.cli(["--batch-size", "8", "--exp-name", "snapshot", "--model.lora-mode", "openpi"])
     config.save_config(settings, tmp_path)
     restored = config.get_config(tmp_path / "config.yaml")
     assert restored.batch_size == 8
     assert restored.exp_name == "snapshot"
+    assert restored.model.lora_mode == "openpi"
     assert restored.data.action_space == "ee_delta"
     assert restored.checkpoint_dir == settings.checkpoint_dir
+
+
+@pytest.mark.parametrize(
+    ("batch", "micro", "world", "expected"),
+    [(5, None, 1, (5, 1)), (5, 1, 1, (1, 5)), (8, None, 2, (4, 1)), (8, 1, 2, (1, 4))],
+)
+def test_batch_splitting_with_and_without_accumulation(batch, micro, world, expected):
+    settings = dataclasses.replace(config.get_config(), batch_size=batch, micro_batch_size=micro, num_gpus=world)
+    assert config.gradient_accumulation(settings, world) == expected
+
+
+@pytest.mark.parametrize("mode", ["lora_only", "openpi"])
+def test_yaml_lora_mode_and_legacy_default(tmp_path, mode):
+    model = config.to_dict(config.get_config())["model"]
+    model["lora_mode"] = mode
+    assert config.get_config(_yaml(tmp_path, model=model)).model.lora_mode == mode
+    del model["lora_mode"]
+    assert config.get_config(_yaml(tmp_path, model=model)).model.lora_mode == "lora_only"

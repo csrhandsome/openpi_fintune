@@ -127,7 +127,7 @@ class TrainConfig:
     checkpoint_base_dir: str = "./checkpoints"
     seed: int = 42
     batch_size: int = 5
-    # Per-GPU forward batch. None keeps one optimizer step equal to batch_size.
+    # Per-GPU forward batch; None uses batch_size / world_size without accumulation.
     micro_batch_size: int | None = None
     num_gpus: int = 1
     num_workers: int = 2

@@ -1,4 +1,6 @@
-"""RLinf PEFT adapters and complete checkpoint loading for PyTorch Pi0."""
+"""PEFT adapters with RLinf or OpenPI training scopes and strict weight loading."""
+
+import torch
 
 
 def uses_lora(config):
@@ -15,6 +17,16 @@ def enable_lora(model):
     from peft import inject_adapter_in_model
 
     rank = getattr(model.config, "lora_rank", 32)
+    mode = getattr(model.config, "lora_mode", "lora_only")
+    if mode not in ("lora_only", "openpi"):
+        raise ValueError("lora_mode must be lora_only or openpi")
+    targets = "all-linear"
+    if mode == "openpi":
+        targets = [
+            name
+            for name, module in model.named_modules()
+            if name.startswith("llm.") and isinstance(module, torch.nn.Linear)
+        ]
     for parameter in model.parameters():
         parameter.requires_grad_(requires_grad=False)
     inject_adapter_in_model(
@@ -22,11 +34,17 @@ def enable_lora(model):
             r=rank,
             lora_alpha=rank,
             lora_dropout=0.0,
-            target_modules="all-linear",
+            target_modules=targets,
             init_lora_weights="gaussian",
         ),
         model,
     )
+    if mode == "openpi":
+        # Official JAX freeze filters only freeze non-LoRA parameters in llm.
+        # Vision and the external action/state/time projections train directly.
+        for name, parameter in model.named_parameters():
+            if not name.startswith("llm."):
+                parameter.requires_grad_(requires_grad=True)
     model.peft_enabled = True
 
 

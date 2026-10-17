@@ -10,7 +10,8 @@ model:
   pi05: false
   paligemma_variant: gemma_2b
   action_expert_variant: gemma_300m
-  is_lora: true            # false：全参微调；true：RLinf PEFT all-linear，基础权重冻结
+  is_lora: true            # false：全参微调；true：按 lora_mode 选择训练范围
+  lora_mode: lora_only     # 须与 VLA checkpoint 一致；lora_only：只训 LoRA；openpi：视觉/动作/状态/时间投影全参更新
   lora_rank: 32
   action_dim: 32
   action_horizon: 16

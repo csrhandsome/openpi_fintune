@@ -22,6 +22,7 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
+from openpi.models_pytorch import weights as _weights
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 from openpi.training.base_weights import ensure_pytorch_base_weights
@@ -525,7 +526,11 @@ def train_loop(config: _config.TrainConfig):
             f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
         )
         logging.info(
-            f"Optimizer: {type(config.optimizer).__name__}, trainable_params={len(trainable_parameters)}, "
+            f"Optimizer: {type(config.optimizer).__name__}, "
+            f"lora_enabled={_weights.uses_lora(model_cfg)}, "
+            f"lora_mode={model_cfg.lora_mode}, "
+            f"trainable_params={sum(parameter.numel() for parameter in trainable_parameters)}, "
+            f"trainable_tensors={len(trainable_parameters)}, "
             f"weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
         logging.info(f"Training precision: {model_cfg.dtype}")

@@ -8,12 +8,16 @@ import pytest
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 from openpi.models import pi0_config
+from openpi.tests.models_pytorch import checkpoint_alignment_test
 from openpi.training import config as _config
 from openpi.training import vla as train
 from openpi.training.validation import validate_dataset
 
 
-def test_train(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("lora_mode", [None, "lora_only", "openpi"])
+def test_train(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, lora_mode):
+    checkpoint_alignment_test.tiny_backbone.__wrapped__(monkeypatch)
+    monkeypatch.setattr(checkpoint_alignment_test.gemma, "PALIGEMMA_VOCAB_SIZE", 2048)
     monkeypatch.setattr(train.torch.cuda, "is_available", lambda: False)
     config = dataclasses.replace(
         _config.get_config("openpi"),
@@ -24,7 +28,13 @@ def test_train(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
         wandb_enabled=False,
         batch_size=1,
         model=pi0_config.Pi0Config(
-            paligemma_variant="dummy", action_expert_variant="dummy", action_horizon=2, max_token_len=8
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_horizon=2,
+            max_token_len=8,
+            is_lora=lora_mode is not None,
+            lora_mode=lora_mode or "lora_only",
+            lora_rank=2,
         ),
         checkpoint_base_dir=str(tmp_path / "checkpoint"),
         exp_name="test",
