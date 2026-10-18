@@ -19,7 +19,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
-import wandb
 
 import openpi.models.pi0_config
 from openpi.models_pytorch import weights as _weights
@@ -28,6 +27,7 @@ import openpi.shared.normalize as _normalize
 from openpi.training.base_weights import ensure_pytorch_base_weights
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+from openpi.training.tracking import init_tracking
 from openpi.training.validation import validate_dataset
 
 
@@ -51,28 +51,6 @@ def init_logging():
         logger.addHandler(ch)
     else:
         logger.handlers[0].setFormatter(formatter)
-
-
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
-    """Initialize wandb logging."""
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
-
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=_config.to_dict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
 
 def setup_ddp():
@@ -149,7 +127,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, tracker=None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -198,9 +176,9 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+        # Log checkpoint to the experiment tracker
+        if tracker is not None:
+            tracker.log({"checkpoint_step": global_step}, step=global_step)
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -338,7 +316,7 @@ def train_loop(config: _config.TrainConfig):
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
 
-    # Initialize checkpoint directory and wandb
+    # Initialize checkpoint directory and the experiment tracker
     resuming = False
     if config.resume:
         # Find checkpoint directory based on experiment name
@@ -389,10 +367,11 @@ def train_loop(config: _config.TrainConfig):
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
-    # Initialize wandb (only on main process)
+    # Initialize the selected tracker only on the main process.
+    tracker = None
     if is_main:
         _config.save_config(config, config.checkpoint_dir)
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        tracker = init_tracking(config, config.checkpoint_dir, resuming=resuming)
 
     # One optimizer step covers batch_size samples. Each forward uses micro_batch_size per GPU.
     world_size = torch.distributed.get_world_size() if use_ddp else 1
@@ -404,8 +383,8 @@ def train_loop(config: _config.TrainConfig):
 
     loader, data_config = build_datasets(config, batch_size=micro_batch * world_size)
 
-    # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
+    # Log sample images to the experiment tracker on first batch
+    if tracker is not None and not resuming:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, shuffle=False, batch_size=micro_batch * world_size)
         sample_batch = next(iter(sample_data_loader))
@@ -414,21 +393,22 @@ def train_loop(config: _config.TrainConfig):
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
-        # Create sample images for wandb
+        # Create sample images for the experiment tracker
         images_to_log = []
         # Get batch size from the first image tensor
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
         for i in range(min(5, batch_size)):
             # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
-            img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
+            # Loaders may supply NHWC floats or NCHW tensors; Trackers need uint8 HWC pixels.
+            views = [img[i].permute(1, 2, 0) if img.shape[1] == 3 else img[i] for img in sample_batch["image"].values()]
+            img_concatenated = torch.cat(views, dim=1).detach().float().cpu()
+            img_concatenated = ((img_concatenated + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+            images_to_log.append(tracker.Image(img_concatenated))
 
-        wandb.log({"camera_views": images_to_log}, step=0)
+        tracker.log({"camera_views": images_to_log}, step=0)
 
         # Clear sample batch from memory aggressively
-        del sample_batch, observation, actions, images_to_log, img_concatenated
+        del sample_batch, observation, actions, images_to_log, img_concatenated, views
         del sample_data_loader  # Also delete the sample data loader
         gc.collect()
         if torch.cuda.is_available():
@@ -614,8 +594,8 @@ def train_loop(config: _config.TrainConfig):
                 else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
             )
 
-            # Log to wandb
-            if config.wandb_enabled and len(infos) > 0:
+            # Log to the experiment tracker
+            if tracker is not None and len(infos) > 0:
                 log_payload = {
                     "loss": avg_loss,
                     "learning_rate": avg_lr,
@@ -624,14 +604,14 @@ def train_loop(config: _config.TrainConfig):
                 }
                 if avg_grad_norm is not None:
                     log_payload["grad_norm"] = avg_grad_norm
-                wandb.log(log_payload, step=global_step)
+                tracker.log(log_payload, step=global_step)
 
             start_time = time.time()
             infos = []  # Reset stats collection
 
         global_step += 1
         # Save checkpoint using the new mechanism
-        save_checkpoint(model, optim, global_step, config, is_main, data_config)
+        save_checkpoint(model, optim, global_step, config, is_main, data_config, tracker)
 
         # Update progress bar
         if pbar is not None:
@@ -642,9 +622,9 @@ def train_loop(config: _config.TrainConfig):
     if pbar is not None:
         pbar.close()
 
-    # Finish wandb run
-    if is_main and config.wandb_enabled:
-        wandb.finish()
+    # Finish the experiment tracker run
+    if tracker is not None:
+        tracker.finish()
 
     cleanup_ddp()
 

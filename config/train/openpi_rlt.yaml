@@ -38,10 +38,10 @@ train:
   num_workers: 2
   num_train_steps: 5000
   log_interval: 100
-  save_interval: 1000
+  save_interval: 5000       # 注意：num_train_steps 也是 5000，这里等于只在末步存一个
   overwrite: false
   resume: false
-  wandb_enabled: false
+  tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
 
 rlt:
   stage: sft               # sft / actor_critic / force；显式选路径，各 stage 独立运行

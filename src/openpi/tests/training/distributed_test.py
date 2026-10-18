@@ -40,7 +40,7 @@ def _config(directory, mode, alpha):
         num_workers=0,
         num_train_steps=2,
         save_interval=10,
-        wandb_enabled=False,
+        tracking_backend="none",
         pytorch_training_precision="float32",
         requires_pytorch_weights=False,
         pytorch_weight_path=None,

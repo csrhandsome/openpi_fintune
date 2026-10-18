@@ -2,7 +2,7 @@
 name: openpi
 mode: vla
 project_name: openpi
-exp_name: ee
+exp_name: joint_7_6_audio_qwen_asr
 
 model:
   type: pi0
@@ -11,18 +11,18 @@ model:
   action_expert_variant: gemma_300m
   is_lora: true            # false：全参微调；true：按 lora_mode 选择训练范围
   lora_mode: lora_only     # lora_only：所有原始权重冻结，只训 LoRA；openpi：Gemma LoRA，视觉/动作/状态/时间投影全参更新
-  lora_rank: 32
+  lora_rank: 48
   action_dim: 32           # 模型内部 padding，必须 >= data.action_dim
   action_horizon: 50
   max_token_len: 48
 
 data:
   type: franka
-  action_space: ee_delta   # joint / ee / ee_delta（数据集均为绝对目标）
-  action_dim: 7            # 启动时校验实际动作维度；EE 单臂 6+1=7，双臂 (6+1)*2=14
+  action_space: joint      # joint / ee / ee_delta（数据集均为绝对目标）
+  action_dim: 8            # 单臂关节动作：7 个关节角 + 1 维夹爪
   motion_dim: null         # 每臂：EE 默认为 6，joint 默认为 7
   gripper_dim: 1           # 每臂夹爪维度；joint 单臂默认总维度 7+1=8
-  repo_id: openpi/franka_lerobot_test_100hz
+  repo_id: openpi/franka_lerobot_7_6_audio_qwen_asr_v3_mp4
   prompt_from_task: true
   assets:
     assets_dir: null       # 默认 data/assets/openpi/<repo_id>/norm_stats.json
@@ -36,18 +36,18 @@ train:
   requires_pytorch_weights: true
   pytorch_training_precision: bfloat16
   assets_base_dir: ./data/assets
-  checkpoint_base_dir: ./checkpoints  # 保存至 checkpoints/openpi/ee/<step>/
+  checkpoint_base_dir: ./checkpoints  # 保存至 checkpoints/openpi/<exp_name>/<step>/
   seed: 42
-  batch_size: 5             # 一次优化器更新的全局 batch
+  batch_size: 12             # 一次优化器更新的全局 batch
   micro_batch_size: null    # null：每卡一次处理 batch_size / num_gpus，不累积；整数：每卡前向 batch，单/多卡均可累积
   num_gpus: 1               # 启动 DDP；每卡保留完整 VLA，分配不同数据并同步梯度，不切分模型
   num_workers: 2
   num_train_steps: 30000
   log_interval: 100
-  save_interval: 1000
+  save_interval: 5000        # 每 5000 步存一个（30000 步共 6 个）；末步必定保存
   overwrite: false
   resume: false
-  wandb_enabled: false
+  tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
 
 lr_schedule:
   warmup_steps: 1000
@@ -62,4 +62,4 @@ optimizer:
   clip_gradient_norm: 1.0
 
 policy_metadata:
-  action_fps: 30.0        # action_space/dim/horizon 从 data/model 自动派生
+  action_fps: 20.0

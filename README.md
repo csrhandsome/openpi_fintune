@@ -12,6 +12,19 @@ uv sync --locked
 
 底层共享模型和变换仍有 JAX 兼容依赖；训练、优化器、数据加载和 checkpoint 保存使用 PyTorch。
 
+在训练 YAML 的 `train.tracking_backend` 中选择日志平台：
+
+```yaml
+train:
+  tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
+```
+
+两份训练配置默认选择 `swanlab`。也可用 `--tracking-backend wandb` 或 `--tracking-backend none` 临时覆盖。首次使用对应平台前执行 `uv run swanlab login` 或 `uv run wandb login`；也支持 `SWANLAB_API_KEY` / `WANDB_API_KEY` 环境变量，密钥无需写入 YAML。
+
+`project_name` 指定项目，`exp_name` 指定实验名。普通 VLA 和 RLT readout（`stage: sft`）记录训练指标；VLA 还记录相机样本和 checkpoint 步数。DDP 仅主进程上传。续训读取输出目录中对应的 `swanlab_id.txt` 或 `wandb_id.txt`；切换平台且没有该平台的 ID 时新建实验，保留另一平台的 ID。
+
+日志统一放在 `data/`：`data/swanlab/<name>/<exp_name>/`、`data/wandb/<name>/<exp_name>/`，SwanLab SDK 默认日志为 `data/swanlog/`，均由 `data/` 忽略规则覆盖。旧 checkpoint YAML 中的 `wandb_enabled` / `swanlab_enabled` 自动转换为相应平台或关闭状态，新保存的配置统一使用 `tracking_backend`。
+
 ## 配置与入口
 
 | 配置 | 用途 | 默认保存目录 |

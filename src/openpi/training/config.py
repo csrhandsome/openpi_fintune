@@ -61,7 +61,7 @@ _TRAIN_FIELD_ORDER = (
     "save_interval",
     "overwrite",
     "resume",
-    "wandb_enabled",
+    "tracking_backend",
 )
 _TRAIN_FIELDS = frozenset(_TRAIN_FIELD_ORDER)
 
@@ -136,7 +136,7 @@ class TrainConfig:
     save_interval: int = 1000
     overwrite: bool = False
     resume: bool = False
-    wandb_enabled: bool = False
+    tracking_backend: Literal["none", "wandb", "swanlab"] = "none"
     policy_metadata: tyro.conf.Suppress[dict[str, Any] | None] = None
     rlt: RLTTrainingConfig = dataclasses.field(default_factory=RLTTrainingConfig)
     config_path: tyro.conf.Suppress[str | None] = None
@@ -170,7 +170,9 @@ class TrainConfig:
                 raise ValueError("batch_size must be divisible by micro_batch_size")
         if type(self.num_workers) is not int or self.num_workers < 0:
             raise ValueError("num_workers must be a nonnegative integer")
-        for key in ("requires_pytorch_weights", "overwrite", "resume", "wandb_enabled"):
+        if self.tracking_backend not in ("none", "wandb", "swanlab"):
+            raise ValueError("tracking_backend must be none, wandb or swanlab")
+        for key in ("requires_pytorch_weights", "overwrite", "resume"):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f"{key} must be boolean")
         if self.resume and self.overwrite:
@@ -288,11 +290,32 @@ def gradient_accumulation(config: TrainConfig, world_size: int) -> tuple[int, in
     return config.micro_batch_size, config.batch_size // (config.micro_batch_size * world_size)
 
 
+def _migrate_tracking_settings(values):
+    # Accept logging switches stored by older checkpoint configs.
+    enabled_backends = []
+    has_legacy_switch = False
+    for backend in ("wandb", "swanlab"):
+        key = f"{backend}_enabled"
+        if key in values:
+            has_legacy_switch = True
+            enabled = values.pop(key)
+            if type(enabled) is not bool:
+                raise ValueError(f"{key} must be boolean")
+            if enabled:
+                enabled_backends.append(backend)
+    if "tracking_backend" not in values and has_legacy_switch:
+        if len(enabled_backends) > 1:
+            raise ValueError("Choose one tracking_backend: wandb or swanlab")
+        values["tracking_backend"] = enabled_backends[0] if enabled_backends else "none"
+
+
 def _hoist_train(values):
+    _migrate_tracking_settings(values)
     nested = values.pop("train", None)
     if nested is None:
         return values
     nested = _mapping(nested, "train")
+    _migrate_tracking_settings(nested)
     unknown = nested.keys() - _TRAIN_FIELDS
     if unknown:
         raise ValueError(f"Unknown train settings: {', '.join(sorted(unknown))}")

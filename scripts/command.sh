@@ -33,8 +33,9 @@ ps aux | grep clash
 
 export UV_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
 
-# wandb 账户登录
-wandb login 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
+# 按 train.tracking_backend 选择对应平台登录（交互输入 API Key）
+uv run swanlab login
+# uv run wandb login
 
 # hf镜像源
 export HF_ENDPOINT=https://hf-mirror.com

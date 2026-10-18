@@ -42,7 +42,7 @@ def test_joint_ema_and_resume(tiny_backbone, tmp_path, monkeypatch, lora_mode): 
         pytorch_training_precision="float32",
         num_train_steps=2,
         save_interval=1,
-        wandb_enabled=False,
+        tracking_backend="none",
         lr_schedule=dataclasses.replace(config.lr_schedule, warmup_steps=0),
         rlt=dataclasses.replace(
             config.rlt,

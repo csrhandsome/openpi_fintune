@@ -10,22 +10,33 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 from openpi.models import pi0_config
 from openpi.tests.models_pytorch import checkpoint_alignment_test
 from openpi.training import config as _config
+from openpi.training import tracking
 from openpi.training import vla as train
 from openpi.training.validation import validate_dataset
 
 
-@pytest.mark.parametrize("lora_mode", [None, "lora_only", "openpi"])
-def test_train(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, lora_mode):
+@pytest.mark.parametrize(
+    ("lora_mode", "tracking_backend"),
+    [(None, "none"), ("lora_only", "none"), ("openpi", "none"), (None, "swanlab"), (None, "wandb")],
+)
+def test_train(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, lora_mode, tracking_backend):
     checkpoint_alignment_test.tiny_backbone.__wrapped__(monkeypatch)
     monkeypatch.setattr(checkpoint_alignment_test.gemma, "PALIGEMMA_VOCAB_SIZE", 2048)
     monkeypatch.setattr(train.torch.cuda, "is_available", lambda: False)
+    if tracking_backend != "none":
+        monkeypatch.setattr(tracking, "LOG_ROOT", tmp_path / "data")
+        for variable in ("SWANLAB_LOG_DIR", "WANDB_CACHE_DIR", "WANDB_DATA_DIR"):
+            monkeypatch.delenv(variable, raising=False)
+        monkeypatch.setenv("SWANLAB_MODE", "offline")
+        monkeypatch.setenv("WANDB_MODE", "offline")
+        monkeypatch.setenv("SWANLAB_SAVE_DIR", str(tmp_path / "credentials"))
     config = dataclasses.replace(
         _config.get_config("openpi"),
         data=_config.FakeDataConfig(),
         requires_pytorch_weights=False,
         pytorch_weight_path=None,
         jax_weight_path=None,
-        wandb_enabled=False,
+        tracking_backend=tracking_backend,
         batch_size=1,
         model=pi0_config.Pi0Config(
             paligemma_variant="dummy",
@@ -62,7 +73,7 @@ def test_finetune_config_requires_pytorch_checkpoint(tmp_path: pathlib.Path, mon
         checkpoint_base_dir=str(tmp_path),
         pytorch_weight_path=str(tmp_path / "torch"),
         jax_weight_path=str(tmp_path / "missing-jax"),
-        wandb_enabled=False,
+        tracking_backend="none",
     )
     with pytest.raises(FileNotFoundError, match="JAX checkpoint not found"):
         train.train_loop(config)

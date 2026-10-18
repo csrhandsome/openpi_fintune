@@ -17,6 +17,7 @@ from openpi.models_pytorch.rl_token import RLTokenReadout
 from openpi.models_pytorch.rlinf.model import Observation
 from openpi.training import config as train_config
 from openpi.training import data_loader
+from openpi.training.tracking import init_tracking
 from openpi.training.validation import validate_dataset
 
 
@@ -325,11 +326,7 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
             if temporary.exists():
                 shutil.rmtree(temporary)
 
-    tracking = None
-    if is_main and config.wandb_enabled:
-        import wandb
-
-        tracking = wandb.init(project=config.project_name, name=config.exp_name, config=train_config.to_dict(config))
+    tracking = init_tracking(config, output, resuming=config.resume) if is_main else None
     last_saved = None
     for step in range(start_step, config.num_train_steps):
         learning_rate = _lr(step, schedule)
