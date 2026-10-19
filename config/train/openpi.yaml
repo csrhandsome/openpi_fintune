@@ -38,6 +38,11 @@ train:
   assets_base_dir: ./data/assets
   checkpoint_base_dir: ./checkpoints  # 保存至 checkpoints/openpi/<exp_name>/<step>/
   seed: 42
+  eval_enabled: false        # true：启用下面的验证切分与评估；false：全部数据训练，沿用原训练/预览加载流程
+  val_ratio: 0.05            # 按 episode 划出验证集，不按帧；n_val = max(1, int(episode 数 * 0.05))
+  split_seed: 42             # 按 episode 序号排序后用这个种子打乱，前 n_val 条做验证
+  eval_interval: 500         # 每 500 步把验证集过完
+  eval_num_steps: 10         # 从标准高斯出发 Euler 积分 10 步（dt=-0.1，t=1→0），再和真值做 MSE
   batch_size: 12             # 一次优化器更新的全局 batch
   micro_batch_size: null    # null：每卡一次处理 batch_size / num_gpus，不累积；整数：每卡前向 batch，单/多卡均可累积
   num_gpus: 1               # 启动 DDP；每卡保留完整 VLA，分配不同数据并同步梯度，不切分模型

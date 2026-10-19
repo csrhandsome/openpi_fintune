@@ -34,8 +34,6 @@ DataConfig = _data.DataConfig
 DataConfigFactory = _data.DataConfigFactory
 FakeDataConfig = _data.FakeDataConfig
 LeRobotFrankaDataConfig = _data.LeRobotFrankaDataConfig
-LeRobotFrankaEEDataConfig = _data.LeRobotFrankaEEDataConfig
-LeRobotFrankaJointDataConfig = _data.LeRobotFrankaJointDataConfig
 
 
 def _positive_int(key, value):
@@ -52,6 +50,11 @@ _TRAIN_FIELD_ORDER = (
     "assets_base_dir",
     "checkpoint_base_dir",
     "seed",
+    "eval_enabled",
+    "val_ratio",
+    "split_seed",
+    "eval_interval",
+    "eval_num_steps",
     "batch_size",
     "micro_batch_size",
     "num_gpus",
@@ -126,6 +129,16 @@ class TrainConfig:
     assets_base_dir: str = "./data/assets"
     checkpoint_base_dir: str = "./checkpoints"
     seed: int = 42
+    # Opt in to validation; configs without this field keep the original training path.
+    eval_enabled: bool = False
+    # Fraction of episodes held out for validation. Frames inside an episode stay together.
+    val_ratio: float = 0.05
+    # Shuffles episode order before the split. Independent of the per-rank training seed.
+    split_seed: int = 42
+    # Run a full validation pass after this many optimizer steps.
+    eval_interval: int = 500
+    # Euler steps for the validation action. dt = -1 / eval_num_steps, from t=1 to t=0.
+    eval_num_steps: int = 10
     batch_size: int = 5
     # Per-GPU forward batch; None uses batch_size / world_size without accumulation.
     micro_batch_size: int | None = None
@@ -162,8 +175,23 @@ class TrainConfig:
             value = getattr(self, key)
             if not isinstance(value, str) or not value or value in (".", "..") or pathlib.Path(value).name != value:
                 raise ValueError(f"{key} must be a nonempty directory name")
-        for key in ("batch_size", "num_train_steps", "log_interval", "save_interval", "num_gpus"):
+        for key in (
+            "batch_size",
+            "num_train_steps",
+            "log_interval",
+            "save_interval",
+            "num_gpus",
+            "eval_interval",
+            "eval_num_steps",
+        ):
             _positive_int(key, getattr(self, key))
+        if isinstance(self.val_ratio, bool) or not isinstance(self.val_ratio, int | float):
+            raise ValueError("val_ratio must be a number")
+        if not 0 <= float(self.val_ratio) < 1:
+            raise ValueError("val_ratio must be in [0, 1)")
+        object.__setattr__(self, "val_ratio", float(self.val_ratio))
+        if type(self.split_seed) is not int or self.split_seed < 0:
+            raise ValueError("split_seed must be a nonnegative integer")
         if self.micro_batch_size is not None:
             _positive_int("micro_batch_size", self.micro_batch_size)
             if self.batch_size % self.micro_batch_size:
@@ -172,7 +200,7 @@ class TrainConfig:
             raise ValueError("num_workers must be a nonnegative integer")
         if self.tracking_backend not in ("none", "wandb", "swanlab"):
             raise ValueError("tracking_backend must be none, wandb or swanlab")
-        for key in ("requires_pytorch_weights", "overwrite", "resume"):
+        for key in ("requires_pytorch_weights", "overwrite", "resume", "eval_enabled"):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f"{key} must be boolean")
         if self.resume and self.overwrite:
@@ -210,8 +238,6 @@ def _construct(cls, value, label):
 
 _DATA_FACTORIES = {
     "franka": LeRobotFrankaDataConfig,
-    "franka_ee": LeRobotFrankaEEDataConfig,
-    "franka_joint": LeRobotFrankaJointDataConfig,
     "aloha": _data.LeRobotAlohaDataConfig,
     "libero": _data.LeRobotLiberoDataConfig,
     "droid": _data.LeRobotDROIDDataConfig,

@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import logging
 import multiprocessing
 import os
 import typing
@@ -62,6 +63,120 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class SubsetDataset(Dataset[T_co]):
+    """View of ``dataset`` restricted to absolute frame indices."""
+
+    def __init__(self, dataset: Dataset, indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = list(indices)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
+def _unwrap_chain(dataset):
+    seen = set()
+    current = dataset
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        nxt = getattr(current, "dataset", None)
+        if nxt is None:
+            nxt = getattr(current, "_dataset", None)
+        current = nxt
+
+
+def _as_int(value) -> int:
+    if isinstance(value, list | tuple):
+        if len(value) != 1:
+            raise ValueError(f"Expected a scalar episode field, got {value}")
+        value = value[0]
+    return int(value)
+
+
+def _episode_rows(episodes) -> list[tuple[int, int, int]]:
+    if episodes is None:
+        return []
+    if isinstance(episodes, list | tuple):
+        rows = episodes
+    else:
+        try:
+            indices = episodes["episode_index"]
+            starts = episodes["dataset_from_index"]
+            ends = episodes["dataset_to_index"]
+        except (KeyError, TypeError, IndexError):
+            rows = [episodes[index] for index in range(len(episodes))]
+        else:
+            return [
+                (_as_int(episode), _as_int(start), _as_int(end))
+                for episode, start, end in zip(indices, starts, ends, strict=True)
+            ]
+    return [
+        (
+            _as_int(row["episode_index"]),
+            _as_int(row["dataset_from_index"]),
+            _as_int(row["dataset_to_index"]),
+        )
+        for row in rows
+    ]
+
+
+def episode_frame_spans(dataset) -> list[tuple[int, int, int]] | None:
+    """Return ``(episode_index, start_frame, end_frame)`` for a LeRobot-backed dataset.
+
+    Indices are positions in the full dataset, so a later subset still lines up with
+    wrappers that look up actions by the original frame index.
+    """
+    for current in _unwrap_chain(dataset):
+        bounds = getattr(current, "episode_bounds", None)
+        if bounds:
+            return [(int(episode), int(start), int(end)) for episode, (start, end) in sorted(bounds.items())]
+    for current in _unwrap_chain(dataset):
+        meta = getattr(current, "meta", None)
+        episodes = getattr(meta, "episodes", None) if meta is not None else None
+        rows = _episode_rows(episodes)
+        if rows:
+            return sorted(rows, key=lambda item: item[0])
+    return None
+
+
+def split_episode_frames(
+    spans: Sequence[tuple[int, int, int]], val_ratio: float, seed: int
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Split whole episodes into train and validation frame indices.
+
+    Episodes are ordered by index, shuffled with ``RandomState(seed)``, and the first
+    ``n_val = max(1, int(len(spans) * val_ratio))`` episodes become validation. The two
+    sides do not share episodes. Every frame of a selected episode is kept.
+    """
+    spans = sorted(spans, key=lambda item: item[0])
+    episodes = [episode for episode, _, _ in spans]
+    if len(set(episodes)) != len(episodes):
+        raise ValueError("Episode indices must be unique")
+    count = len(spans)
+    if count < 2:
+        raise ValueError(f"Need at least 2 episodes to hold out val_ratio={val_ratio}")
+    n_val = min(count - 1, max(1, int(count * val_ratio)))
+    order = np.random.RandomState(seed).permutation(count)
+    val_episodes = [spans[int(index)][0] for index in order[:n_val]]
+    train_episodes = [spans[int(index)][0] for index in order[n_val:]]
+    val_ids = set(val_episodes)
+    train_frames: list[int] = []
+    val_frames: list[int] = []
+    for episode, start, end in spans:
+        if end < start:
+            raise ValueError(f"Episode {episode} has a descending frame range {start}:{end}")
+        frames = range(start, end)
+        if episode in val_ids:
+            val_frames.extend(frames)
+        else:
+            train_frames.extend(frames)
+    return train_frames, val_frames, train_episodes, val_episodes
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -250,10 +365,17 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     batch_size: int | None = None,
+    dataset: Dataset | None = None,
+    frame_indices: Sequence[int] | None = None,
+    repeat: bool = True,
+    drop_last: bool = True,
+    use_distributed: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     data_config = config.data.create(config.assets_dirs, config.model)
     batch_size = config.batch_size if batch_size is None else batch_size
     if data_config.rlds_data_dir is not None:
+        if dataset is not None or frame_indices is not None:
+            raise ValueError("Episode splits are not supported for RLDS datasets")
         return create_rlds_data_loader(
             data_config,
             config.model.action_horizon,
@@ -272,7 +394,99 @@ def create_data_loader(
         num_workers=config.num_workers,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
+        dataset=dataset,
+        frame_indices=frame_indices,
+        repeat=repeat,
+        drop_last=drop_last,
+        use_distributed=use_distributed,
     )
+
+
+def create_train_and_val_loaders(
+    config: _config.TrainConfig, *, batch_size: int
+) -> tuple[DataLoader, DataLoader | None, _config.DataConfig, Dataset | None, list[int] | None]:
+    """Build the training loader and, when episodes can be split, a one-pass validation loader.
+
+    Both loaders share one transformed dataset, so they use the same ``norm_stats``.
+    Validation frames are this rank's stride of the held-out episodes.
+    Disabled validation uses the original loader and preview construction path.
+    """
+    if not config.eval_enabled or config.val_ratio == 0:
+        loader = create_data_loader(config, shuffle=True, batch_size=batch_size)
+        return loader, None, loader.data_config(), None, None
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.rlds_data_dir is not None:
+        if config.val_ratio > 0:
+            logging.warning("RLDS data has no episode split; skipping validation")
+        return (
+            create_rlds_data_loader(
+                data_config,
+                config.model.action_horizon,
+                batch_size,
+                shuffle=True,
+            ),
+            None,
+            data_config,
+            None,
+            None,
+        )
+
+    raw = create_torch_dataset(data_config, config.model.action_horizon, config.model)
+    transformed = transform_dataset(raw, data_config)
+    train_indices = None
+    val_loader = None
+    if config.val_ratio > 0:
+        spans = episode_frame_spans(raw)
+        if spans is None:
+            if data_config.repo_id != "fake":
+                logging.warning("Dataset has no episode index; training uses every frame and skips validation")
+        else:
+            train_indices, val_indices, train_episodes, val_episodes = split_episode_frames(
+                spans, config.val_ratio, config.split_seed
+            )
+            world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                logging.info(
+                    "Validation episodes (%d/%d, %d frames): %s. Training uses %d episodes (%d frames).",
+                    len(val_episodes),
+                    len(spans),
+                    len(val_indices),
+                    val_episodes,
+                    len(train_episodes),
+                    len(train_indices),
+                )
+            shard = val_indices[rank::world]
+            local_batch = min(batch_size // world, len(shard))
+            if shard and local_batch > 0:
+                val_loader = create_torch_data_loader(
+                    data_config,
+                    config.model,
+                    config.model.action_horizon,
+                    local_batch,
+                    dataset=transformed,
+                    frame_indices=shard,
+                    shuffle=False,
+                    num_workers=config.num_workers,
+                    seed=config.split_seed,
+                    repeat=False,
+                    drop_last=False,
+                    use_distributed=False,
+                    persistent_workers=False,
+                )
+    train_loader = create_torch_data_loader(
+        data_config,
+        config.model,
+        config.model.action_horizon,
+        batch_size,
+        dataset=transformed,
+        frame_indices=train_indices,
+        shuffle=True,
+        num_workers=config.num_workers,
+        seed=config.seed,
+    )
+    return train_loader, val_loader, data_config, transformed, train_indices
 
 
 def create_torch_data_loader(
@@ -286,12 +500,24 @@ def create_torch_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
+    dataset: Dataset | None = None,
+    frame_indices: Sequence[int] | None = None,
+    repeat: bool = True,
+    drop_last: bool = True,
+    use_distributed: bool = True,
+    persistent_workers: bool | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    dataset = transform_dataset(
-        create_torch_dataset(data_config, action_horizon, model_config), data_config, skip_norm_stats=skip_norm_stats
-    )
+    if dataset is None:
+        dataset = transform_dataset(
+            create_torch_dataset(data_config, action_horizon, model_config),
+            data_config,
+            skip_norm_stats=skip_norm_stats,
+        )
+    if frame_indices is not None:
+        dataset = SubsetDataset(dataset, frame_indices)
     sampler = None
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    distributed = use_distributed and torch.distributed.is_initialized()
+    world_size = torch.distributed.get_world_size() if distributed else 1
     if batch_size <= 0 or batch_size % world_size:
         raise ValueError(f"Global batch_size={batch_size} must be positive and divisible by world_size={world_size}")
     if world_size > 1:
@@ -301,7 +527,7 @@ def create_torch_data_loader(
             rank=torch.distributed.get_rank(),
             shuffle=shuffle,
             seed=seed,
-            drop_last=True,
+            drop_last=drop_last,
         )
     loader = TorchDataLoader(
         dataset,
@@ -311,6 +537,9 @@ def create_torch_data_loader(
         num_batches=num_batches,
         num_workers=num_workers,
         seed=seed,
+        drop_last=drop_last,
+        repeat=repeat,
+        persistent_workers=persistent_workers,
     )
     return DataLoaderImpl(data_config, loader)
 
@@ -344,6 +573,9 @@ class TorchDataLoader:
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
+        drop_last: bool = True,
+        repeat: bool = True,
+        persistent_workers: bool | None = None,
     ):
         """Create a PyTorch data loader.
 
@@ -358,10 +590,15 @@ class TorchDataLoader:
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
             seed: The seed to use for shuffling the data.
+            drop_last: Drop a trailing partial batch. Validation keeps it.
+            repeat: Start another epoch after the dataset is exhausted. Validation reads once.
+            persistent_workers: Keep worker processes after an epoch. Defaults to on when
+                ``num_workers > 0``.
         """
-        if local_batch_size <= 0 or len(dataset) < local_batch_size:
+        if local_batch_size <= 0 or len(dataset) == 0 or (drop_last and len(dataset) < local_batch_size):
             raise ValueError(f"Local batch size ({local_batch_size}) is invalid for dataset size ({len(dataset)}).")
         self._num_batches = num_batches
+        self._repeat = repeat
 
         mp_context = None
         if num_workers > 0:
@@ -376,10 +613,10 @@ class TorchDataLoader:
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
+            persistent_workers=num_workers > 0 if persistent_workers is None else persistent_workers,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
+            drop_last=drop_last,
             generator=generator,
         )
 
@@ -404,6 +641,8 @@ class TorchDataLoader:
                 num_items += 1
                 yield tree_map(torch.as_tensor, batch)
             epoch += 1
+            if not self._repeat:
+                return
 
 
 def _collate_fn(items):

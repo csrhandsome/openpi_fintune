@@ -15,10 +15,8 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
-import openpi.policies.franka_ee_policy as franka_ee_policy
 import openpi.policies.franka_policy as franka_policy
 import openpi.policies.libero_policy as libero_policy
-import openpi.policies.panda_policy as panda_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -482,92 +480,4 @@ class LeRobotFrankaDataConfig(DataConfigFactory):
             data_transforms=_transforms.Group(inputs=inputs, outputs=outputs),
             model_transforms=ModelTransformFactory()(model_config),
             action_sequence_keys=(f"action.{layout.target}", "action.gripper_position"),
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotFrankaJointDataConfig(DataConfigFactory):
-    """
-    Panda LeRobot data with split absolute joint and gripper action targets.
-    """
-
-    align_action_trace: bool = False
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation.exterior_image": "observation.exterior_image",
-                        "observation.wrist_image_left": "observation.wrist_image_left",
-                        "observation.joint_position": "observation.joint_position",
-                        "observation.gripper_position": "observation.gripper_position",
-                        "action.joint_position": "action.joint_position",
-                        "action.gripper_position": "action.gripper_position",
-                        "prompt": "prompt",
-                        "episode_index": "episode_index",
-                        "frame_index": "frame_index",
-                    }
-                )
-            ]
-        )
-        data_transforms = _transforms.Group(
-            inputs=[panda_policy.PandaJointInputs(model_type=model_config.model_type)],
-            outputs=[droid_policy.DroidOutputs()],
-        )
-        # Joint targets are stored as absolute positions, so convert the first 7
-        # dimensions to deltas for training and restore them during inference.
-        # The last gripper dimension remains absolute.
-        delta_action_mask = _transforms.make_bool_mask(7, -1)
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
-        model_transforms = ModelTransformFactory()(model_config)
-
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            action_sequence_keys=("action.joint_position", "action.gripper_position"),
-            model_transforms=model_transforms,
-            align_franka_action_trace=self.align_action_trace,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class LeRobotFrankaEEDataConfig(DataConfigFactory):
-    """Read 6D base-frame EE pose and 7D future pose/gripper actions from LeRobot."""
-
-    @override
-    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation.exterior_image": "observation.exterior_image",
-                        "observation.wrist_image_left": "observation.wrist_image_left",
-                        "observation.ee_pose": "observation.ee_pose",
-                        "observation.gripper_position": "observation.gripper_position",
-                        "action.ee_pose": "action.ee_pose",
-                        "action.gripper_position": "action.gripper_position",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
-        data_transforms = _transforms.Group(
-            inputs=[franka_ee_policy.FrankaEEInputs(model_type=model_config.model_type)],
-            outputs=[franka_ee_policy.FrankaEEOutputs()],
-        ).push(
-            inputs=[franka_ee_policy.EEDeltaActions()],
-            outputs=[franka_ee_policy.EEAbsoluteActions()],
-        )
-        return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
-            data_transforms=data_transforms,
-            action_sequence_keys=("action.ee_pose", "action.gripper_position"),
-            model_transforms=ModelTransformFactory()(model_config),
         )

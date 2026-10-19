@@ -24,6 +24,8 @@ import openpi.models.pi0_config
 from openpi.models_pytorch import weights as _weights
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
+from openpi.training.action_eval import component_slices
+from openpi.training.action_eval import denoised_action_metrics
 from openpi.training.base_weights import ensure_pytorch_base_weights
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -85,9 +87,40 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig, *, batch_size: int | None = None):
-    # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, shuffle=True, batch_size=batch_size)
-    return data_loader, data_loader.data_config()
+    # Train and validation share one transformed dataset and therefore one norm_stats.
+    return _data.create_train_and_val_loaders(
+        config, batch_size=config.batch_size if batch_size is None else batch_size
+    )
+
+
+def _validation_batches(loader, device, dtype):
+    if loader is None:
+        return
+    for observation, actions in loader:
+        yield (
+            move_tree_to_device_dtype(observation, device, dtype),
+            actions.to(device=device, dtype=torch.float32),
+        )
+
+
+def _log_validation(model, val_loader, config, device, dtype, step, is_main, tracker):
+    layout = getattr(config.data, "layout", None)
+    physical_dim = (
+        layout.action_dim if layout is not None else getattr(config.data, "action_dim", config.model.action_dim)
+    )
+    metrics = denoised_action_metrics(
+        model,
+        _validation_batches(val_loader, device, dtype),
+        physical_dim=physical_dim,
+        slices=component_slices(layout) if layout is not None else {},
+        num_steps=config.eval_num_steps,
+        device=device,
+    )
+    if not is_main or metrics["eval_loss"] != metrics["eval_loss"]:
+        return
+    logging.info("step=%d %s", step, " ".join(f"{key}={value:.4f}" for key, value in metrics.items()))
+    if tracker is not None:
+        tracker.log(metrics, step=step)
 
 
 def move_tree_to_device_dtype(tree, device, dtype):
@@ -381,12 +414,32 @@ def train_loop(config: _config.TrainConfig):
         f"global batch={config.batch_size}, world_size={world_size}"
     )
 
-    loader, data_config = build_datasets(config, batch_size=micro_batch * world_size)
+    loader, val_loader, data_config, preview_dataset, train_indices = build_datasets(
+        config, batch_size=micro_batch * world_size
+    )
 
     # Log sample images to the experiment tracker on first batch
     if tracker is not None and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, shuffle=False, batch_size=micro_batch * world_size)
+        # Create a separate data loader for sample batch to avoid consuming the main loader.
+        # Preview frames come from the training episodes when a validation split exists.
+        if preview_dataset is None:
+            sample_data_loader = _data.create_data_loader(config, shuffle=False, batch_size=micro_batch * world_size)
+        else:
+            preview_count = len(train_indices) if train_indices is not None else len(preview_dataset)
+            preview_batch = min(micro_batch * world_size, preview_count)
+            sample_data_loader = _data.create_torch_data_loader(
+                data_config,
+                config.model,
+                config.model.action_horizon,
+                preview_batch,
+                dataset=preview_dataset,
+                frame_indices=train_indices,
+                shuffle=False,
+                num_batches=1,
+                num_workers=0,
+                seed=config.seed,
+                use_distributed=False,
+            )
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
         observation, actions = sample_batch
@@ -612,6 +665,8 @@ def train_loop(config: _config.TrainConfig):
         global_step += 1
         # Save checkpoint using the new mechanism
         save_checkpoint(model, optim, global_step, config, is_main, data_config, tracker)
+        if config.eval_enabled and train_indices is not None and global_step % config.eval_interval == 0:
+            _log_validation(model, val_loader, config, device, weight_dtype, global_step, is_main, tracker)
 
         # Update progress bar
         if pbar is not None:

@@ -12,7 +12,6 @@ import torch
 from openpi import transforms
 from openpi.models import model
 from openpi.models import pi0_config
-from openpi.policies import franka_ee_policy
 from openpi.policies import franka_policy
 from openpi.policies import policy
 from openpi.shared import normalize
@@ -93,17 +92,25 @@ def test_v3_split_actions_tasks_and_episode_padding(panda_dataset):
     np.testing.assert_array_equal(first["action.ee_pose"][:, 0], [1, 2, 2, 2])
     np.testing.assert_array_equal(last["action.ee_pose"][:, 0], [2, 2, 2, 2])
     np.testing.assert_array_equal(next_episode["action.ee_pose"][:, 0], [11, 11, 11, 11])
-    inputs = franka_ee_policy.FrankaEEInputs(model.ModelType.PI0)(first)
+    inputs = franka_policy.FrankaInputs(model.ModelType.PI0, franka_policy.ActionLayout())(first)
     assert inputs["state"].shape == (7,)
     assert inputs["actions"].shape == (4, 7)
     np.testing.assert_array_equal(inputs["actions"][:, -1], 0.25)
 
 
 @pytest.mark.parametrize("config_name", ["openpi", "openpi_rlt"])
-def test_v3_collector_metadata_is_accepted(panda_dataset, config_name):
-    repo_id, _ = panda_dataset
+def test_v3_collector_metadata_is_accepted(panda_dataset, config_name, train_yaml):
+    repo_id, root = panda_dataset
+    yaml_config = train_yaml(config_name)
     train_config = config.get_config(config_name)
-    train_config = dataclasses.replace(train_config, data=dataclasses.replace(train_config.data, repo_id=repo_id))
+    assert train_config.data.action_space == yaml_config["data"]["action_space"]
+    # This fixture exercises both EE and joint targets at its own recorded frame rate.
+    fixture_fps = json.loads((root / "meta/info.json").read_text())["fps"]
+    train_config = dataclasses.replace(
+        train_config,
+        data=dataclasses.replace(train_config.data, repo_id=repo_id),
+        policy_metadata={**train_config.policy_metadata, "action_fps": fixture_fps},
+    )
     validate_dataset(train_config)
 
 
@@ -116,8 +123,8 @@ def test_v3_data_can_compute_ee_normalization(panda_dataset, num_workers):
         action_sequence_keys=("action.ee_pose", "action.gripper_position"),
         data_transforms=transforms.Group(
             inputs=[
-                franka_ee_policy.FrankaEEInputs(model.ModelType.PI0),
-                franka_ee_policy.EEDeltaActions(),
+                franka_policy.FrankaInputs(model.ModelType.PI0, franka_policy.ActionLayout()),
+                franka_policy.EEPoseOffsets(franka_policy.ActionLayout()),
             ]
         ),
     )
@@ -135,6 +142,74 @@ def test_v3_data_can_compute_ee_normalization(panda_dataset, num_workers):
             accumulator.update(np.asarray(batch[key]))
     assert stats["state"].get_statistics().mean.shape == (7,)
     np.testing.assert_allclose(stats["actions"].get_statistics().mean[-1], 0.25)
+
+
+def test_episode_metadata_splits_whole_episodes(panda_dataset):
+    repo_id, _ = panda_dataset
+    data_config = config.DataConfig(repo_id=repo_id, action_sequence_keys=("action.ee_pose", "action.gripper_position"))
+    dataset = data_loader.create_torch_dataset(data_config, 1, pi0_config.Pi0Config())
+    spans = data_loader.episode_frame_spans(dataset)
+    assert spans == [(0, 0, 3), (1, 3, 5)]
+    train_frames, val_frames, train_episodes, val_episodes = data_loader.split_episode_frames(spans, 0.05, 42)
+    assert len(val_episodes) == 1
+    assert set(train_episodes).isdisjoint(val_episodes)
+    assert sorted(train_frames + val_frames) == list(range(5))
+
+
+@pytest.mark.parametrize(("eval_enabled", "val_ratio"), [(False, 0.05), (True, 0.0), (True, 0.05)])
+def test_train_val_loaders_share_normalization_and_keep_episode_boundaries(
+    legacy_mp4_dataset, monkeypatch, eval_enabled, val_ratio
+):
+    repo_id, _ = legacy_mp4_dataset
+    factory = config.LeRobotFrankaDataConfig(repo_id=repo_id, action_space="joint", action_dim=8)
+    # Use known, nontrivial normalization and the real Franka transforms; text encoding is irrelevant here.
+    stats = {
+        key: normalize.NormStats(mean=np.full(8, 1.0, np.float32), std=np.full(8, 2.0, np.float32))
+        for key in ("state", "actions")
+    }
+    pipeline = config.DataConfig(
+        repo_id=repo_id,
+        norm_stats=stats,
+        prompt_from_task=True,
+        action_sequence_keys=("action.joint_position", "action.gripper_position"),
+        data_transforms=transforms.Group(inputs=[franka_policy.FrankaInputs(model.ModelType.PI0, factory.layout)]),
+        model_transforms=transforms.Group(
+            inputs=[
+                lambda item: {key: value for key, value in item.items() if key != "prompt"},
+                transforms.PadStatesAndActions(32),
+            ]
+        ),
+    )
+    monkeypatch.setattr(config.LeRobotFrankaDataConfig, "create", lambda *_args: pipeline)
+    settings = config.TrainConfig(
+        name="split_test",
+        data=factory,
+        model=pi0_config.Pi0Config(action_horizon=4),
+        val_ratio=val_ratio,
+        eval_enabled=eval_enabled,
+        num_workers=0,
+    )
+    train_loader, val_loader, actual_pipeline, dataset, train_indices = data_loader.create_train_and_val_loaders(
+        settings, batch_size=2
+    )
+    assert actual_pipeline is pipeline
+    _, train_actions = next(iter(train_loader))
+    if not eval_enabled or val_ratio == 0:
+        assert val_loader is None
+        assert train_indices is None
+        assert dataset is None
+        return
+    assert train_indices == [0, 1, 2]
+    # Seed 42 selects episode 1: all three frames, including the trailing one-sample batch.
+    for _ in range(2):
+        batches = list(val_loader)
+        assert [actions.shape[0] for _, actions in batches] == [2, 1]
+        val_actions = torch.cat([actions for _, actions in batches])
+        expected = torch.as_tensor(np.stack([dataset[index]["actions"] for index in (3, 4, 5)]))
+        torch.testing.assert_close(val_actions, expected)
+        torch.testing.assert_close(val_actions[0, 0, :7], torch.full((7,), 10 / (2 + 1e-6)))
+        assert torch.count_nonzero(val_actions[..., 8:]) == 0
+        assert val_actions[:, 0, 0].min() > train_actions[:, 0, 0].max()
 
 
 def test_explicit_root_keeps_the_hub_repo_id(panda_dataset, monkeypatch):
@@ -294,11 +369,14 @@ def test_ee_policy_accepts_collector_wire_keys():
         EEModel(),
         is_pytorch=True,
         transforms=[
-            franka_ee_policy.FrankaEEInputs(model.ModelType.PI0),
-            franka_ee_policy.EEDeltaActions(),
+            franka_policy.FrankaInputs(model.ModelType.PI0, franka_policy.ActionLayout()),
+            franka_policy.EEPoseOffsets(franka_policy.ActionLayout()),
             transforms.PadStatesAndActions(32),
         ],
-        output_transforms=[franka_ee_policy.EEAbsoluteActions(), franka_ee_policy.FrankaEEOutputs()],
+        output_transforms=[
+            franka_policy.FrankaOutputs(action_dim=7),
+            franka_policy.EEPoseOffsets(franka_policy.ActionLayout(), inverse=True),
+        ],
     )
     pose = np.array([0.3, 0.1, 0.4, 0.2, -0.1, 0.5], np.float32)
     result = ee_policy.infer(

@@ -149,12 +149,7 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         raise ValueError("Readout output must not overwrite the VLA checkpoint or its parent")
     if output.exists() and any(output.iterdir()) and not (config.overwrite or config.resume):
         raise FileExistsError(f"Readout output exists: {output}; choose another output or set overwrite=true")
-    if not isinstance(
-        config.data,
-        train_config.LeRobotFrankaDataConfig
-        | train_config.LeRobotFrankaEEDataConfig
-        | train_config.LeRobotFrankaJointDataConfig,
-    ):
+    if not isinstance(config.data, train_config.LeRobotFrankaDataConfig):
         raise ValueError("Readout requires Franka external/wrist views without finger-camera inputs")
     data = dataclasses.replace(
         config.data, assets=dataclasses.replace(config.data.assets, assets_dir=str(checkpoint / "assets"))
@@ -253,11 +248,8 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         else:
             _restore_rng(saved)
         del saved
-    metadata = config.policy_metadata or {}
-    action_space = metadata.get(
-        "action_space", "joint" if isinstance(data, train_config.LeRobotFrankaJointDataConfig) else "ee"
-    )
-    action_dim = metadata.get("action_dim", 8 if action_space == "joint" else 7)
+    action_space = "joint" if data.action_space == "joint" else "ee"
+    action_dim = data.action_dim
     manifest = {
         "format": "pytorch-rl-token-v1",
         "architecture": "openpi-rlt-cross-attention-v1",
@@ -269,7 +261,7 @@ def train(config: train_config.TrainConfig, *, defaults: ReadoutDefaults | None 
         "action_horizon": vla.action_horizon,
         "model_action_dim": vla.action_dim,
         "action_space": action_space,
-        "action_representation": metadata.get("action_representation", action_space),
+        "action_representation": data.action_space,
         "physical_action_dim": action_dim,
         "joint_training": defaults.alpha > 0,
         "stage1_settings": settings,

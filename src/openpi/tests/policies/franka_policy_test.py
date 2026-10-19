@@ -3,14 +3,13 @@ import pytest
 
 from openpi.models import model
 from openpi.models import pi0_config
-from openpi.policies.franka_ee_policy import FrankaEEInputs
-from openpi.policies.panda_policy import PandaJointInputs
-from openpi.training.config import LeRobotFrankaEEDataConfig
-from openpi.training.config import LeRobotFrankaJointDataConfig
+from openpi.policies.franka_policy import ActionLayout
+from openpi.policies.franka_policy import FrankaInputs
+from openpi.training.config import LeRobotFrankaDataConfig
 from openpi.transforms import compose
 
 
-@pytest.mark.parametrize("space", ["joint", "ee"])
+@pytest.mark.parametrize("space", ["joint", "ee", "ee_delta"])
 def test_split_targets_are_combined_only_at_model_input(space):
     target = "joint_position" if space == "joint" else "ee_pose"
     dimension = 7 if space == "joint" else 6
@@ -21,7 +20,8 @@ def test_split_targets_are_combined_only_at_model_input(space):
         "observation.gripper_position": np.ones(1, np.float32),
         "prompt": "test",
     }
-    inputs = PandaJointInputs(model.ModelType.PI0) if space == "joint" else FrankaEEInputs(model.ModelType.PI0)
+    layout = ActionLayout(action_space=space, action_dim=dimension + 1, motion_dim=dimension)
+    inputs = FrankaInputs(model.ModelType.PI0, layout)
     assert "actions" not in inputs(obs)
     obs.update(
         {
@@ -38,21 +38,18 @@ def test_split_targets_are_combined_only_at_model_input(space):
     np.testing.assert_array_equal(result["actions"][:, -1], 0.25)
 
 
-@pytest.mark.parametrize(
-    ("factory", "target"),
-    [
-        (LeRobotFrankaJointDataConfig, "joint_position"),
-        (LeRobotFrankaEEDataConfig, "ee_pose"),
-    ],
-)
-def test_training_config_reads_canonical_fields_without_dataset_yaml(tmp_path, factory, target):
-    cfg = factory(repo_id="local/panda").create(tmp_path, pi0_config.Pi0Config())
+@pytest.mark.parametrize("space", ["joint", "ee", "ee_delta"])
+def test_training_config_reads_canonical_fields_without_dataset_yaml(tmp_path, space):
+    target = "joint_position" if space == "joint" else "ee_pose"
+    dimension = 7 if space == "joint" else 6
+    cfg = LeRobotFrankaDataConfig(repo_id="local/panda", action_space=space, action_dim=dimension + 1).create(
+        tmp_path, pi0_config.Pi0Config()
+    )
     assert tuple(cfg.action_sequence_keys) == (f"action.{target}", "action.gripper_position")
     keys = cfg.repack_transforms.inputs[0].structure
     assert "observation.exterior_image" in keys
     assert "actions" not in keys
     assert "observation.exterior_image_2_left" not in keys
-    dimension = 7 if target == "joint_position" else 6
     data = {key: np.zeros(1) for key in keys}
     data.update(
         {
@@ -66,4 +63,4 @@ def test_training_config_reads_canonical_fields_without_dataset_yaml(tmp_path, f
         }
     )
     result = compose((*cfg.repack_transforms.inputs, *cfg.data_transforms.inputs))(data)
-    assert result["actions"].shape[-1] >= dimension + 1
+    assert result["actions"].shape[-1] == dimension + 1
