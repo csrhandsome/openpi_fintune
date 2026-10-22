@@ -137,6 +137,7 @@ class RMSNorm(nn.Module):
         adaptive: bool = False,
     ):
         super().__init__()
+        self.use_triton = False
         self.dim = dim
         self.adaptive = adaptive
         if not self.adaptive:
@@ -158,6 +159,18 @@ class RMSNorm(nn.Module):
         Returns:
             (normalized_output, gate) where gate is None for regular RMSNorm
         """
+        if self.use_triton and not self.training and not torch.is_grad_enabled() and x.is_cuda:
+            from openpi.models_pytorch.triton_inference import rms_norm
+
+            if not self.adaptive:
+                return rms_norm(x, self.scale), None
+            modulation = self.ada_modulation(cond.to(self.ada_modulation.weight.dtype))
+            scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
+            output = rms_norm(x, scale, shift)
+            if x.ndim == 3:
+                gate = gate.unsqueeze(-2)
+            return output, gate.to(x.dtype)
+
         dtype = x.dtype
         x_float = x.float()
         var = torch.mean(x_float**2, dim=-1, keepdim=True)

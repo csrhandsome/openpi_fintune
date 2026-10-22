@@ -29,6 +29,7 @@ class Args:
     host: str | None = None
     port: int | None = None
     record: bool | None = None
+    use_triton: bool | None = None
 
 
 def load_settings(args):
@@ -45,7 +46,7 @@ def load_settings(args):
         settings = serving_config.InferenceConfig(train_config=str(path), mode="force" if force_stage else "vla")
     overrides = {
         key: getattr(args, key)
-        for key in ("checkpoint", "readout", "device", "host", "port", "record")
+        for key in ("checkpoint", "readout", "device", "host", "port", "record", "use_triton")
         if getattr(args, key) is not None
     }
     return dataclasses.replace(settings, **overrides)
@@ -108,7 +109,11 @@ def create_policy(args: Args):
         from openpi.rlt.force_rlt.serve import create_policy_from_config
 
         return create_policy_from_config(
-            config, checkpoint=settings.checkpoint, readout=settings.readout, device=device
+            config,
+            checkpoint=settings.checkpoint,
+            readout=settings.readout,
+            device=device,
+            use_triton=settings.use_triton,
         )
     checkpoint = settings.checkpoint
     if checkpoint is None and config.mode == "rlt":
@@ -123,7 +128,9 @@ def create_policy(args: Args):
         if config.mode == "rlt":
             raise ValueError("Set rlt.vla_checkpoint, pass --checkpoint, or use a readout with bundled VLA weights")
         checkpoint = latest_checkpoint(config)
-    policy = policy_config.create_trained_policy(config, checkpoint, pytorch_device=device)
+    policy = policy_config.create_trained_policy(
+        config, checkpoint, pytorch_device=device, use_triton=settings.use_triton
+    )
     if config.mode == "rlt" or settings.readout is not None or settings.mode == "rlt":
         attach_readout(policy, config, directory)
     if settings.mode == "rlt":

@@ -56,6 +56,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        use_triton: bool = False,
     ):
         """Initialize the Policy.
 
@@ -68,6 +69,7 @@ class Policy(BasePolicy):
             metadata: Additional metadata to store with the policy.
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
+            use_triton: Enable fused Gemma kernels for CUDA inference.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
         self._model = model
@@ -82,8 +84,14 @@ class Policy(BasePolicy):
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
+            if use_triton:
+                from openpi.models_pytorch.triton_inference import configure_triton
+
+                configure_triton(self._model, enabled=True)
             self._sample_actions = model.sample_actions
         else:
+            if use_triton:
+                raise ValueError("use_triton=true requires a CUDA PyTorch policy")
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)

@@ -69,6 +69,7 @@ class InferenceConfig:
     host: str = "0.0.0.0"
     port: int = 8001
     record: bool = False
+    use_triton: bool = False
     rlt: RLTConfig = dataclasses.field(default_factory=RLTConfig)
 
     def __post_init__(self):
@@ -78,6 +79,7 @@ class InferenceConfig:
         if self.port > 65535:
             raise ValueError("port must be <= 65535")
         boolean("record", self.record)
+        boolean("use_triton", self.use_triton)
 
 
 def find_config(value: str) -> pathlib.Path:

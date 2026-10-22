@@ -112,7 +112,7 @@ def _vla_observation(obs):
     }
 
 
-def create_policy_from_config(config, *, checkpoint=None, readout=None, device="cpu"):
+def create_policy_from_config(config, *, checkpoint=None, readout=None, device="cpu", use_triton=False):
     """Build the contact service using descriptive YAML settings, without --group."""
     from openpi.models_pytorch.readout_checkpoint import readout_manifest
     from openpi.models_pytorch.readout_checkpoint import readout_vla_checkpoint
@@ -171,7 +171,7 @@ def create_policy_from_config(config, *, checkpoint=None, readout=None, device="
                 finger_max_skew_s=force.max_skew_s,
                 finger_max_age_s=force.max_age_s,
             )
-    vla_policy = policy_config.create_trained_policy(config, checkpoint, pytorch_device=device)
+    vla_policy = policy_config.create_trained_policy(config, checkpoint, pytorch_device=device, use_triton=use_triton)
     attach_readout(vla_policy, config, readout, require_reference_anchor=actor is not None)
     metadata = {**vla_policy.metadata, **actor_metadata, "force_policy": settings.policy, "force_enabled": enabled}
     if actor is not None:
