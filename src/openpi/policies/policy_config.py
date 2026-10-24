@@ -20,6 +20,7 @@ def create_trained_policy(
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
     use_triton: bool = False,
+    use_torch_compile: bool = False,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -34,6 +35,7 @@ def create_trained_policy(
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
             from the checkpoint directory.
         use_triton: Enable forward-only fused Triton kernels on CUDA.
+        use_torch_compile: Compile the shared Pi0 denoising step on CUDA.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
 
@@ -89,5 +91,6 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         use_triton=use_triton,
+        use_torch_compile=use_torch_compile,
         pytorch_device=pytorch_device if is_pytorch else None,
     )

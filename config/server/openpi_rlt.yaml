@@ -4,6 +4,7 @@ mode: rlt                   # rlt：普通在线 RL；force：读取 train_confi
 train_config: config/train/openpi_rlt.yaml
 checkpoint: null             # 默认 train YAML 的 rlt.vla_checkpoint；须设置其中一处
 readout: null                # force 默认 rlt.force_stage.readout_dir；其余默认 train YAML 的 rlt.output_dir/readout_dir
+use_torch_compile: false  # true：编译 CUDA VLA 去噪步骤；首次请求编译，需预热
 use_triton: false  # true：启用 CUDA Triton RMSNorm / adaRMS 融合推理；首次请求会编译
 device: auto
 host: 0.0.0.0

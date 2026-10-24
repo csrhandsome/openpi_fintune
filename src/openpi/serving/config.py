@@ -69,6 +69,7 @@ class InferenceConfig:
     host: str = "0.0.0.0"
     port: int = 8001
     record: bool = False
+    use_torch_compile: bool = False
     use_triton: bool = False
     rlt: RLTConfig = dataclasses.field(default_factory=RLTConfig)
 
@@ -80,6 +81,7 @@ class InferenceConfig:
             raise ValueError("port must be <= 65535")
         boolean("record", self.record)
         boolean("use_triton", self.use_triton)
+        boolean("use_torch_compile", self.use_torch_compile)
 
 
 def find_config(value: str) -> pathlib.Path:

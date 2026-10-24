@@ -57,6 +57,7 @@ class Policy(BasePolicy):
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
         use_triton: bool = False,
+        use_torch_compile: bool = False,
     ):
         """Initialize the Policy.
 
@@ -70,6 +71,7 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             use_triton: Enable fused Gemma kernels for CUDA inference.
+            use_torch_compile: Compile the shared Pi0 denoising step on CUDA.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
         self._model = model
@@ -88,8 +90,14 @@ class Policy(BasePolicy):
                 from openpi.models_pytorch.triton_inference import configure_triton
 
                 configure_triton(self._model, enabled=True)
-            self._sample_actions = model.sample_actions
+            if use_torch_compile:
+                from openpi.models_pytorch.compile_inference import configure_torch_compile
+
+                configure_torch_compile(self._model, enabled=True)
+            self._sample_actions = self._model.sample_actions
         else:
+            if use_torch_compile:
+                raise ValueError("use_torch_compile=true requires a CUDA PyTorch policy")
             if use_triton:
                 raise ValueError("use_triton=true requires a CUDA PyTorch policy")
             # JAX model setup

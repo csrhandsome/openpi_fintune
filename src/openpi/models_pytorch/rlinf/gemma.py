@@ -622,7 +622,7 @@ class Module(nn.Module):
         else:
             layer_kv_caches = (
                 list(kv_cache)
-                if isinstance(kv_cache, list | tuple)
+                if isinstance(kv_cache, (list, tuple))  # noqa: UP038 -- TorchDynamo 2.7 cannot trace UnionType
                 else [kv_cache] * len(self.layers)
             )
 
