@@ -66,7 +66,11 @@
 
    每个对照分别设置 replay 和 checkpoint 路径、使用独立初始化。总更新次数、种子和日志/保存间隔使用顶层 `num_train_steps`、`seed`、`log_interval`、`save_interval`；网络、batch 和优化参数使用 `rlt.force_stage`，独立于普通 `rlt.actor/critic/learner`。`rlt.actor_checkpoint` 可指定续训权重，`resume: true` 默认恢复 `force_stage.checkpoint_path`。续训校验网络、学习参数和指内开关，禁止把恒零 checkpoint 当成真实特征 checkpoint。
 
-   `ReplayJournal` 读取的 JSONL 每条记录必须包含实际执行的 E 步关节目标、逐步奖励、有效 mask、下一状态、来源和安全标记。H 使用 YAML 的模型 horizon，E 从回放推导；token 和指内维度必须匹配 YAML。人工接管数据不进入自主 RL。`rlt.replay.directory` 的普通 Pickle replay 不能用于这条链路。
+   `ReplayJournal` 读取的 JSONL 每条记录必须包含实际执行的 E 步关节目标、逐步奖励、有效 mask、下一状态、来源和安全标记。H 使用 YAML 的模型 horizon，E 从回放推导；token 和指内维度必须匹配 YAML。训练包含人工接管数据，纯人工 replay 也可训练；真实指内和恒零对照均支持。`rlt.replay.directory` 的普通 Pickle replay 不能用于这条链路。
+
+   `source` 使用 `BASE/RL/HUMAN/MIXED`，可选 `source_chunk[E]` 逐步记录 `BASE/RL/HUMAN`，未执行位置可填 `PAD`。混合 chunk 必须提供逐步来源；`source` 为有效步来源的汇总，`intervention_flag` 为有效步中是否存在 HUMAN。旧 JSONL 不含 `source_chunk` 时，按整个 chunk 的 `source` 读取，保持兼容。`runtime.make_transition` 也接受 `source_chunk`。
+
+   critic 对所有来源使用实际执行的关节目标。actor 的 BC 与平滑目标在人工步使用实际执行目标，其他位置保留 VLA 参考；有效 mask 排除 E 步内的补齐动作，H-E 的预测尾部仍以 VLA 参考约束。日志输出 `human_fraction`。人工接管不会自动终止任务，journal 支持同一回合连续写入 `RL → HUMAN → HUMAN → RL`，实际终止或执行不足 E 步时仍须设置 `done=true`。VLA/readout 在离线小网络训练时不更新。
 
 4. 使用同一份训练 YAML 部署，服务自动识别 `stage: force`，无需额外传 `--group`：
 

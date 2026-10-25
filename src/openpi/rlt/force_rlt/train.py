@@ -41,13 +41,9 @@ def train_from_config(config):
         fixed_std=settings.fixed_std,
         max_reference_offset=settings.max_reference_offset_rad,
     )
-    records = [
-        record
-        for record in ReplayJournal(settings.replay_path, network).read_all()
-        if record.source != "HUMAN" and not record.intervention_flag
-    ]
+    records = ReplayJournal(settings.replay_path, network).read_all()
     if not records:
-        raise ValueError("Force replay contains no autonomous transitions")
+        raise ValueError("Force replay contains no transitions")
     learner_config = LearnerConfig(
         network=network,
         gamma=settings.gamma,
@@ -105,9 +101,9 @@ def main():
         max_reference_offset=args.max_reference_offset_rad,
     )
     journal = ReplayJournal(args.replay, network)
-    records = [record for record in journal.read_all() if record.source != "HUMAN" and not record.intervention_flag]
+    records = journal.read_all()
     if not records:
-        parser.error("Replay contains no autonomous transitions")
+        parser.error("Replay contains no transitions")
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     learner = ChunkLearner(

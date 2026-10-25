@@ -81,12 +81,11 @@ class ChunkLearner:
         cfg = self.config.network
         for record in records:
             record.validate(cfg)
-            if record.source == "HUMAN" or record.intervention_flag:
-                raise ValueError("Human intervention cannot enter autonomous RL updates")
         state = self._state(records)
         next_state = self._state(records, next_state=True)
         actions = self._tensor([record.executed_q for record in records])
         mask = self._tensor([record.executed_mask for record in records], boolean=True)
+        human = self._tensor([record.action_sources == "HUMAN" for record in records], boolean=True) & mask
         rewards = self._tensor([record.rewards for record in records])
         done = torch.as_tensor([record.done for record in records], dtype=torch.bool, device=self.device)
 
@@ -104,11 +103,20 @@ class ChunkLearner:
         for parameter in self.critic.parameters():
             parameter.requires_grad = False
         proposal = self.actor.sample(*state)
-        full_mask = torch.ones_like(mask)
-        proposal_q, _ = self.critic(*state, proposal[:, : cfg.executed_steps], full_mask)
-        bc = (proposal - state[3]).square().mean()
+        proposal_q, _ = self.critic(*state, proposal[:, : cfg.executed_steps], mask)
+        # Supervise acknowledged human targets, retaining VLA references elsewhere.
+        bc_target = state[3].clone()
+        bc_target[:, : cfg.executed_steps] = torch.where(human[..., None], actions, bc_target[:, : cfg.executed_steps])
+        bc_mask = torch.ones(proposal.shape[:2], dtype=torch.bool, device=self.device)
+        bc_mask[:, : cfg.executed_steps] = mask
+        bc = ((proposal - bc_target).square().mean(dim=-1) * bc_mask).sum() / bc_mask.sum()
+        pair_mask = bc_mask[:, 1:] & bc_mask[:, :-1]
         smooth = (
-            (proposal[:, 1:] - proposal[:, :-1] - (state[3][:, 1:] - state[3][:, :-1])).square().mean()
+            (
+                (proposal[:, 1:] - proposal[:, :-1] - (bc_target[:, 1:] - bc_target[:, :-1])).square().mean(dim=-1)
+                * pair_mask
+            ).sum()
+            / pair_mask.sum().clamp_min(1)
             if cfg.horizon > 1
             else proposal.new_zeros(())
         )
@@ -134,6 +142,7 @@ class ChunkLearner:
             "critic_loss": float(critic_loss.detach()),
             "bc": float(bc.detach()),
             "smooth": float(smooth.detach()),
+            "human_fraction": float(human.sum() / mask.sum()),
         }
 
     def save(self, path: str | Path):

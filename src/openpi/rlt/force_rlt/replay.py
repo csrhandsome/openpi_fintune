@@ -1,4 +1,4 @@
-"""Validated executed-transition journal with episode and intervention boundaries."""
+"""Validated executed transitions with per-step human intervention provenance."""
 
 from __future__ import annotations
 
@@ -37,6 +37,14 @@ class Transition:
     independent_success: bool
     intervention_flag: bool
     observation_meta: dict
+    source_chunk: np.ndarray | None = None
+
+    @property
+    def action_sources(self) -> np.ndarray:
+        if self.source_chunk is not None:
+            return np.asarray(self.source_chunk)
+        # Legacy records identified one controller for the entire chunk.
+        return np.where(self.executed_mask, self.source, "PAD")
 
     def validate(self, cfg: NetworkConfig):
         for state in (self.state, self.next_state):
@@ -68,10 +76,17 @@ class Transition:
                 raise ValueError("Unexecuted steps cannot carry reward")
             if not np.allclose(np.asarray(self.executed_q)[n:], np.asarray(self.executed_q)[n - 1]):
                 raise ValueError("Unexecuted targets must repeat the last executed target")
-        if self.source not in {"BASE", "RL", "HUMAN"}:
+        if self.source not in {"BASE", "RL", "HUMAN", "MIXED"}:
             raise ValueError("Invalid action source")
-        if self.intervention_flag != (self.source == "HUMAN"):
-            raise ValueError("Human intervention must be isolated by source")
+        sources = self.action_sources
+        if sources.shape != (cfg.executed_steps,) or not set(sources[valid].tolist()) <= {"BASE", "RL", "HUMAN"}:
+            raise ValueError("source_chunk must identify BASE, RL or HUMAN for each executed step")
+        unique = set(sources[valid].tolist())
+        expected_source = next(iter(unique)) if len(unique) == 1 else "MIXED"
+        if self.source != expected_source:
+            raise ValueError("Action source does not match source_chunk")
+        if type(self.intervention_flag) is not bool or self.intervention_flag != ("HUMAN" in unique):
+            raise ValueError("intervention_flag must match executed HUMAN steps")
         if not self.episode_id or self.step_id < 0:
             raise ValueError("Episode/step ID missing")
 
@@ -89,9 +104,9 @@ class ReplayJournal:
         if (
             previous
             and previous.episode_id == transition.episode_id
-            and (previous.done or previous.intervention_flag or transition.step_id != previous.step_id + 1)
+            and (previous.done or transition.step_id != previous.step_id + 1)
         ):
-            raise ValueError("Episode crossed a terminal or intervention boundary")
+            raise ValueError("Episode crossed a terminal boundary or skipped a step")
         payload = json.dumps(asdict(transition), default=lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(payload + "\n")
@@ -109,6 +124,8 @@ class ReplayJournal:
             for key in ("proposed_q", "executed_q", "rewards"):
                 value[key] = np.asarray(value[key], dtype=np.float32)
             value["executed_mask"] = np.asarray(value["executed_mask"], dtype=bool)
+            if value.get("source_chunk") is not None:
+                value["source_chunk"] = np.asarray(value["source_chunk"])
             value["safety_flags"] = tuple(value["safety_flags"])
             record = Transition(**value)
             record.validate(self.cfg)

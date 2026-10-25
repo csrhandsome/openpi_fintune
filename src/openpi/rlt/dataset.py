@@ -66,6 +66,15 @@ def _quaternion_rpy(value) -> np.ndarray:
 
 
 def _source(row: dict, sync: dict) -> str:
+    # These flags describe the actual controller, even when the proposal was RL.
+    human = False
+    for key in ("intervention_flag", "human_controlled"):
+        if key in row:
+            if type(row[key]) is not bool:
+                raise ValueError(f"{key} must be an explicit boolean")
+            human |= row[key]
+    if human:
+        return "HUMAN"
     name = row.get("control_source", row.get("source"))
     if name in {"BASE", "RL", "HUMAN"}:
         return name
@@ -75,7 +84,11 @@ def _source(row: dict, sync: dict) -> str:
         return "RL"
     if name == "policy":
         return "BASE"
+    if name is not None:
+        raise ValueError(f"Unknown per-step action source: {name}; use BASE, RL or HUMAN")
     if "vr_arm_enabled" in row:
+        if type(row["vr_arm_enabled"]) is not bool:
+            raise ValueError("vr_arm_enabled must be an explicit boolean")
         return "HUMAN" if row["vr_arm_enabled"] else "BASE"
     return "HUMAN" if sync.get("source", "collection") == "collection" else "BASE"
 

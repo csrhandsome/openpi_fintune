@@ -67,6 +67,10 @@ class RLTTransition:
         sources = set(self.source_chunk[self.executed_mask].tolist())
         return next(iter(sources)) if len(sources) == 1 else "MIXED"
 
+    @property
+    def intervention_flag(self):
+        return bool(np.any((self.source_chunk == "HUMAN") & self.executed_mask))
+
     def validate(self, spec: ReplaySpec):
         for name in ("z_grip", "next_z_grip"):
             value = getattr(self, name)

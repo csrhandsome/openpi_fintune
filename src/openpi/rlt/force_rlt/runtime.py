@@ -123,6 +123,7 @@ def make_transition(
     independent_success: bool,
     intervention_flag: bool,
     observation_meta: dict,
+    source_chunk: np.ndarray | None = None,
 ) -> Transition:
     """Journal only acknowledged targets; pad the unused tail with the last target."""
     commanded = np.asarray(commanded, dtype=np.float32)
@@ -149,4 +150,5 @@ def make_transition(
         independent_success,
         intervention_flag,
         observation_meta,
+        source_chunk,
     )

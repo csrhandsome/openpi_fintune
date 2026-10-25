@@ -144,14 +144,17 @@ class ChunkLearner:
         critic_loss.backward()
         self.critic_opt.step()
         self.steps += 1
-        metrics = {"critic_loss": float(critic_loss.detach())}
+        human = self._tensor([r.source_chunk == "HUMAN" for r in records], dtype=torch.bool) & mask
+        metrics = {
+            "critic_loss": float(critic_loss.detach()),
+            "human_fraction": float(human.sum() / mask.sum()),
+        }
         if self.steps % self.config.actor_update_period == 0:
             self.critic.requires_grad_(requires_grad=False)
             try:
                 keep = torch.rand(len(records), 1, 1, device=self.device) >= self.config.reference_dropout
                 predicted = self.actor.sample(*current, reference_condition=current[2] * keep)[:, : self.spec.chunk_len]
                 actor_q1, actor_q2 = self.critic(*current[:2], predicted, mask, current[3])
-                human = self._tensor([r.source_chunk == "HUMAN" for r in records], dtype=torch.bool)
                 bc_target = torch.where(human[..., None], actions, current[2][:, : self.spec.chunk_len])
                 bc = (((predicted - bc_target).square().mean(dim=-1)) * mask).sum() / mask.sum()
                 actor_q = actor_q1 if self.config.actor_q_reduction == "q1" else torch.minimum(actor_q1, actor_q2)

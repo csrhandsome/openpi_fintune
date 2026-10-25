@@ -1,6 +1,7 @@
 """Offline checks for contact synchronization, safety and E-step TD semantics."""
 
 from dataclasses import replace
+import json
 
 import numpy as np
 import pytest
@@ -135,7 +136,7 @@ def record(cfg, *, done=False, count=2, source="RL"):
     )
 
 
-def test_partial_execution_target_and_human_isolation(tmp_path):
+def test_partial_execution_target_and_human_training(tmp_path):
     cfg = NetworkConfig(z_rlt_dim=4, z_grip_dim=8, horizon=4, executed_steps=2, hidden_dim=16)
     rewards = torch.tensor([[1.0, 9.0], [1.0, 2.0]])
     mask = torch.tensor([[True, False], [True, True]])
@@ -151,10 +152,110 @@ def test_partial_execution_target_and_human_isolation(tmp_path):
     learner.save(tmp_path / "actor.pt")
     loaded = ChunkLearner.load(tmp_path / "actor.pt")
     assert loaded.steps == 1
-    with pytest.raises(ValueError, match="Human"):
-        learner.update([record(cfg, done=True, source="HUMAN")])
+    metrics = learner.update([record(cfg, done=True, source="HUMAN")])
+    assert metrics["human_fraction"] == 1.0
+    assert np.isfinite(metrics["actor_loss"])
     with pytest.raises(ValueError, match="short execution"):
         replace(transition, done=False).validate(cfg)
+
+
+def test_replay_preserves_rl_human_rl_and_legacy_sources(tmp_path):
+    cfg = NetworkConfig(z_rlt_dim=4, z_grip_dim=8, horizon=4, executed_steps=2, hidden_dim=16)
+    journal = ReplayJournal(tmp_path / "replay.jsonl", cfg)
+    for index, source in enumerate(("RL", "HUMAN", "HUMAN", "RL")):
+        journal.append(replace(record(cfg, source=source), step_id=index, done=index == 3))
+    records = journal.read_all()
+    assert [r.source for r in records] == ["RL", "HUMAN", "HUMAN", "RL"]
+    assert [r.done for r in records] == [False, False, False, True]
+    np.testing.assert_array_equal(records[1].action_sources, ["HUMAN", "HUMAN"])
+    # Existing JSONL files omit the new optional field entirely.
+    payloads = [json.loads(line) for line in journal.path.read_text().splitlines()]
+    for payload in payloads:
+        payload.pop("source_chunk")
+    journal.path.write_text("\n".join(json.dumps(payload) for payload in payloads))
+    assert len(journal.read_all()) == 4
+    with pytest.raises(ValueError, match="terminal"):
+        journal.append(replace(record(cfg), step_id=4))
+
+
+@pytest.mark.parametrize("zero_grip", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_human_bc_targets_and_smoothing(zero_grip, partial):
+    cfg = NetworkConfig(z_rlt_dim=4, z_grip_dim=8, horizon=5, executed_steps=3, hidden_dim=16, fixed_std=0)
+    transition = record(cfg, count=2 if partial else 3, done=True)
+    actions = np.full((3, 7), 0.4, np.float32)
+    actions[0] = 9.0  # Autonomous execution must not become a BC target.
+    transition = replace(
+        transition,
+        source="MIXED",
+        intervention_flag=True,
+        source_chunk=np.array(["RL", "HUMAN", "PAD" if partial else "HUMAN"]),
+        executed_q=actions,
+    )
+    learner = ChunkLearner(LearnerConfig(cfg, beta_smooth=0.5, zero_grip=zero_grip))
+    state = learner._state([transition])  # noqa: SLF001
+    with torch.no_grad():
+        prediction = learner.actor.sample(*state)
+    target = state[3].clone()
+    target[:, 1 : (2 if partial else 3)] = 0.4
+    valid = torch.ones((1, 5), dtype=torch.bool)
+    valid[0, 2] = not partial
+    expected_bc = ((prediction - target).square().mean(dim=-1) * valid).sum() / valid.sum()
+    pairs = valid[:, 1:] & valid[:, :-1]
+    expected_smooth = ((prediction.diff(dim=1) - target.diff(dim=1)).square().mean(dim=-1) * pairs).sum() / pairs.sum()
+    metrics = learner.update([transition])
+    assert metrics["bc"] == pytest.approx(expected_bc.item())
+    assert metrics["smooth"] == pytest.approx(expected_smooth.item())
+    assert metrics["human_fraction"] == pytest.approx(0.5 if partial else 2 / 3)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"source": "MIXED", "source_chunk": None},
+        {"source_chunk": np.array(["RL", "HUMAN"])},
+        {"intervention_flag": True},
+        {"source_chunk": np.array(["RL"])},
+    ],
+)
+def test_replay_rejects_inconsistent_human_provenance(changes):
+    cfg = NetworkConfig(z_rlt_dim=4, z_grip_dim=8, horizon=4, executed_steps=2, hidden_dim=16)
+    with pytest.raises(ValueError, match="source|intervention_flag"):
+        replace(record(cfg), **changes).validate(cfg)
+
+
+@pytest.mark.parametrize("group", ["B", "C"])
+def test_legacy_training_cli_accepts_human_only_replay(tmp_path, monkeypatch, group):
+    from openpi.rlt.force_rlt import train
+
+    cfg = NetworkConfig(z_rlt_dim=4, z_grip_dim=8, horizon=4, executed_steps=2, hidden_dim=16)
+    replay = tmp_path / "replay.jsonl"
+    ReplayJournal(replay, cfg).append(record(cfg, source="HUMAN", done=True))
+    output = tmp_path / "actor.pt"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train",
+            "--replay",
+            str(replay),
+            "--group",
+            group,
+            "--output",
+            str(output),
+            "--steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--device",
+            "cpu",
+            "--max-reference-offset-rad",
+            "0.05",
+        ],
+    )
+    train.main()
+    saved = ChunkLearner.load(output)
+    assert saved.steps == 1
+    assert saved.config.zero_grip == (group == "B")
 
 
 def test_raw_frame_journal_preserves_rgb(tmp_path):

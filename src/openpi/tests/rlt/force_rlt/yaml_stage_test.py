@@ -91,9 +91,15 @@ def test_force_cli_overrides():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_yaml_train_force_and_resume(tmp_path, monkeypatch, enabled):
+@pytest.mark.parametrize("source", ["RL", "HUMAN", "MIXED"])
+def test_yaml_train_force_and_resume(tmp_path, monkeypatch, enabled, source):
     config = settings(tmp_path, enabled=enabled)
-    ReplayJournal(config.rlt.force_stage.replay_path, network(config)).append(record(network(config)))
+    transition = record(network(config), source="HUMAN" if source == "HUMAN" else "RL")
+    if source == "MIXED":
+        transition = dataclasses.replace(
+            transition, source="MIXED", source_chunk=np.array(["RL", "HUMAN"]), intervention_flag=True
+        )
+    ReplayJournal(config.rlt.force_stage.replay_path, network(config)).append(transition)
     path = write_yaml(config, tmp_path / "train.yaml")
     monkeypatch.setattr("sys.argv", ["train.py", "--config", str(path)])
     train.main()
@@ -127,8 +133,6 @@ def test_force_rejects_ee_vla_training_and_bad_replay(tmp_path):
     with pytest.raises(ValueError, match="no actor to train"):
         train.main(settings(tmp_path, policy="vla"))
     ReplayJournal(config.rlt.force_stage.replay_path, network(config)).append(record(network(config), source="HUMAN"))
-    with pytest.raises(ValueError, match="no autonomous transitions"):
-        train.main(config)
     wrong = dataclasses.replace(
         config, rlt=dataclasses.replace(config.rlt, force=dataclasses.replace(config.rlt.force, feature_dim=24))
     )

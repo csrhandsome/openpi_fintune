@@ -121,6 +121,40 @@ def test_offline_training_cli_and_resume(tmp_path, monkeypatch):
     assert ChunkLearner.load(output).steps == 3
 
 
+@pytest.mark.parametrize("grip_dim", [0, 3])
+def test_mixed_human_bc_uses_executed_targets_and_ignores_padding(grip_dim):
+    spec = ReplaySpec(4, 7, 4, 3, 7, grip_dim=grip_dim)
+    record = episode(replace(spec, grip_dim=0), length=2)[0]
+    actions = np.full((3, 7), 9.0, np.float32)
+    actions[1] = 0.7
+    record = replace(
+        record,
+        action_chunk=actions,
+        source_chunk=np.array(["RL", "HUMAN", "HUMAN"]),
+        z_grip=np.ones(grip_dim, np.float32) if grip_dim else None,
+        next_z_grip=np.ones(grip_dim, np.float32) if grip_dim else None,
+    )
+    learner = ChunkLearner(
+        spec,
+        LearnerConfig(actor_update_period=1, reference_dropout=0.0),
+        actor_config=ActorConfig(hidden_dim=8, layers=1, fixed_std=0.0),
+        critic_config=CriticConfig(hidden_dim=8, layers=1),
+        adapter=ActionAdapter(7, q01=np.full(7, -2, np.float32), q99=np.full(7, 2, np.float32)),
+    )
+    feature = {"z_rlt": record.z_rlt, "proprio": record.proprio, "ref_chunk": record.ref_chunk}
+    if grip_dim:
+        feature["z_grip"] = record.z_grip
+    prediction = learner.adapter.normalize(learner.propose(feature), record.proprio)[:2]
+    target = record.ref_chunk[:2].copy()
+    target[1] = record.action_chunk[1]
+    expected = np.square(prediction - learner.adapter.normalize(target, record.proprio)).mean()
+    metrics = learner.update([record])
+    assert metrics["bc"] == pytest.approx(float(expected))
+    assert metrics["human_fraction"] == 0.5
+    assert record.source == "MIXED"
+    assert record.intervention_flag
+
+
 def test_reference_optimizer_targets_q_loss_and_physical_smoothing():
     spec = ReplaySpec(4, 7, 4, 3, 7)
     record = episode(spec)[0]

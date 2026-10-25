@@ -119,6 +119,18 @@ checkpoint 同时保存网络、target、优化器、动作变换和训练步数
 actor 和 critic 分别定义在独立文件，learner 只协调优化。
 actor 使用参考输入 dropout，BC 对自主动作使用 VLA 参考、对人工步使用执行动作。
 critic 使用实际执行的 E 步和 mask。TD 的 bootstrap 指数按有效步数计算，终止样本不 bootstrap。
+
+`rlt.stage: actor_critic` 的 YAML 训练入口与上面的 CLI 都支持纯人工回合和
+`RL → HUMAN → RL` 混合回合，无需额外开关。VLA/readout 只在构建 replay 时提供冻结特征，
+离线 actor/critic 训练直接读取 replay，不更新 VLA/readout。
+采集端的 `*.actions.jsonl` 应逐步写入 `control_source: "BASE" / "RL" / "HUMAN"`；
+也识别旧字段 `source`、`vr_arm_enabled` 和布尔字段 `intervention_flag`、`human_controlled`。
+`intervention_flag` 或 `human_controlled` 为 `true` 时，该步按实际人工动作训练，即使原提案来源标为 RL。
+新 trace 的 `control_source` 描述实际控制来源，优先于原始 VR 按钮状态；缺少明确来源时才回退到 `vr_arm_enabled`。
+每步必须具有确定来源；`MIXED` 由窗口内的逐步来源推导，不能用作单步标记。
+人工接管本身不代表任务终止；混合回合在真实结束处设置 `done`，成败仍由回合标注决定。
+训练日志的 `human_fraction` 表示当前 batch 有效执行步中人工步的比例。
+
 在线服务、episode 边界切换、可选 force 模态和机器人客户端执行反馈 helper 见
 [RLT 在线说明](../../../docs/rlt_online.md)。采集端使用 helper 将设备执行结果与回合成败回传。
 

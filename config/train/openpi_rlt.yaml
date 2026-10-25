@@ -44,7 +44,7 @@ train:
   tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
 
 rlt:
-  stage: sft               # sft / actor_critic / force；显式选路径，各 stage 独立运行
+  stage: sft               # sft / actor_critic / force；后两者均支持人工接管 replay，各 stage 独立运行
   vla_checkpoint: null     # 必填：含 model.safetensors 和 assets/ 的已有 VLA checkpoint 目录
   output_dir: null         # 默认 checkpoints/pi0_rlt/readout；保存配套 EMA VLA/readout 和可恢复的训练状态
   embed_dim: 2048          # 与 Gemma 2B 宽度相同则不做输入/输出投影；改小会加两层 Linear
