@@ -14,7 +14,6 @@ import openpi.models.model as _model
 from openpi.training.collector_frames import LegacyCollectorFrames
 from openpi.training.collector_frames import sequence_keys
 import openpi.training.config as _config
-from openpi.training.droid_rlds_dataset import DroidRldsDataset
 from openpi.training.franka_multirate import MultirateFrankaDataset
 from openpi.training.lerobot_utils import resolve_dataset_root
 import openpi.transforms as _transforms
@@ -27,16 +26,6 @@ class Dataset(Protocol[T_co]):
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
-
-    def __len__(self) -> int:
-        raise NotImplementedError("Subclasses of Dataset should implement __len__.")
-
-
-class IterableDataset(Protocol[T_co]):
-    """Interface for an iterable dataset."""
-
-    def __iter__(self) -> Iterator[T_co]:
-        raise NotImplementedError("Subclasses of IterableDataset should implement __iter__.")
 
     def __len__(self) -> int:
         raise NotImplementedError("Subclasses of Dataset should implement __len__.")
@@ -179,40 +168,6 @@ def split_episode_frames(
     return train_frames, val_frames, train_episodes, val_episodes
 
 
-class IterableTransformedDataset(IterableDataset[T_co]):
-    def __init__(
-        self,
-        dataset: IterableDataset,
-        transforms: Sequence[_transforms.DataTransformFn],
-        *,
-        is_batched: bool = False,
-    ):
-        self._dataset = dataset
-        self._transform = _transforms.compose(transforms)
-        self._is_batched = is_batched
-
-    def __iter__(self):
-        for sample in self._dataset:
-            if self._is_batched:
-                # Transforms are designed to be applied to individual samples. So we need to split the batch into
-                # individual samples and apply the transform to each sample individually.
-                batch_size = next(v.shape[0] for v in sample.values())
-
-                # Split batch into individual samples using tree_map
-                individual_samples = [tree_map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
-
-                # Transform each sample
-                transformed = [self._transform(s) for s in individual_samples]
-
-                # Recombine batch with tree_map
-                yield tree_map(lambda *x: np.stack(x, axis=0), *transformed)
-            else:
-                yield self._transform(sample)
-
-    def __len__(self) -> int:
-        return len(self._dataset)
-
-
 class FakeDataset(Dataset):
     """Deterministic NumPy fixtures for exercising the PyTorch training pipeline."""
 
@@ -289,24 +244,6 @@ def create_torch_dataset(
     return dataset
 
 
-def create_rlds_dataset(
-    data_config: _config.DataConfig,
-    action_horizon: int,
-    batch_size: int,
-    *,
-    shuffle: bool = False,
-) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
-    return DroidRldsDataset(
-        data_dir=data_config.rlds_data_dir,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        action_chunk_size=action_horizon,
-        action_space=data_config.action_space,
-        datasets=data_config.datasets,
-    )
-
-
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
@@ -329,35 +266,6 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     )
 
 
-def transform_iterable_dataset(
-    dataset: IterableDataset,
-    data_config: _config.DataConfig,
-    *,
-    skip_norm_stats: bool = False,
-    is_batched: bool = False,
-) -> IterableDataset:
-    """Transform the dataset by applying the data transforms."""
-    norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
-        if data_config.norm_stats is None:
-            raise ValueError(
-                "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
-            )
-        norm_stats = data_config.norm_stats
-
-    return IterableTransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-        is_batched=is_batched,
-    )
-
-
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -373,17 +281,6 @@ def create_data_loader(
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     data_config = config.data.create(config.assets_dirs, config.model)
     batch_size = config.batch_size if batch_size is None else batch_size
-    if data_config.rlds_data_dir is not None:
-        if dataset is not None or frame_indices is not None:
-            raise ValueError("Episode splits are not supported for RLDS datasets")
-        return create_rlds_data_loader(
-            data_config,
-            config.model.action_horizon,
-            batch_size,
-            shuffle=shuffle,
-            num_batches=num_batches,
-            skip_norm_stats=skip_norm_stats,
-        )
     return create_torch_data_loader(
         data_config,
         config.model,
@@ -416,22 +313,6 @@ def create_train_and_val_loaders(
         return loader, None, loader.data_config(), None, None
 
     data_config = config.data.create(config.assets_dirs, config.model)
-    if data_config.rlds_data_dir is not None:
-        if config.val_ratio > 0:
-            logging.warning("RLDS data has no episode split; skipping validation")
-        return (
-            create_rlds_data_loader(
-                data_config,
-                config.model.action_horizon,
-                batch_size,
-                shuffle=True,
-            ),
-            None,
-            data_config,
-            None,
-            None,
-        )
-
     raw = create_torch_dataset(data_config, config.model.action_horizon, config.model)
     transformed = transform_dataset(raw, data_config)
     train_indices = None
@@ -544,22 +425,6 @@ def create_torch_data_loader(
     return DataLoaderImpl(data_config, loader)
 
 
-def create_rlds_data_loader(
-    data_config: _config.DataConfig,
-    action_horizon: int,
-    batch_size: int,
-    *,
-    skip_norm_stats: bool = False,
-    shuffle: bool = False,
-    num_batches: int | None = None,
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    if torch.distributed.is_initialized():
-        raise NotImplementedError("Distributed PyTorch RLDS loading requires dataset sharding")
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
-    dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
-    return DataLoaderImpl(data_config, RLDSDataLoader(dataset, num_batches=num_batches))
-
-
 class TorchDataLoader:
     """Torch data loader implementation."""
 
@@ -656,38 +521,8 @@ def _worker_init_fn(worker_id: int) -> None:
     np.random.seed(torch.initial_seed() % (2**32))
 
 
-class RLDSDataLoader:
-    """Shallow wrapper around the DROID data loader to make it compatible with openpi.
-
-    All batching already happens in the DROID dataset, so we don't need to do anything here.
-    """
-
-    def __init__(
-        self,
-        dataset: DroidRldsDataset,
-        *,
-        num_batches: int | None = None,
-    ):
-        self._dataset = dataset
-        self._num_batches = num_batches
-
-    def __iter__(self):
-        num_items = 0
-        while True:
-            data_iter = iter(self._dataset)
-            while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
-                    return
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    break  # We've exhausted the dataset. Create a new iterator and start over.
-                num_items += 1
-                yield tree_map(torch.as_tensor, batch)
-
-
 class DataLoaderImpl(DataLoader):
-    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader | RLDSDataLoader):
+    def __init__(self, data_config: _config.DataConfig, data_loader: TorchDataLoader):
         self._data_config = data_config
         self._data_loader = data_loader
 

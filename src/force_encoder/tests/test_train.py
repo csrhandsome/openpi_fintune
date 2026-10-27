@@ -3,6 +3,7 @@
 import copy
 import json
 import math
+from pathlib import Path
 import random
 
 import pytest
@@ -133,6 +134,77 @@ def test_cpu_training_and_interrupted_resume_match(config, tmp_path, monkeypatch
     records = [json.loads(line) for line in (tmp_path / "training/metrics.jsonl").read_text().splitlines()]
     assert [record["step"] for record in records if "loss" in record] == [1, 2, 3, 4]
     assert all(math.isfinite(record.get("loss", record.get("val/loss"))) for record in records)
+
+
+def test_progress_bar_and_tracker_receive_the_same_records(config, monkeypatch):
+    class Tracker:
+        def __init__(self):
+            self.logs = []
+            self.finished = 0
+
+        def log(self, record, step):
+            self.logs.append((record, step))
+
+        def finish(self):
+            self.finished += 1
+
+    tracker = Tracker()
+    opened = []
+    bars = []
+
+    class Bar:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.updates = 0
+            self.postfix = None
+            bars.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def update(self, count=1):
+            self.updates += count
+
+        def set_postfix(self, ordered_dict=None, **kwargs):
+            self.postfix = ordered_dict if ordered_dict is not None else kwargs
+
+        def write(self, _text):
+            return None
+
+    def fake_init(cfg, directory, *, resuming):
+        opened.append((cfg["tracking_backend"], directory, resuming))
+        return tracker
+
+    monkeypatch.setattr(train, "init_tracking", fake_init)
+    monkeypatch.setattr(train.tqdm, "tqdm", lambda **kwargs: Bar(**kwargs))
+    config.update(tracking_backend="swanlab", name="force_encoder", exp_name="jepa", project_name="openpi")
+    train.run(config)
+    output = config["output_dir"]
+    records = [json.loads(line) for line in (Path(output) / "metrics.jsonl").read_text().splitlines()]
+    assert opened == [("swanlab", Path(output), False)]
+    assert bars[0].kwargs == {"total": 4, "initial": 0, "desc": "Training"}
+    assert bars[0].updates == 4
+    assert set(bars[0].postfix) == {"loss", "lr", "step"}
+    assert bars[0].postfix["step"] == 4
+    assert [(record, record["step"]) for record in records] == tracker.logs
+    assert [record["step"] for record in records if "loss" in record] == [1, 2, 3, 4]
+    assert [record["step"] for record in records if "val/loss" in record] == [2, 4]
+    assert tracker.finished == 1
+
+    train.run(config, resume=str(Path(output) / "latest.pt"))
+    assert opened[1] == ("swanlab", Path(output), True)
+    assert bars[1].kwargs["initial"] == 4
+    assert bars[1].updates == 0
+    assert tracker.finished == 2
+
+
+def test_unknown_tracking_backend_is_rejected(config):
+    config["tracking_backend"] = "other"
+    with pytest.raises(ValueError, match="tracking_backend must be"):
+        train.run(config)
 
 
 def test_validation_reuses_masks_and_restores_training_mode(config):

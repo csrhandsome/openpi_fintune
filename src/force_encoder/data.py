@@ -362,11 +362,14 @@ class LeRobotTactileDataset(Dataset):
             validation_key = (record.source, record.episode_index, record.video_key)
             if validation_key not in self._validated_streams:
                 expected = (record.to_timestamp - record.from_timestamp) * video.rate
-                if abs(expected - record.length) > max(2.0, record.length * 0.001):
+                # The NAS converter copies complete camera videos but derives
+                # length from trajectory rows. Extra trailing video frames are
+                # valid: keep the trajectory-aligned prefix, without rescaling.
+                if record.length - expected > max(2.0, record.length * 0.001):
                     raise ValueError(
                         f"{record.source} episode {record.episode_index}: video span at actual rate "
                         f"contains {expected:.2f} frames, metadata length is {record.length}; "
-                        "frame_index mode requires all video frames in order"
+                        "frame_index mode requires enough video frames in order"
                     )
                 self._validated_streams.add(validation_key)
             target = record.from_timestamp + frame_index / video.rate

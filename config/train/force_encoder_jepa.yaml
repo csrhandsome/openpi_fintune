@@ -1,6 +1,10 @@
 # ViT-Base/16 from random initialization; batch 64.
 # Capacity/memory rationale: docs/force_encoder_capacity_2026_10_27.md
 # Run from the project root. data/force is a symlink to /mnt/nas on mirnagroup.
+name: force_encoder
+project_name: openpi
+exp_name: jepa
+tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
 seed: 42
 output_dir: checkpoints/force_encoder/jepa
 data:

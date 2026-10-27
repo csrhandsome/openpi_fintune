@@ -10,6 +10,8 @@ Python 3.12，LeRobot 0.6.1（v3.0 Parquet 数据集），PyTorch 2.7.1。
 uv sync --locked
 ```
 
+数据读取统一使用 LeRobot v3。SwanLab 0.10.3 或更新版本随主依赖安装，默认启用 `dev` 依赖组。
+
 底层共享模型和变换仍有 JAX 兼容依赖；训练、优化器、数据加载和 checkpoint 保存使用 PyTorch。
 
 在训练 YAML 的 `train.tracking_backend` 中选择日志平台：

@@ -17,6 +17,34 @@ def _isolate_tracking_paths(monkeypatch):
         monkeypatch.delenv(variable, raising=False)
 
 
+def test_mapping_without_backend_does_not_import_sdk(tmp_path, monkeypatch):
+    load_sdk = Mock(side_effect=AssertionError("Disabled tracking must not import a tracker SDK"))
+    monkeypatch.setattr(tracking.importlib, "import_module", load_sdk)
+    assert init_tracking({}, tmp_path / "unused", resuming=False) is None
+    assert not (tmp_path / "unused").exists()
+
+
+def test_mapping_config_is_stored_without_train_config_conversion(tmp_path, monkeypatch):
+    monkeypatch.setattr(tracking, "LOG_ROOT", tmp_path / "data")
+    settings = {
+        "tracking_backend": "swanlab",
+        "name": "force_encoder",
+        "exp_name": "jepa",
+        "project_name": "openpi",
+        "training": {"max_steps": 4},
+    }
+    initialize = Mock(return_value=SimpleNamespace(id="jepa-run"))
+    sdk = SimpleNamespace(init=initialize)
+    monkeypatch.setattr(tracking.importlib, "import_module", Mock(return_value=sdk))
+    assert init_tracking(settings, tmp_path, resuming=False) is sdk
+    options = initialize.call_args.kwargs
+    assert options["project"] == "openpi"
+    assert options["experiment_name"] == "jepa"
+    assert options["config"]["training"] == {"max_steps": 4}
+    assert options["logdir"] == str(tmp_path / "data" / "swanlab" / "force_encoder" / "jepa")
+    assert (tmp_path / "swanlab_id.txt").read_text() == "jepa-run"
+
+
 def test_disabled_tracking_does_not_import_sdk(tmp_path, monkeypatch):
     load_sdk = Mock(side_effect=AssertionError("Disabled tracking must not import a tracker SDK"))
     monkeypatch.setattr(tracking.importlib, "import_module", load_sdk)
@@ -104,6 +132,6 @@ def test_real_offline_sdk_records_metrics_and_images(tmp_path, monkeypatch, back
         sdk.finish()
     assert list((tmp_path / "data" / backend).rglob("*.png"))
     if backend == "swanlab":
-        assert not (tmp_path / "swanlab_id.txt").exists()
+        assert (tmp_path / "swanlab_id.txt").read_text().strip()
     else:
         assert (tmp_path / "wandb_id.txt").read_text()

@@ -218,13 +218,36 @@ def test_auto_key_selection_excludes_external_rgb_camera(v3_root):
         LeRobotTactileDataset([{"name": "fixture", "root": v3_root, "video_keys": ["action"]}])
 
 
-def test_frame_count_duration_mismatch_is_rejected(v3_root):
+def test_trailing_video_frames_preserve_frame_indices_and_shared_offsets(v3_root):
+    episode_path = v3_root / "meta/episodes/chunk-000/file-000.parquet"
+    rows = pq.read_table(episode_path).to_pylist()[:2]
+    for index, row in enumerate(rows):
+        for key in TACTILE_KEYS:
+            row[f"videos/{key}/from_timestamp"] = index * 0.6
+            row[f"videos/{key}/to_timestamp"] = (index + 1) * 0.6
+    pq.write_table(pa.Table.from_pylist(rows), episode_path)
+    info_path = v3_root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info.update(total_episodes=2, total_frames=6)
+    info_path.write_text(json.dumps(info))
+    (v3_root / "verified.json").write_text(json.dumps({"episodes": 2, "frames": 6}))
+    dataset = _dataset(v3_root)
+    assert len(dataset) == 12
+    # Read both cameras out of order; extra frames must not stretch the mapping
+    # or shift the start of the next episode in the shared MP4.
+    for index in [11, 0, 8, 3, 6, 2, 9, 5]:
+        metadata = dataset.sample_metadata(index)
+        absolute_frame = metadata["episode_index"] * 6 + metadata["frame_index"]
+        assert abs(_red_channel(dataset[index]) - (20 + absolute_frame * 17)) < 5
+
+
+def test_video_shorter_than_metadata_is_rejected(v3_root):
     episode_path = v3_root / "meta/episodes/chunk-000/file-000.parquet"
     rows = pq.read_table(episode_path).to_pylist()
     for key in TACTILE_KEYS:
-        rows[0][f"videos/{key}/to_timestamp"] = 1.3
+        rows[0][f"videos/{key}/to_timestamp"] = 0.05
     pq.write_table(pa.Table.from_pylist(rows), episode_path)
-    with pytest.raises(ValueError, match="frame_index mode requires"):
+    with pytest.raises(ValueError, match="frame_index mode requires enough video frames"):
         _dataset(v3_root)[0]
 
 

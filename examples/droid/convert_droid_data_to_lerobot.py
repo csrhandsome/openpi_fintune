@@ -49,10 +49,10 @@ def main(data_dir: str, *, push_to_hub: bool = False):
         robot_type="panda",
         fps=15,  # DROID data is typically recorded at 15fps
         features={
-            # We call this "left" since we will only use the left stereo camera (following DROID RLDS convention)
+            # Use the left image from each stereo camera.
             "exterior_image_1_left": {
                 "dtype": "image",
-                "shape": (180, 320, 3),  # This is the resolution used in the DROID RLDS dataset
+                "shape": (180, 320, 3),
                 "names": ["height", "width", "channel"],
             },
             "exterior_image_2_left": {
@@ -152,7 +152,7 @@ def main(data_dir: str, *, push_to_hub: bool = False):
     # Optionally push to the Hugging Face Hub
     if push_to_hub:
         dataset.push_to_hub(
-            tags=["libero", "panda", "rlds"],
+            tags=["droid", "panda", "lerobot"],
             private=False,
             push_videos=True,
             license="apache-2.0",

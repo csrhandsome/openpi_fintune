@@ -144,6 +144,29 @@ def test_v3_data_can_compute_ee_normalization(panda_dataset, num_workers):
     np.testing.assert_allclose(stats["actions"].get_statistics().mean[-1], 0.25)
 
 
+def test_normalization_entrypoint_saves_v3_statistics(panda_dataset, tmp_path, monkeypatch):
+    repo_id, _ = panda_dataset
+    settings = config.TrainConfig(
+        name="v3_norm_stats",
+        data=config.LeRobotFrankaDataConfig(
+            repo_id=repo_id,
+            action_space="ee_delta",
+            action_dim=7,
+            base_config=config.DataConfig(prompt_from_task=True),
+        ),
+        model=pi0_config.Pi0Config(action_horizon=4),
+        assets_base_dir=str(tmp_path / "assets"),
+        batch_size=2,
+        num_workers=0,
+    )
+    monkeypatch.setattr(config, "get_config", lambda _name: settings)
+    compute_norm_stats.main(config="v3_norm_stats")
+    stats = normalize.load(settings.assets_dirs / repo_id)
+    np.testing.assert_allclose(stats["state"].mean[:6], 3.25)
+    np.testing.assert_allclose(stats["state"].mean[-1], 1.0)
+    np.testing.assert_allclose(stats["actions"].mean[-1], 0.25)
+
+
 def test_episode_metadata_splits_whole_episodes(panda_dataset):
     repo_id, _ = panda_dataset
     data_config = config.DataConfig(repo_id=repo_id, action_sequence_keys=("action.ee_pose", "action.gripper_position"))

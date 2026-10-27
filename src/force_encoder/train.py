@@ -11,11 +11,13 @@ import time
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+import tqdm
 import yaml
 
 from force_encoder.data import BalancedSourceSampler
 from force_encoder.data import LeRobotTactileDataset
 from force_encoder.model import ImageJEPA
+from openpi.training.tracking import init_tracking
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "config/train/force_encoder_jepa.yaml"
@@ -52,6 +54,30 @@ def amp_context(device: torch.device, precision: str):
     if device.type == "cuda" and not torch.cuda.is_bf16_supported():
         raise ValueError("This GPU does not support bf16; set precision=fp32")
     return torch.autocast(device.type, dtype=torch.bfloat16)
+
+
+def check_tracking(config: dict) -> None:
+    backend = config.get("tracking_backend", "none")
+    if backend not in ("none", "wandb", "swanlab"):
+        raise ValueError("tracking_backend must be none, wandb or swanlab")
+    if backend == "none":
+        return
+    for key in ("name", "exp_name"):
+        value = config.get(key)
+        if not isinstance(value, str) or not value or value in {".", ".."} or Path(value).name != value:
+            raise ValueError(f"{key} must be a nonempty directory name")
+    project_name = config.get("project_name")
+    if not isinstance(project_name, str) or not project_name or "/" in project_name or "\\" in project_name:
+        raise ValueError("project_name must be a nonempty name")
+
+
+def log_record(record: dict, log, pbar, tracker) -> None:
+    line = json.dumps(record)
+    pbar.write(line)
+    log.write(line + "\n")
+    log.flush()
+    if tracker is not None:
+        tracker.log(record, step=record["step"])
 
 
 def memory_stats(device: torch.device) -> dict[str, float]:
@@ -142,6 +168,7 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
         raise ValueError("max_steps, steps_per_epoch and batch_size must be positive")
     if min(cfg[key] for key in ("validate_every", "val_batches", "save_every", "log_every")) <= 0:
         raise ValueError("Validation, checkpoint and log intervals must be positive")
+    check_tracking(config)
     device = torch.device(cfg["device"])
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; use --device cpu for a small test")
@@ -209,62 +236,69 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
     step = start_step
     model.train()
     started = time.monotonic()
-    with (output / "metrics.jsonl").open("a") as log:
-        while step < cfg["max_steps"]:
-            epoch = step // cfg["steps_per_epoch"]
-            sampler.set_epoch(epoch)
-            # Bound the final partial epoch so workers cannot keep decoding
-            # unused NAS batches after the requested last optimizer step.
-            sampler.num_samples = (
-                min(cfg["steps_per_epoch"], cfg["max_steps"] - epoch * cfg["steps_per_epoch"]) * cfg["batch_size"]
-            )
-            skip_batches = step % cfg["steps_per_epoch"]
-            for batch_index, batch in enumerate(train_loader):
-                if batch_index < skip_batches:
-                    continue
-                images = batch.to(device, non_blocking=True)
-                lr, weight_decay, momentum = schedule(step, cfg)
-                for index, group in enumerate(optimizer.param_groups):
-                    group["lr"] = lr
-                    group["weight_decay"] = weight_decay if index == 0 else 0.0
-                optimizer.zero_grad(set_to_none=True)
-                with amp_context(device, cfg["precision"]):
-                    metrics = model(images)
-                if not torch.isfinite(metrics["loss"]):
-                    raise FloatingPointError(f"Nonfinite JEPA loss at step {step}")
-                metrics["loss"].backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(parameters, cfg["grad_clip"], error_if_nonfinite=True)
-                optimizer.step()
-                model.update_teacher(momentum)
-                step += 1
-                if step == 1 or step % cfg["log_every"] == 0 or step == cfg["max_steps"]:
-                    record = {
-                        "step": step,
-                        **{key: float(value) for key, value in metrics.items()},
-                        "lr": lr,
-                        "weight_decay": weight_decay,
-                        "momentum": momentum,
-                        "grad_norm": float(grad_norm),
-                        "elapsed_seconds": time.monotonic() - started,
-                        **memory_stats(device),
-                    }
-                    print(json.dumps(record), flush=True)
-                    log.write(json.dumps(record) + "\n")
-                    log.flush()
-                final = step == cfg["max_steps"]
-                if step % cfg["validate_every"] == 0 or final:
-                    record = {"step": step, **validate(model, val_loader, device, cfg), **memory_stats(device)}
-                    print(json.dumps(record), flush=True)
-                    log.write(json.dumps(record) + "\n")
-                    log.flush()
-                    if record["val/loss"] < best_loss:
-                        best_loss = record["val/loss"]
-                        save_checkpoint(output / "best.pt", model, optimizer, step, config, best_loss)
-                if step % cfg["save_every"] == 0 or final:
-                    save_checkpoint(output / "latest.pt", model, optimizer, step, config, best_loss)
-                if final:
-                    break
-    print(f"Training completed at step {step}; checkpoint: {output / 'latest.pt'}", flush=True)
+    tracker = init_tracking(config, output, resuming=resume is not None)
+    try:
+        with (
+            tqdm.tqdm(total=cfg["max_steps"], initial=start_step, desc="Training") as pbar,
+            (output / "metrics.jsonl").open("a") as log,
+        ):
+            while step < cfg["max_steps"]:
+                epoch = step // cfg["steps_per_epoch"]
+                sampler.set_epoch(epoch)
+                # Bound the final partial epoch so workers cannot keep decoding
+                # unused NAS batches after the requested last optimizer step.
+                sampler.num_samples = (
+                    min(cfg["steps_per_epoch"], cfg["max_steps"] - epoch * cfg["steps_per_epoch"]) * cfg["batch_size"]
+                )
+                skip_batches = step % cfg["steps_per_epoch"]
+                for batch_index, batch in enumerate(train_loader):
+                    if batch_index < skip_batches:
+                        continue
+                    images = batch.to(device, non_blocking=True)
+                    lr, weight_decay, momentum = schedule(step, cfg)
+                    for index, group in enumerate(optimizer.param_groups):
+                        group["lr"] = lr
+                        group["weight_decay"] = weight_decay if index == 0 else 0.0
+                    optimizer.zero_grad(set_to_none=True)
+                    with amp_context(device, cfg["precision"]):
+                        metrics = model(images)
+                    if not torch.isfinite(metrics["loss"]):
+                        raise FloatingPointError(f"Nonfinite JEPA loss at step {step}")
+                    metrics["loss"].backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(parameters, cfg["grad_clip"], error_if_nonfinite=True)
+                    optimizer.step()
+                    model.update_teacher(momentum)
+                    step += 1
+                    loss = float(metrics["loss"])
+                    if step == 1 or step % cfg["log_every"] == 0 or step == cfg["max_steps"]:
+                        record = {
+                            "step": step,
+                            **{key: float(value) for key, value in metrics.items()},
+                            "lr": lr,
+                            "weight_decay": weight_decay,
+                            "momentum": momentum,
+                            "grad_norm": float(grad_norm),
+                            "elapsed_seconds": time.monotonic() - started,
+                            **memory_stats(device),
+                        }
+                        log_record(record, log, pbar, tracker)
+                    final = step == cfg["max_steps"]
+                    if step % cfg["validate_every"] == 0 or final:
+                        record = {"step": step, **validate(model, val_loader, device, cfg), **memory_stats(device)}
+                        log_record(record, log, pbar, tracker)
+                        if record["val/loss"] < best_loss:
+                            best_loss = record["val/loss"]
+                            save_checkpoint(output / "best.pt", model, optimizer, step, config, best_loss)
+                    if step % cfg["save_every"] == 0 or final:
+                        save_checkpoint(output / "latest.pt", model, optimizer, step, config, best_loss)
+                    pbar.update(1)
+                    pbar.set_postfix({"loss": f"{loss:.4f}", "lr": f"{lr:.2e}", "step": step})
+                    if final:
+                        break
+        print(f"Training completed at step {step}; checkpoint: {output / 'latest.pt'}", flush=True)
+    finally:
+        if tracker is not None:
+            tracker.finish()
 
 
 def main() -> None:
@@ -278,6 +312,7 @@ def main() -> None:
     parser.add_argument("--max-episodes-per-source", type=int)
     parser.add_argument("--device", choices=("cuda", "cpu"))
     parser.add_argument("--precision", choices=("bf16", "fp32"))
+    parser.add_argument("--tracking-backend", choices=("none", "wandb", "swanlab"))
     args = parser.parse_args()
     config = read_config(args.config)
     for key in ("max_steps", "batch_size", "num_workers", "val_batches", "steps_per_epoch", "device", "precision"):
@@ -287,6 +322,8 @@ def main() -> None:
         config["output_dir"] = str(Path(args.output_dir).resolve())
     if args.max_episodes_per_source is not None:
         config["data"]["max_episodes_per_source"] = args.max_episodes_per_source
+    if args.tracking_backend is not None:
+        config["tracking_backend"] = args.tracking_backend
     run(config, resume=args.resume, inspect=args.inspect)
 
 
