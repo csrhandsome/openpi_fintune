@@ -1,0 +1,38 @@
+# Frozen-encoder downstream probe. These NAS conversions have no force labels.
+seed: 42
+checkpoint: checkpoints/force_encoder/jepa/best.pt
+output_dir: outputs/force_encoder/gripper_probe
+data:
+  sources:
+    - name: FreeTacMan
+      root: data/force/FreeTacMan/lerobot_v3
+      timestamp_mode: frame_index
+  val_fraction: 0.05
+  test_fraction: 0.05
+  frame_stride: 5
+  max_episodes_per_source: null
+  require_verified: true
+task:
+  type: regression
+  target_key: observation.gripper_position
+  # The converter stores CSV gripper_distance under this generic feature name.
+  # It does not normalize it to a 0..1 opening ratio. Preserve source units.
+  label_names: [gripper_distance]
+  units: [source_csv_distance]
+encoder:
+  baseline: pretrained
+  random_seed: 42
+head:
+  type: linear
+  hidden_dim: 256
+  dropout: 0.0
+training:
+  device: cuda
+  batch_size: 256
+  feature_batch_size: 64
+  num_workers: 4
+  epochs: 30
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seeds: [0, 1, 2]
+  max_samples_per_split: null

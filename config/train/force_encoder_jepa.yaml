@@ -1,0 +1,55 @@
+# ViT-Base/16 from random initialization; batch 64.
+# Capacity/memory rationale: docs/force_encoder_capacity_2026_10_27.md
+# Run from the project root. data/force is a symlink to /mnt/nas on mirnagroup.
+seed: 42
+output_dir: checkpoints/force_encoder/jepa
+data:
+  sources:
+    - name: tactile-video-pretrain-nc
+      root: data/force/tactile-video-pretrain-nc/lerobot_v3
+      timestamp_mode: frame_index
+    - name: FreeTacMan
+      root: data/force/FreeTacMan/lerobot_v3
+      timestamp_mode: frame_index
+    - name: ViTaMIn
+      root: data/force/ViTaMIn/lerobot_v3
+      timestamp_mode: frame_index
+  val_fraction: 0.05
+  # Hold out test episodes from SSL as well as downstream head training.
+  test_fraction: 0.05
+  frame_stride: 5
+  max_episodes_per_source: null
+model:
+  image_size: 224
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  predictor_depth: 4
+  predictor_dim: 768
+  mlp_ratio: 4.0
+  num_local_targets: 2
+  num_global_targets: 2
+  local_scale: [0.05, 0.10]
+  global_scale: [0.15, 0.20]
+  max_target_overlap: 0.25
+training:
+  device: cuda
+  precision: bf16
+  batch_size: 64
+  num_workers: 4
+  # A fixed-length epoch, drawing equally from each dataset with replacement.
+  steps_per_epoch: 1000
+  max_steps: 100000
+  learning_rate: 0.0003
+  min_learning_rate: 0.000001
+  warmup_steps: 2000
+  weight_decay: 0.04
+  final_weight_decay: 0.1
+  ema_start: 0.996
+  ema_end: 1.0
+  grad_clip: 1.0
+  log_every: 20
+  validate_every: 1000
+  val_batches: 20
+  save_every: 1000
