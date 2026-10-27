@@ -183,3 +183,6 @@ franka_lerobot_*
 
 # ModelScope local credentials
 scripts/modelscope/config.py
+
+# third party
+third_party/

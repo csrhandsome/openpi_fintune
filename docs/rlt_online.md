@@ -32,6 +32,12 @@ RLT 启动前设置 VLA checkpoint 和 readout 路径。VLA checkpoint 必须包
 推理请求中提供 `in_critical_phase: bool`，非关键阶段继续执行 VLA。
 `begin_episode(..., policy_mode="base")` 可以选择本轮始终执行 VLA。
 
+这里的关键阶段开关目前只限制动作来源，不过滤采集数据。即使
+`in_critical_phase=False`，有效 `observe` 仍生成 draft，标注结束后也会入库并计入
+warmup；默认 600 条统计整个训练 buffer 的 chunk transition 数。它与参考
+`openpi-RLT` 的“非关键段不进入 replay”存在差异。完整示教数采、RL warmup、
+关键阶段及人工接管的逐项对照见 [数采对照](rlt_collection_alignment.md)。
+
 20000 表示 learner 更新数；`actor_update_period: 2` 时，actor 更新约 10000 次。
 收集完成 warmup 后，每新增 transition 增加 `grad_updates_per_cycle` 次更新预算，
 没有新数据时停止追加更新。`freeze_after_warmup: true` 则达标后停止学习。
@@ -87,6 +93,8 @@ client.close()
 自定义状态可传 `observation.proprio`，须匹配 `proprio_dim`。
 每个 server 同时运行一个机器人 episode。`episode_id` 必须唯一，反馈的 `step_id`
 须对应尚未确认的动作。人工接管反馈使用 `source="HUMAN"`，随后结束回合，避免跨接管边界。
+此在线接口尚不支持原仓库同回合接管再恢复策略；实际遥操作切换由执行端负责，
+helper 不提供 `c` / `t` 按键。人工接管本身不代表任务失败，成败仍需显式标注。
 动作提案由机器人现有执行接口下发；执行端继续负责设备约束、急停和目标裁剪。
 
 底层仍是原 WebSocket，消息为 `{rlt_event: ..., episode_id: ..., ...}`：

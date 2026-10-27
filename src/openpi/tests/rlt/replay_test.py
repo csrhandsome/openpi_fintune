@@ -303,7 +303,15 @@ def test_real_v3_import_frontend_labels_cache_and_reannotation(tmp_path, monkeyp
     )
     journal = ReplayJournal(tmp_path / "replay", spec)
     result = import_dataset(dataset, root, cache, journal, action_source="measured")
-    assert result == {"imported_episodes": 1, "skipped_unannotated": 1, "transitions": 2}
+    assert result == {
+        "imported_episodes": 1,
+        "skipped_unannotated": 1,
+        "skipped_no_critical_phase": 0,
+        "skipped_empty_critical_phase": 0,
+        "excluded_noncritical_steps": 0,
+        "included_steps": 5,
+        "transitions": 2,
+    }
     assert len(calls) == 4
     records = journal.read_all()
     assert records[-1].rewards[-1] == 1
@@ -359,8 +367,17 @@ def test_real_v3_import_frontend_labels_cache_and_reannotation(tmp_path, monkeyp
     )
     build_replay.main()
     build_replay.main()
+    assert len(calls) == 4  # The default skips old episodes without phase annotations.
+    assert len(ReplayJournal(cli_output)) == 0
+    # Full-task import is explicit, and cannot reuse a journal bound to critical-only filtering.
+    sys.argv.extend(["--include-noncritical"])
+    with pytest.raises(ValueError, match="model/action semantics"):
+        build_replay.main()
+    sys.argv[sys.argv.index(str(cli_output))] = str(tmp_path / "cli_full_replay")
+    build_replay.main()
+    build_replay.main()
     assert len(calls) == 8
-    cli_journal = ReplayJournal(cli_output)
+    cli_journal = ReplayJournal(tmp_path / "cli_full_replay")
     assert len(cli_journal) == 2
     assert all(not record.success for record in cli_journal.read_all())
     cache_other = FeatureCache(cache.path, SimpleNamespace(infer=infer), model_id="other", horizon=4, action_dim=7)

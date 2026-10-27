@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=src/openpi-client/pyproject.toml,target=src/openpi-client/pyproject.toml \
-    --mount=type=bind,source=src/openpi-client/src,target=src/openpi-client/src \
+    --mount=type=bind,source=src/openpi-client/openpi_client,target=src/openpi-client/openpi_client \
     GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
 
 CMD /bin/bash -c "uv run scripts/server.py $SERVER_ARGS"

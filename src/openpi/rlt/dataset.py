@@ -1,6 +1,7 @@
 """Adapt existing data_collect LeRobot episodes and frontend sync annotations."""
 
 from dataclasses import asdict
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -181,15 +182,33 @@ def import_dataset(
     stride: int = 2,
     action_source: str = "command",
     episode_indices: list[int] | None = None,
+    critical_phase_only: bool = False,
 ) -> dict:
+    """Replace annotated episodes; optional critical scope excludes every interval crossing the marker.
+
+    Critical scope requires versioned absolute-clock phase annotations. Missing/null markers remove
+    any prior entry instead of promoting legacy or unmarked episodes into the contact replay.
+    """
     root = Path(root).resolve()
     reward = reward or TerminalReward()
     spec = journal.spec
-    journal.bind_provenance({"model_id": cache.model_id, "action_source": action_source})
+    phase_scope = "critical_phase" if critical_phase_only else "full_episode"
+    provenance = {"model_id": cache.model_id, "action_source": action_source}
+    if critical_phase_only:
+        provenance["phase_scope"] = phase_scope
+    journal.bind_provenance(provenance)
     if not np.isclose(float(dataset.meta.fps), spec.fps):
         raise ValueError("Dataset and replay action timebases differ; align the dataset before importing")
     identity = root.name + ":" + hashlib.sha256(str(root).encode()).hexdigest()[:16]
-    stats = {"imported_episodes": 0, "skipped_unannotated": 0, "transitions": 0}
+    stats = {
+        "imported_episodes": 0,
+        "skipped_unannotated": 0,
+        "skipped_no_critical_phase": 0,
+        "skipped_empty_critical_phase": 0,
+        "excluded_noncritical_steps": 0,
+        "included_steps": 0,
+        "transitions": 0,
+    }
     for episode in dataset.meta.episodes:
         index = int(episode["episode_index"])
         if episode_indices is not None and index not in episode_indices:
@@ -201,6 +220,20 @@ def import_dataset(
             stats["skipped_unannotated"] += 1
             continue
         start, stop = int(episode["dataset_from_index"]), int(episode["dataset_to_index"])
+        marker = sync.get("critical_phase_start_monotonic_ns")
+        if critical_phase_only:
+            if marker is None:
+                journal.remove_episode(episode_id)
+                stats["skipped_no_critical_phase"] += 1
+                stats["excluded_noncritical_steps"] += max(stop - start - 1, 0)
+                continue
+            if (
+                type(sync.get("critical_phase_annotation_version")) is not int
+                or sync["critical_phase_annotation_version"] != 1
+            ):
+                raise ValueError("Critical-phase replay requires critical_phase_annotation_version 1")
+            if type(marker) is not int or marker < 0:
+                raise ValueError("critical_phase_start_monotonic_ns must be a nonnegative integer or null")
         items = _numeric_items(dataset, start, stop, space=spec.action_space, action_source=action_source)
         if len(items) < 2:
             raise ValueError(f"Episode {index} has no observed next-state transition")
@@ -213,11 +246,28 @@ def import_dataset(
             else [round(float(_numpy(item["timestamp"]).item()) * 1e9) for item in items],
             np.int64,
         )
-        intervals = np.diff(frame_ns) / 1e9
-        if np.any(intervals <= 0) or np.any(np.abs(intervals - 1 / spec.fps) > 0.5 / spec.fps):
-            raise ValueError("Camera gaps would change chunk discount timing; align or split the episode first")
+        if np.any(np.diff(frame_ns) <= 0):
+            raise ValueError("Camera frame timestamps must increase")
         if sync.get("action_trace") and not frames:
             raise ValueError("Trace alignment requires absolute sync frame timestamps")
+        phase_start = 0
+        if critical_phase_only:
+            if not frames:
+                raise ValueError("Critical-phase alignment requires absolute sync frame timestamps")
+            # A command interval that starts before the marker is excluded in full.
+            # The suffix still ends at the original last state, preserving terminal semantics.
+            phase_start = int(np.searchsorted(frame_ns, marker, side="left"))
+            stats["excluded_noncritical_steps"] += min(phase_start, len(items) - 1)
+            if phase_start >= len(items) - 1:
+                journal.remove_episode(episode_id)
+                stats["skipped_empty_critical_phase"] += 1
+                continue
+        observed_frames = len(items)
+        items = items[phase_start:]
+        frame_ns = frame_ns[phase_start:]
+        intervals = np.diff(frame_ns) / 1e9
+        if np.any(np.abs(intervals - 1 / spec.fps) > 0.5 / spec.fps):
+            raise ValueError("Camera gaps would change chunk discount timing; align or split the episode first")
         actions, sources = episode_actions(
             root, sync, items, frame_ns, space=spec.action_space, action_source=action_source
         )
@@ -226,7 +276,7 @@ def import_dataset(
         required = set(starts) | {min(start + spec.chunk_len, len(actions)) for start in starts}
         features = [None] * len(items)
         for frame_index in sorted(required):
-            item = dataset[start + frame_index]
+            item = dataset[start + phase_start + frame_index]
             observation = {key: _numpy(value) for key, value in item.items() if key.startswith("observation.")}
             observation.update(
                 prompt=str(item.get("task", sync.get("task", ""))), monotonic_ts=np.asarray(frame_ns[frame_index] / 1e9)
@@ -236,6 +286,7 @@ def import_dataset(
         records = build_episode_transitions(
             episode_id, features, actions, sources, spec=spec, success=sync["success"], stride=stride, reward=reward
         )
+        records = [replace(record, step_id=record.step_id + phase_start) for record in records]
         journal.replace_episode(
             records,
             metadata={
@@ -248,10 +299,18 @@ def import_dataset(
                 "action_source": action_source,
                 "model_id": cache.model_id,
                 "reference_origin": "offline_vla_recomputed",
-                "observed_frames": len(items),
+                "phase_scope": phase_scope,
+                "critical_phase_annotation_version": sync.get("critical_phase_annotation_version"),
+                "critical_phase_start_monotonic_ns": marker,
+                "first_included_step": phase_start,
+                "excluded_noncritical_steps": phase_start,
+                "observed_frames": observed_frames,
+                "included_frames": len(items),
+                "original_executed_steps": observed_frames - 1,
                 "executed_steps": len(actions),
             },
         )
         stats["imported_episodes"] += 1
+        stats["included_steps"] += len(actions)
         stats["transitions"] += len(records)
     return stats

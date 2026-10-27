@@ -24,6 +24,13 @@ def main():
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--episode-index", type=int, action="append")
     parser.add_argument("--action-source", choices=("command", "measured"), default="command")
+    parser.add_argument(
+        "--include-noncritical",
+        action="store_true",
+        help="Import full episodes, including noncritical stages and legacy unmarked data. By default, only "
+        "intervals starting at/after the recorded critical-phase marker are imported; unmarked episodes are skipped. "
+        "Use a separate output directory for each mode.",
+    )
     parser.add_argument("--success-reward", type=float, default=1.0)
     parser.add_argument("--failure-reward", type=float, default=0.0)
     parser.add_argument("--step-reward", type=float, default=0.0)
@@ -80,6 +87,7 @@ def main():
         stride=args.stride,
         action_source=args.action_source,
         episode_indices=args.episode_index,
+        critical_phase_only=not args.include_noncritical,
     )
     print(json.dumps(stats, indent=2))
 

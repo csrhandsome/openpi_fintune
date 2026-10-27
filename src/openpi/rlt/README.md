@@ -34,6 +34,14 @@ rlt/
 
 ## 从已有数据构建 replay
 
+完整示教数据保留全任务。构建 replay 的 CLI 默认只导入关键阶段：采集时按左摇杆进入，
+sidecar 写入 `critical_phase_annotation_version: 1` 和 `critical_phase_start_monotonic_ns`。
+训练窗口从标记之后的第一个相机观测开始，不跨边界，保留到真实回合结束，
+其中 BASE、RL 和 HUMAN 动作均可入库。未标记、未标成败或标记后无有效动作的回合跳过。
+`--include-noncritical` 显式导入完整回合（含旧的无阶段标记数据）；两种范围必须使用不同输出目录。
+Python API `import_dataset` 为兼容旧调用，需显式传 `critical_phase_only=True` 开启过滤。
+与参考仓库的在线接口差异见 [数采对照](../../../docs/rlt_collection_alignment.md)。
+
 在仓库根目录、GPU 推理环境运行，不需要连接机器人：
 
 ```bash

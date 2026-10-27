@@ -2,6 +2,8 @@
 
 当前实现对照本机 RLinf `61ba34e6` 和 openpi-RLT `c1e40ac3`。普通 VLA 使用 RLinf 的 PyTorch Pi0/Pi0.5 主干、flow matching 和 Euler sampler；第一阶段的 readout 使用 openpi-RLT 的 cross-attention encoder/decoder。
 
+openpi-RLT 的对应源码快照保存在 [third_party/openpi-RLT](../third_party/openpi-RLT/README.md)，版本和来源见[快照记录](../third_party/openpi-RLT.UPSTREAM.md)。
+
 ## VLA 精度与 LoRA
 
 训练和推理加载都使用 `pytorch_training_precision`，默认 `bfloat16`。Gemma/SigLIP 主干采用 BF16，动作与时间投影、Gemma norm、视觉 patch embedding 和位置 embedding 保持 FP32，与 RLinf 的选择性转换一致。`float32` 会同时恢复权重和计算 dtype，避免参数 dtype 与输入 dtype 不一致。
@@ -75,6 +77,12 @@ RLT checkpoint 保存每个 rank 的 CPU、CUDA 和 NumPy RNG 状态，恢复时
 | `rlt.learner.delta_weight` / `smooth_action_dims` | `0.0` / `6`：在物理空间比较预测和 BC target 的相邻步增量，忽略 padding；多臂动作应按实际布局调整 |
 
 全有效 E 步情况下，这些网络和损失对应参考普通 RLT。当前还保留短 chunk mask、多臂输入、可选触觉和 H 步服务协议；这些是本项目扩展。旧 actor/critic checkpoint 结构不兼容，新格式为 `openpi-rlt-learner-v2`。独立 `force_rlt` B/C 实验网络保持自己的实现。
+
+## 数采与在线流程的对齐范围
+
+网络和损失的数值对照不代表数采流程等价。2026-10-27 核对发现：参考 ROS 链路在 warmup 和 online 都排除非关键阶段的 replay；当前普通在线服务的 `critical_phase_only` 只限制 actor 接管，非关键段反馈仍入库并计入 warmup。参考支持同回合人工接管再交回策略，当前在线 `HUMAN` 反馈后要求结束回合；当前离线导入支持混合来源回合，但没有关键阶段裁剪入口。
+
+完整示教、关键阶段切换、600 条统计、`c` / `t` 的操作语义、离线数据复用和待补功能见 [RLT 数采、关键阶段与人工接管对照](rlt_collection_alignment.md)。该文区分当前行为与待实现要求。
 
 ## 验证范围
 
