@@ -135,10 +135,11 @@ class FrameLabelReader:
             if len(self._episodes) > self.cache_size:
                 self._episodes.popitem(last=False)
         self._episodes.move_to_end(cache_key)
+        frame_index = metadata.get("frame_indices", [metadata["frame_index"]])[-1]
         try:
-            return self._episodes[cache_key][int(metadata["frame_index"])].copy()
+            return self._episodes[cache_key][int(frame_index)].copy()
         except KeyError as error:
-            raise ValueError(f"{path}: missing label for episode {episode}, frame {metadata['frame_index']}") from error
+            raise ValueError(f"{path}: missing label for episode {episode}, frame {frame_index}") from error
 
     def close(self) -> None:
         for parquet in self._files.values():
@@ -198,6 +199,8 @@ def extract_features(encoder: ImageEncoder, dataset: LeRobotTactileDataset, outp
                     "video_key": metadata["video_key"],
                     "frame_index": metadata["frame_index"],
                 }
+                if "frame_indices" in metadata:
+                    identity.update(frame_indices=metadata["frame_indices"], frame_index=metadata["frame_indices"][-1])
                 line = json.dumps(identity, sort_keys=True)
                 identity_hash.update((line + "\n").encode())
                 stream.write(line + "\n")
@@ -496,6 +499,11 @@ def run(config: dict) -> list[Path]:
     validate_pretraining_split(payload, config)
     device = torch.device(cfg["device"])
     encoder = load_encoder(config["checkpoint"], device)
+    if encoder.num_frames > 1:
+        step = payload["config"]["data"].get("clip_frame_step", 1)
+        if config["data"].get("clip_frame_step", step) != step:
+            raise ValueError("Benchmark clip_frame_step must match video pretraining")
+        config["data"]["clip_frame_step"] = step
     encoder_cfg = config.get("encoder", {})
     baseline = encoder_cfg.get("baseline", "pretrained")
     if baseline == "frozen_random":
@@ -511,7 +519,11 @@ def run(config: dict) -> list[Path]:
     manifests = {}
     for split in ("train", "val", "test"):
         dataset = LeRobotTactileDataset(
-            **config["data"], image_size=encoder.image_size, split=split, seed=config["seed"]
+            **config["data"],
+            image_size=encoder.image_size,
+            split=split,
+            seed=config["seed"],
+            num_frames=encoder.num_frames,
         )
         manifests[split] = extract_features(encoder, dataset, output / "features" / split, config)
     for left, right in (("train", "val"), ("train", "test"), ("val", "test")):

@@ -186,3 +186,8 @@ scripts/modelscope/config.py
 
 # third party
 third_party/
+
+# Local agent navigation and machine-specific operating notes.
+/AGENTS.md
+/agents.md
+/spec/

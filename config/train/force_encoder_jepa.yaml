@@ -1,12 +1,12 @@
-# ViT-Base/16 from random initialization; batch 64.
+# ViT-Base/16 from random initialization; 16-frame clips, 2-frame tubelets.
 # Capacity/memory rationale: docs/force_encoder_capacity_2026_10_27.md
 # Run from the project root. data/force is a symlink to /mnt/nas on mirnagroup.
 name: force_encoder
 project_name: openpi
-exp_name: jepa
+exp_name: jepa_video16_tube2_ema_5sources
 tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
 seed: 42
-output_dir: checkpoints/force_encoder/jepa
+output_dir: checkpoints/force_encoder/jepa_video16_tube2_ema_5sources
 data:
   sources:
     - name: tactile-video-pretrain-nc
@@ -18,12 +18,39 @@ data:
     - name: ViTaMIn
       root: data/force/ViTaMIn/lerobot_v3
       timestamp_mode: frame_index
+    - name: HapTile
+      root: data/force/HapTile/lerobot_v3
+      timestamp_mode: frame_index
+    - name: Daimon-Infinity-Lite
+      root: data/force/Daimon-Infinity-Lite/datasets/dm_dataClaw
+      # The published info.json hides tactile cameras; info_raw.json retains them.
+      info_file: meta/info_raw.json
+      # Native v3 exports have no conversion marker; episode/frame checks still apply.
+      require_verified: false
+      timestamp_mode: frame_index
+      video_keys:
+        - observation.images.left_gripper_left_tactile
+        - observation.images.left_gripper_right_tactile
+        - observation.images.right_gripper_left_tactile
+        - observation.images.right_gripper_right_tactile
   val_fraction: 0.05
   # Hold out test episodes from SSL as well as downstream head training.
   test_fraction: 0.05
   frame_stride: 5
+  # Gap between frames WITHIN a clip; frame_stride above is the gap between clip starts.
+  clip_frame_step: 2
   max_episodes_per_source: null
 model:
+  # single_frame keeps the image JEPA path; spatiotemporal uses Conv3d tubelets.
+  # In single_frame mode num_frames/tubelet_size below are ignored (effective 1/1).
+  input_mode: spatiotemporal
+  num_frames: 16
+  tubelet_size: 2
+  # ema: frozen EMA teacher; sigreg: shared encoder, both branches receive gradients.
+  target_mode: ema
+  sigreg_weight: 0.09
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
   image_size: 224
   patch_size: 16
   embed_dim: 768
@@ -40,7 +67,8 @@ model:
 training:
   device: cuda
   precision: bf16
-  batch_size: 64
+  # Number of clips, not number of frames (8 clips = 128 images per update).
+  batch_size: 8
   num_workers: 4
   # A fixed-length epoch, drawing equally from each dataset with replacement.
   steps_per_epoch: 1000

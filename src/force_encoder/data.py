@@ -68,6 +68,9 @@ class LeRobotTactileDataset(Dataset):
 
     ``sources`` contains dictionaries with ``name``, ``root`` (the lerobot_v3
     directory), optional ``video_keys``, and optional ``timestamp_mode``.
+    Native v3 exports may select another ``info_file`` (relative to root) and
+    explicitly override ``require_verified`` per source. Complete episode/frame
+    metadata checks apply even when a native export has no conversion marker.
     ``verified.json`` is required by default and its episode/frame counts must
     match both info.json and the complete episode table. Splits happen before
     expanding cameras, preventing leakage of another sensor from one episode.
@@ -90,6 +93,8 @@ class LeRobotTactileDataset(Dataset):
         video_cache_size: int = 4,
         timestamp_cache_size: int = 8,
         frame_cache_size: int = 16,
+        num_frames: int = 1,
+        clip_frame_step: int = 1,
     ) -> None:
         if split not in {"train", "val", "test", "all"}:
             raise ValueError("split must be train, val, test, or all")
@@ -99,6 +104,11 @@ class LeRobotTactileDataset(Dataset):
             raise ValueError("test_fraction must be nonnegative and val_fraction + test_fraction must be < 1")
         if frame_stride < 1 or image_size < 1:
             raise ValueError("frame_stride and image_size must be positive")
+        if num_frames < 1 or clip_frame_step < 1:
+            raise ValueError("num_frames and clip_frame_step must be positive")
+        self.num_frames = num_frames
+        self.clip_frame_step = clip_frame_step
+        self.clip_span = 1 + (num_frames - 1) * clip_frame_step
         if max_episodes_per_source is not None and max_episodes_per_source < 1:
             raise ValueError("max_episodes_per_source must be positive")
         if min(video_cache_size, timestamp_cache_size, frame_cache_size) < 1:
@@ -119,6 +129,9 @@ class LeRobotTactileDataset(Dataset):
             "val_fraction": val_fraction,
             "test_fraction": test_fraction,
             "split_seed": seed,
+            "num_frames": num_frames,
+            "clip_frame_step": clip_frame_step,
+            "clip_span_frames": self.clip_span,
         }
         names: set[str] = set()
         for source in sources:
@@ -147,11 +160,15 @@ class LeRobotTactileDataset(Dataset):
 
         root = Path(source["root"]).expanduser().resolve()
         name = str(source["name"])
-        info = json.loads((root / "meta/info.json").read_text())
+        info_file = root / source.get("info_file", "meta/info.json")
+        info = json.loads(info_file.read_text())
         if info.get("codebase_version") != "v3.0":
             raise ValueError(f"{name}: expected LeRobot v3.0, found {info.get('codebase_version')!r}")
         marker = root / "verified.json"
-        if require_verified and not marker.is_file():
+        source_require_verified = source.get("require_verified", require_verified)
+        if not isinstance(source_require_verified, bool):
+            raise ValueError(f"{name}: require_verified must be a boolean")
+        if source_require_verified and not marker.is_file():
             raise ValueError(f"{name}: missing {marker}; unfinished datasets are excluded")
         if marker.is_file():
             verified = json.loads(marker.read_text())
@@ -219,8 +236,9 @@ class LeRobotTactileDataset(Dataset):
         }
         chosen = partitions[self.split]
         selected = [episodes[i] for i in sorted(chosen)]
+        eligible = [row for row in selected if int(row["length"]) >= self.clip_span]
         start = self._ends[-1] if self._ends else 0
-        for row in selected:
+        for row in eligible:
             episode_index = int(row["episode_index"])
             length = int(row["length"])
             data_path = root / info.get("data_path", _DATA_PATH).format(
@@ -242,7 +260,9 @@ class LeRobotTactileDataset(Dataset):
                 self._streams.append(
                     _CameraEpisode(name, episode_index, key, length, data_path, video_path, offset, end, mode)
                 )
-                self._ends.append((self._ends[-1] if self._ends else 0) + (length - 1) // self.frame_stride + 1)
+                self._ends.append(
+                    (self._ends[-1] if self._ends else 0) + (length - self.clip_span) // self.frame_stride + 1
+                )
         end = self._ends[-1] if self._ends else 0
         if end > start:
             self.source_ranges.append((name, start, end))
@@ -250,11 +270,14 @@ class LeRobotTactileDataset(Dataset):
             {
                 "name": name,
                 "root": str(root),
+                "info_file": str(info_file),
+                "require_verified": source_require_verified,
                 "verified": marker.is_file(),
                 "video_keys": keys,
                 "timestamp_mode": mode,
-                "episodes": len(selected),
-                "frames": sum(int(row["length"]) for row in selected),
+                "episodes": len(eligible),
+                "frames": sum(int(row["length"]) for row in eligible),
+                "excluded_short_episodes": len(selected) - len(eligible),
                 "samples": end - start,
                 "available_episodes": len(episodes),
                 "available_frames": int(info["total_frames"]),
@@ -285,7 +308,7 @@ class LeRobotTactileDataset(Dataset):
 
     def sample_metadata(self, index: int) -> dict[str, Any]:
         record, frame_index = self._locate(index)
-        return {
+        metadata = {
             "source": record.source,
             "episode_index": record.episode_index,
             "video_key": record.video_key,
@@ -293,6 +316,12 @@ class LeRobotTactileDataset(Dataset):
             "video_path": str(record.video_path),
             "data_path": str(record.data_path),
         }
+        if self.num_frames > 1:
+            metadata.update(
+                frame_indices=[frame_index + step * self.clip_frame_step for step in range(self.num_frames)],
+                clip_frame_step=self.clip_frame_step,
+            )
+        return metadata
 
     def _ensure_process(self) -> None:
         if self._pid != os.getpid():
@@ -358,6 +387,22 @@ class LeRobotTactileDataset(Dataset):
         self._ensure_process()
         record, frame_index = self._locate(index)
         video = self._video(record.video_path)
+        if self.num_frames > 1:
+            indices = [frame_index + step * self.clip_frame_step for step in range(self.num_frames)]
+            targets = [self._frame_timestamp(record, video, frame) for frame in indices]
+            # One seek per clip, followed by sequential decoding, even on NAS.
+            frames = self._decode_clip(video, targets, record.video_path)
+            return torch.stack([preprocess_image(frame, self.image_size) for frame in frames], dim=1)
+        target = self._frame_timestamp(record, video, frame_index)
+        cache_key = (str(record.video_path), target)
+        if cache_key not in self._frames:
+            self._frames[cache_key] = preprocess_image(self._decode(video, target, record.video_path), self.image_size)
+            if len(self._frames) > self._frame_cache_size:
+                self._frames.popitem(last=False)
+        self._frames.move_to_end(cache_key)
+        return self._frames[cache_key].clone()
+
+    def _frame_timestamp(self, record: _CameraEpisode, video: _Video, frame_index: int) -> float:
         if record.timestamp_mode == "frame_index":
             validation_key = (record.source, record.episode_index, record.video_key)
             if validation_key not in self._validated_streams:
@@ -377,13 +422,39 @@ class LeRobotTactileDataset(Dataset):
             target = record.from_timestamp + float(self._episode_timestamps(record)[frame_index])
         if target >= record.to_timestamp + 0.6 / video.rate:
             raise ValueError(f"{record.source}: timestamp {target:.6f} exceeds episode video interval")
-        cache_key = (str(record.video_path), target)
-        if cache_key not in self._frames:
-            self._frames[cache_key] = preprocess_image(self._decode(video, target, record.video_path), self.image_size)
-            if len(self._frames) > self._frame_cache_size:
-                self._frames.popitem(last=False)
-        self._frames.move_to_end(cache_key)
-        return self._frames[cache_key].clone()
+        return target
+
+    @staticmethod
+    def _decode_clip(video: _Video, targets: list[float], path: Path) -> list[Image.Image]:
+        video.container.seek(
+            int(targets[0] / float(video.stream.time_base)), stream=video.stream, backward=True, any_frame=False
+        )
+        output = []
+        previous = None
+        tolerance = max(1e-4, 0.6 / video.rate)
+        for frame in video.container.decode(video.stream):
+            if frame.pts is None:
+                continue
+            timestamp = float(frame.pts * frame.time_base)
+            while len(output) < len(targets) and timestamp >= targets[len(output)] - 1e-7:
+                target = targets[len(output)]
+                best, distance = frame, abs(timestamp - target)
+                if previous is not None and abs(previous[0] - target) < distance:
+                    best, distance = previous[1], abs(previous[0] - target)
+                if distance > tolerance:
+                    raise ValueError(f"{path}: no video frame near {target:.6f}s (distance={distance:.6f}s)")
+                output.append(best.to_image().convert("RGB"))
+            if len(output) == len(targets):
+                return output
+            previous = (timestamp, frame)
+        # A rounded target can be just after the last frame's timestamp.
+        while previous is not None and len(output) < len(targets):
+            if abs(previous[0] - targets[len(output)]) > tolerance:
+                break
+            output.append(previous[1].to_image().convert("RGB"))
+        if len(output) != len(targets):
+            raise ValueError(f"{path}: incomplete clip; decoded {len(output)}/{len(targets)} frames")
+        return output
 
     @staticmethod
     def _decode(video: _Video, target: float, path: Path) -> Image.Image:

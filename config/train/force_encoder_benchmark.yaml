@@ -1,7 +1,7 @@
 # Frozen-encoder downstream probe. These NAS conversions have no force labels.
 seed: 42
-checkpoint: checkpoints/force_encoder/jepa/best.pt
-output_dir: outputs/force_encoder/gripper_probe
+checkpoint: checkpoints/force_encoder/jepa_video16_tube2_ema/best.pt
+output_dir: outputs/force_encoder/gripper_probe_video16_ema
 data:
   sources:
     - name: FreeTacMan
@@ -29,7 +29,7 @@ head:
 training:
   device: cuda
   batch_size: 256
-  feature_batch_size: 64
+  feature_batch_size: 8
   num_workers: 4
   epochs: 30
   learning_rate: 0.001

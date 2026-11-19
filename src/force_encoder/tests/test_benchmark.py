@@ -84,6 +84,7 @@ def test_real_downstream_run_preserves_units_and_selects_only_on_validation(benc
         artifact_paths = run(benchmark_config)
     finally:
         torch.set_num_threads(previous_threads)
+
     assert len(artifact_paths) == 1
     assert len(calls) == 1
     artifact = load_evaluation_artifact(artifact_paths[0].parent)
@@ -105,6 +106,35 @@ def test_real_downstream_run_preserves_units_and_selects_only_on_validation(benc
     assert len((output / "seed_3/training.jsonl").read_text().splitlines()) == 2
     assert "rmse" in json.loads((output / "seed_3/test_metrics.json").read_text())
     assert artifact.manifest["original_class_ids"] == []
+
+
+@pytest.mark.parametrize("target_mode", ["ema", "sigreg"])
+def test_video_probe_uses_clip_end_labels_and_online_or_ema_backbone(benchmark_config, target_mode):
+    checkpoint = benchmark_config["checkpoint"]
+    payload = torch.load(checkpoint, weights_only=True)
+    model = ImageJEPA(
+        image_size=16,
+        patch_size=4,
+        embed_dim=16,
+        depth=1,
+        num_heads=4,
+        predictor_dim=16,
+        predictor_depth=1,
+        input_mode="spatiotemporal",
+        num_frames=2,
+        tubelet_size=1,
+        target_mode=target_mode,
+        sigreg_num_proj=16,
+    )
+    payload.update(model=model.state_dict(), model_config=model.model_config)
+    torch.save(payload, checkpoint)
+    run(benchmark_config)
+    directory = benchmark._project_path(benchmark_config["output_dir"]) / "features/train"  # noqa: SLF001
+    identities = [json.loads(line) for line in (directory / "samples.jsonl").read_text().splitlines()]
+    targets = np.load(directory / "targets.npy")[:, 0]
+    for identity, target in zip(identities, targets, strict=True):
+        assert identity["frame_index"] == identity["frame_indices"][-1]
+        assert target == pytest.approx((identity["episode_index"] * 3 + identity["frame_index"]) / 12)
 
 
 def test_classification_remaps_real_noncontiguous_task_indices(benchmark_config):

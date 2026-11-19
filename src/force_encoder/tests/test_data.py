@@ -117,6 +117,42 @@ def test_frame_index_uses_actual_video_rate_and_nonzero_offsets(v3_root):
     dataset.close()
 
 
+def test_native_v3_reads_raw_metadata_without_relaxing_other_sources(v3_root):
+    info_path = v3_root / "meta/info.json"
+    raw_info = info_path.read_text()
+    (v3_root / "meta/info_raw.json").write_text(raw_info)
+    info = json.loads(raw_info)
+    info["features"] = {EXTERNAL_KEY: info["features"][EXTERNAL_KEY]}
+    info_path.write_text(json.dumps(info))
+    (v3_root / "verified.json").unlink()
+    source = {
+        "name": "native",
+        "root": v3_root,
+        "info_file": "meta/info_raw.json",
+        "require_verified": False,
+        "video_keys": TACTILE_KEYS,
+    }
+    dataset = LeRobotTactileDataset([source], image_size=16, split="all", frame_stride=1)
+    try:
+        assert len(dataset) == 24
+        assert abs(_red_channel(dataset[23]) - (20 + 11 * 17)) < 5
+        assert dataset.summary["sources"][0]["verified"] is False
+        # Only the native source opts out; converted sources still require their marker.
+        with pytest.raises(ValueError, match="missing .*verified.json"):
+            LeRobotTactileDataset([source, {"name": "converted", "root": v3_root}], split="all")
+        info = json.loads(raw_info)
+        info["total_frames"] += 1
+        (v3_root / "meta/info_raw.json").write_text(json.dumps(info))
+        with pytest.raises(ValueError, match="episode lengths do not match"):
+            LeRobotTactileDataset([source], split="all")
+        (v3_root / "meta/info_raw.json").write_text(raw_info)
+        (v3_root / "verified.json").write_text(json.dumps({"episodes": 4, "frames": 999}))
+        with pytest.raises(ValueError, match="verified frames"):
+            LeRobotTactileDataset([source], split="all")
+    finally:
+        dataset.close()
+
+
 def test_recorded_timestamps_reads_correct_episode_across_row_groups(v3_root):
     data_path = v3_root / "data/chunk-000/file-000.parquet"
     pq.write_table(

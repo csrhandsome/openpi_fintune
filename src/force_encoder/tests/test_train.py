@@ -16,7 +16,8 @@ from force_encoder.model import load_encoder
 
 
 class SyntheticImages(Dataset):
-    def __init__(self):
+    def __init__(self, num_frames=1):
+        self.num_frames = num_frames
         self.source_ranges = [("small", 0, 4), ("large", 4, 12)]
         self.summary = {"synthetic": True, "images": 12}
 
@@ -24,12 +25,19 @@ class SyntheticImages(Dataset):
         return 12
 
     def __getitem__(self, index):
-        return torch.randn(3, 32, 32, generator=torch.Generator().manual_seed(int(index)))
+        shape = (3, 32, 32) if self.num_frames == 1 else (3, self.num_frames, 32, 32)
+        return torch.randn(shape, generator=torch.Generator().manual_seed(int(index)))
 
 
 @pytest.fixture
 def config(tmp_path, monkeypatch):
-    monkeypatch.setattr(train, "make_dataset", lambda _config, _split: SyntheticImages())
+    monkeypatch.setattr(
+        train,
+        "make_dataset",
+        lambda cfg, _split: SyntheticImages(
+            cfg["model"].get("num_frames", 1) if cfg["model"].get("input_mode") == "spatiotemporal" else 1
+        ),
+    )
     return {
         "seed": 7,
         "output_dir": str(tmp_path / "training"),
@@ -103,7 +111,12 @@ def test_checkpoint_loads_weights_only_with_optimizer_and_python_rng(config, tmp
     assert not checkpoint_path.with_suffix(".tmp").exists()
 
 
-def test_cpu_training_and_interrupted_resume_match(config, tmp_path, monkeypatch):
+@pytest.mark.parametrize("input_mode", ["single_frame", "spatiotemporal"])
+@pytest.mark.parametrize("target_mode", ["ema", "sigreg"])
+def test_cpu_training_and_interrupted_resume_match(config, tmp_path, monkeypatch, input_mode, target_mode):
+    config["model"].update(
+        input_mode=input_mode, num_frames=4, tubelet_size=2, target_mode=target_mode, sigreg_num_proj=16
+    )
     reference = copy.deepcopy(config)
     reference["output_dir"] = str(tmp_path / "reference")
     train.run(reference)

@@ -1,4 +1,53 @@
-# 视触觉 JEPA encoder
+# 视触觉图像／视频 JEPA encoder
+
+## 当前版本：时空 token 与 SIGReg（2026-10-28）
+
+训练 YAML 的 `model.input_mode` 可选 `single_frame` 或 `spatiotemporal`。
+默认已切换到后者：ViT-Base/16，16 帧、帧间隔 2、tubelet_size 2，
+输入 `[B,3,16,224,224]`。不重叠 Conv3d `(2,16,16)` 生成
+`8×14×14=1568` 个 token，加入时间和空间位置编码，由同一 Transformer
+联合建模。mask 是贯穿所有时间位置的空间矩形 tube；student 不接收这些
+位置任何帧的像素，目标分支接收完整片段。这是视频遮挡表征预训练，未加入动作条件。
+
+`data.frame_stride: 5` 控制候选片段起点间隔，`data.clip_frame_step: 2`
+控制片段内的帧间隔。16 帧覆盖 31 个原始帧，不跨 episode 或相机，也不重复尾帧
+补长；不足一个片段的 episode 排除并记录数量。读取使用真实视频帧率，单次 seek
+后顺序解码一个片段。左右相机仍为独立样本，同 episode 保持在同一 split。
+
+`model.target_mode` 可选：
+
+- `ema`：冻结 EMA teacher，masked normalized-feature MSE，保持原图像分支的目标。
+- `sigreg`：单个共享 encoder，两端都回传梯度，无 EMA／stop-gradient；
+  BN projector 产生目标特征，损失为 masked MSE + `sigreg_weight * SIGReg`。
+  SIGReg 按官方 LeWM 的 Epps–Pulley 统计实现，默认 weight 0.09、17 knots、
+  1024 随机投影。每个时间位置先池化空间，再在独立 clip 的 batch 上统计，
+  不把时空位置混成独立样本。它是借用 LeWM 正则的遮挡训练对照，未复现
+  LeWM 的动作条件 next-frame world model。来源与许可见
+  [实验说明](../../docs/force_encoder_spatiotemporal_2026_10_28.md)。
+
+保持一个正式预训练 YAML，用命令行覆盖运行两个独立实验：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m force_encoder.train
+PYTHONPATH=src .venv/bin/python -m force_encoder.train --target-mode sigreg \
+  --exp-name jepa_video16_tube2_sigreg_5sources \
+  --output-dir checkpoints/force_encoder/jepa_video16_tube2_sigreg_5sources
+```
+
+切回单帧可用 `--input-mode single_frame` 或修改 YAML 同名字段，num_frames /
+tubelet_size 此时有效值自动变成 1／1；请同时选择独立 exp_name 与 output_dir。
+旧单帧 checkpoint 可加载；新时空模型需要重新训练，不能恢复旧 Conv2d 权重。
+`load_encoder` 自动选择 EMA teacher 或 SIGReg online backbone，返回 pooled
+embedding 或时空 tokens；SIGReg 的训练 projector 不属于导出的 backbone。
+图片 CLI 在视频模式将 `--images` 按每 16 张、时间有序分组，不自动重复单帧。
+benchmark 自动匹配训练的片段间隔，监督标签对应片段末帧。
+
+默认 batch 8 表示 8 个片段／128 张图片。SwanLab 的配置包含 input_mode、
+target_mode、tubelet、时间 token 数、总 token 数、每步 clip／帧数与损失定义，
+日志分别记录总 loss、prediction_loss、sigreg_loss、跨样本／跨时间 std 和显存。
+两种 loss 数值定义不同，不能仅按总 loss 大小比较效果。
+
+下方保留 2026-10-27 单帧实现与历史验证说明；当前默认参数和启动命令以本节为准。
 
 独立的 PyTorch 训练、数据读取和推理实现，不依赖 `third_party`。默认使用 ViT-Base/16，输入是视触觉传感器的 RGB 图像，输出为 768 维 pooled embedding 或 `196 × 768` patch tokens。规模建议与完整显存诊断见 [容量评估报告](../../docs/force_encoder_capacity_2026_10_27.md)。
 
@@ -19,9 +68,17 @@ PYTHONPATH=src .venv/bin/python -m force_encoder.setup_data --nas-root /mnt/nas
 data/force/tactile-video-pretrain-nc/lerobot_v3
 data/force/FreeTacMan/lerobot_v3
 data/force/ViTaMIn/lerobot_v3
+data/force/HapTile/lerobot_v3
+data/force/Daimon-Infinity-Lite/datasets/dm_dataClaw
 ```
 
-只接受 `v3.0` 且具有匹配 `verified.json` 的数据。WireFishing-M、HapTile 和 FeelSight 不在默认配置里；转换并核对完毕后再显式添加。默认仅选择 `observation.gripper_image_left/right`，不读取环境或腕部相机；左右传感器作为独立图像样本，共用 encoder。以整个 episode 划分 90%/5%/5% 训练、验证、测试集，同一 episode 的左右图像始终在同一 split；测试 episode 不参加 JEPA 预训练。按数据集均衡采样，默认每 5 帧取 1 帧。
+默认五源配置已加入 HapTile 和戴盟 Claw，实验名及输出目录使用 `_5sources` 后缀，避免覆盖历史三源实验。WireFishing-M 和 FeelSight 尚未加入。
+
+转换数据要求 `v3.0` 且具有匹配 `verified.json`。戴盟是发布方原生 v3，没有本项目转换器生成的标记；仅该来源显式设置 `require_verified: false`，完整 episode 表、帧数、版本和视频时间区间校验继续执行。有标记时仍核对其计数，不忽略不匹配的标记。戴盟用 `info_file: meta/info_raw.json` 恢复被可视化版 `info.json` 隐藏的四路 `observation.images.*_tactile` RGB 视频，显式指定 `video_keys`，不读取普通相机或形变／剪切／深度的伪彩色视频。原始 NAS 文件不修改。
+
+戴盟 Claw 共 6 条轨迹／5,688 帧，按当前规则分为 train 4／val 1／test 1；Dex 只有 1 条轨迹，不足以独立划分，因此未纳入。五源仍均衡、有放回采样，每个来源约占 20%，戴盟样例较小，需留意重复采样和过拟合。
+
+其余来源默认仅选择 `observation.gripper_image_left/right`，不读取环境或腕部相机；各触觉传感器作为独立片段，共用 encoder。以整个 episode 划分 90%/5%/5% 训练、验证、测试集，同一 episode 的所有相机始终在同一 split；测试 episode 不参加 JEPA 预训练。`frame_stride: 5` 是候选片段起点间隔。
 
 **时间轴兼容：** NAS 上第一份数据的 `info.fps=1`、Parquet 时间戳也是 1 FPS，而 MP4 实为 30 FPS；FreeTacMan 元数据是 31 FPS，MP4 为 30 FPS。默认使用帧序号和 MP4 真实帧率定位，并考虑 v3 episode 视频起始偏移，避免按这些错误时间戳错读。未来时间戳正确且不等间隔的数据可使用 recorded 模式（见 `data.py`）。读取器不写数据、不修复原始元信息、不自动下载。
 

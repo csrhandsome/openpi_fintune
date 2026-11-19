@@ -73,7 +73,12 @@ def mask_extremes(model_config: dict, seed: int, candidates: int = 32) -> dict:
             generator=torch.Generator().manual_seed(candidate),
             **kwargs,
         )
-        counts.append((len(masks.context), candidate))
+        time_steps = (
+            model_config["num_frames"] // model_config["tubelet_size"]
+            if model_config.get("input_mode", "single_frame") == "spatiotemporal"
+            else 1
+        )
+        counts.append((len(masks.context) * time_steps, candidate))
     minimum, maximum = min(counts), max(counts)
     return {
         "candidate_count": candidates,
@@ -92,19 +97,26 @@ def batch_metadata(dataset, indices: list[int]) -> dict:
             {
                 key: value
                 for key, value in dataset.sample_metadata(index).items()
-                if key in {"source", "episode_index", "video_key", "frame_index"}
+                if key in {"source", "episode_index", "video_key", "frame_index", "frame_indices", "clip_frame_step"}
             }
             for index in indices
         ],
     }
 
 
+def batch_shape(config: dict, batch_size: int) -> tuple[int, ...]:
+    model = config["model"]
+    size = model["image_size"]
+    if model.get("input_mode", "single_frame") == "spatiotemporal":
+        return batch_size, 3, model["num_frames"], size, size
+    return batch_size, 3, size, size
+
+
 def validate_cached_batches(base: dict, sweep: dict, output: Path) -> Path:
     """Verify cache shape and reproducible data IDs without decoding any frames."""
     path = output / "batches.pt"
     cached = torch.load(path, map_location="cpu", weights_only=True)
-    size = base["model"]["image_size"]
-    expected = (sweep["batch_size"], 3, size, size)
+    expected = batch_shape(base, sweep["batch_size"])
     if set(cached) != {"train", "val"} or any(tuple(batch.shape) != expected for batch in cached.values()):
         raise ValueError(f"Existing cache does not match expected batch shape {expected}")
     metadata = json.loads((output / "batch_metadata.json").read_text())
@@ -307,7 +319,7 @@ def run_worker(sweep: dict, profile: dict, cache: Path, output: Path) -> dict:
         baseline_nonallocator = max(0, baseline["sampled_device_used_gib"] - baseline["reserved_gib"])
         result["mask_search"] = mask_extremes(config["model"], config["seed"])
         cached = torch.load(cache, map_location="cpu", weights_only=True)
-        expected = (sweep["batch_size"], 3, config["model"]["image_size"], config["model"]["image_size"])
+        expected = batch_shape(config, sweep["batch_size"])
         if any(tuple(cached[key].shape) != expected for key in ("train", "val")):
             raise ValueError(f"Cached batches must have shape {expected}")
         model = ImageJEPA(**config["model"])

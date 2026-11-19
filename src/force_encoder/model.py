@@ -1,4 +1,4 @@
-"""Image JEPA with rectangular targets and an exponential moving average teacher.
+"""Image/video JEPA with rectangular tube targets and an EMA teacher.
 
 Inputs are RGB tensors normalized by the dataset. Mask indices are sampled on
 CPU, shared by a minibatch, and moved to the image device before use. Sharing
@@ -13,6 +13,8 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional
+
+from force_encoder.sigreg import SIGReg
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,16 @@ def _position_embedding(grid_size: int, dim: int) -> torch.Tensor:
     return torch.cat([value for position in positions for value in (position.sin(), position.cos())], dim=-1)[None]
 
 
+def _spatiotemporal_position_embedding(grid_size: int, time_steps: int, dim: int) -> torch.Tensor:
+    spatial = _position_embedding(grid_size, dim)
+    if time_steps == 1:
+        return spatial
+    frequency = 1.0 / (10000 ** (torch.arange(dim // 2, dtype=torch.float32) / (dim // 2)))
+    phase = torch.arange(time_steps, dtype=torch.float32)[:, None] * frequency
+    temporal = torch.cat((phase.sin(), phase.cos()), dim=-1)
+    return (spatial[:, None] + temporal[None, :, None]).flatten(1, 2)
+
+
 def _transformer(dim: int, depth: int, heads: int, mlp_ratio: float) -> nn.TransformerEncoder:
     if depth < 1 or dim % heads:
         raise ValueError("Transformer depth must be positive and dimension divisible by number of heads")
@@ -141,10 +153,11 @@ def _transformer(dim: int, depth: int, heads: int, mlp_ratio: float) -> nn.Trans
 
 
 class ImageEncoder(nn.Module):
-    """Vision transformer exposing pooled embeddings and spatial patch tokens.
+    """Vision transformer exposing pooled embeddings and image/video patch tokens.
 
     ``forward(images)`` returns ``[B, D]`` mean-pooled embeddings.
-    ``forward_features(images)`` returns ``[B, H/P * W/P, D]`` patch tokens.
+    Video input is ``[B, 3, num_frames, H, W]``. Tokens are flattened in
+    time/row/column order: ``[B, (T/tubelet_size)*(H/P)*(W/P), D]``.
     """
 
     def __init__(
@@ -155,10 +168,25 @@ class ImageEncoder(nn.Module):
         depth: int = 12,
         num_heads: int = 3,
         mlp_ratio: float = 4.0,
+        input_mode: str = "single_frame",
+        num_frames: int = 1,
+        tubelet_size: int = 1,
     ):
         super().__init__()
         if image_size <= 0 or patch_size <= 0 or image_size % patch_size:
             raise ValueError("image_size must be positive and divisible by patch_size")
+        if input_mode not in {"single_frame", "spatiotemporal"}:
+            raise ValueError("input_mode must be single_frame or spatiotemporal")
+        if input_mode == "single_frame":
+            num_frames, tubelet_size = 1, 1
+        if num_frames < 1 or tubelet_size < 1 or num_frames % tubelet_size:
+            raise ValueError("num_frames must be positive and divisible by tubelet_size")
+        if input_mode == "spatiotemporal" and (num_frames < 2 or num_frames // tubelet_size < 2):
+            raise ValueError("spatiotemporal mode needs at least two temporal tokens per spatial position")
+        self.input_mode = input_mode
+        self.num_frames = num_frames
+        self.tubelet_size = tubelet_size
+        self.temporal_size = num_frames // tubelet_size
         self.image_size = image_size
         self.patch_size = patch_size
         self.embed_dim = embed_dim
@@ -170,14 +198,26 @@ class ImageEncoder(nn.Module):
             "depth": depth,
             "num_heads": num_heads,
             "mlp_ratio": mlp_ratio,
+            "input_mode": input_mode,
+            "num_frames": num_frames,
+            "tubelet_size": tubelet_size,
         }
-        self.patch_embed = nn.Conv2d(3, embed_dim, patch_size, stride=patch_size)
-        self.register_buffer("pos_embed", _position_embedding(self.grid_size, embed_dim))
+        if input_mode == "single_frame":
+            self.patch_embed = nn.Conv2d(3, embed_dim, patch_size, stride=patch_size)
+        else:
+            kernel = (tubelet_size, patch_size, patch_size)
+            self.patch_embed = nn.Conv3d(3, embed_dim, kernel, stride=kernel)
+        self.register_buffer(
+            "pos_embed", _spatiotemporal_position_embedding(self.grid_size, self.temporal_size, embed_dim)
+        )
         self.blocks = _transformer(embed_dim, depth, num_heads, mlp_ratio)
 
     def forward_features(self, images: torch.Tensor, indices: torch.Tensor | None = None) -> torch.Tensor:
-        if images.ndim != 4 or images.shape[1:] != (3, self.image_size, self.image_size):
-            raise ValueError(f"Expected RGB images [B, 3, {self.image_size}, {self.image_size}], got {images.shape}")
+        expected = (3, self.image_size, self.image_size)
+        if self.input_mode == "spatiotemporal":
+            expected = (3, self.num_frames, self.image_size, self.image_size)
+        if tuple(images.shape[1:]) != expected:
+            raise ValueError(f"Expected RGB input [B, {expected}], got {images.shape}")
         tokens = self.patch_embed(images).flatten(2).transpose(1, 2)
         tokens = tokens + self.pos_embed.to(dtype=tokens.dtype)
         if indices is not None:
@@ -189,7 +229,7 @@ class ImageEncoder(nn.Module):
 
 
 class ImageJEPA(nn.Module):
-    """Predict normalized teacher features using only visible image patches."""
+    """Masked image/video prediction with an EMA teacher or shared-encoder SIGReg."""
 
     def __init__(
         self,
@@ -206,13 +246,45 @@ class ImageJEPA(nn.Module):
         local_scale: tuple[float, float] = (0.05, 0.10),
         global_scale: tuple[float, float] = (0.15, 0.20),
         max_target_overlap: float = 0.25,
+        input_mode: str = "single_frame",
+        num_frames: int = 1,
+        tubelet_size: int = 1,
+        target_mode: str = "ema",
+        sigreg_weight: float = 0.09,
+        sigreg_knots: int = 17,
+        sigreg_num_proj: int = 1024,
     ):
         super().__init__()
-        self.context_encoder = ImageEncoder(image_size, patch_size, embed_dim, depth, num_heads, mlp_ratio)
-        self.target_encoder = copy.deepcopy(self.context_encoder).requires_grad_(requires_grad=False).eval()
+        self.context_encoder = ImageEncoder(
+            image_size, patch_size, embed_dim, depth, num_heads, mlp_ratio, input_mode, num_frames, tubelet_size
+        )
+        if target_mode not in {"ema", "sigreg"}:
+            raise ValueError("target_mode must be ema or sigreg")
+        if not math.isfinite(sigreg_weight) or sigreg_weight <= 0:
+            raise ValueError("sigreg_weight must be finite and positive")
+        self.target_mode = target_mode
+        self.sigreg_weight = sigreg_weight
+        self.target_encoder = (
+            copy.deepcopy(self.context_encoder).requires_grad_(requires_grad=False).eval()
+            if target_mode == "ema"
+            else None
+        )
+        if target_mode == "sigreg":
+            self.target_projector = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.BatchNorm1d(embed_dim * 2),
+                nn.GELU(),
+                nn.Linear(embed_dim * 2, embed_dim),
+            )
+            self.sigreg = SIGReg(sigreg_knots, sigreg_num_proj)
         self.context_projection = nn.Linear(embed_dim, predictor_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_dim))
-        self.register_buffer("predictor_pos_embed", _position_embedding(self.context_encoder.grid_size, predictor_dim))
+        self.register_buffer(
+            "predictor_pos_embed",
+            _spatiotemporal_position_embedding(
+                self.context_encoder.grid_size, self.context_encoder.temporal_size, predictor_dim
+            ),
+        )
         self.predictor = _transformer(predictor_dim, predictor_depth, num_heads, mlp_ratio)
         self.prediction_head = nn.Linear(predictor_dim, embed_dim)
         self.mask_config = {
@@ -227,23 +299,47 @@ class ImageJEPA(nn.Module):
             "predictor_depth": predictor_depth,
             "predictor_dim": predictor_dim,
             **self.mask_config,
+            "target_mode": target_mode,
+            "sigreg_weight": sigreg_weight,
+            "sigreg_knots": sigreg_knots,
+            "sigreg_num_proj": sigreg_num_proj,
         }
 
     def train(self, mode: bool = True):  # noqa: FBT001, FBT002
         super().train(mode)
-        self.target_encoder.eval()
+        if self.target_encoder is not None:
+            self.target_encoder.eval()
         return self
 
     def sample_masks(self, generator: torch.Generator | None = None) -> JEPAMasks:
-        return sample_masks(self.context_encoder.grid_size, generator=generator, **self.mask_config)
+        masks = sample_masks(self.context_encoder.grid_size, generator=generator, **self.mask_config)
+        # V-JEPA-style tubes: hide a spatial region at every temporal position,
+        # preventing the same patch in a neighbouring frame from being exposed.
+        offsets = torch.arange(self.context_encoder.temporal_size) * self.context_encoder.grid_size**2
+
+        def expand(indices):
+            return (offsets[:, None] + indices[None]).flatten()
+
+        return JEPAMasks(expand(masks.context), tuple(expand(target) for target in masks.targets))
 
     def forward(self, images: torch.Tensor, generator: torch.Generator | None = None) -> dict[str, torch.Tensor]:
         masks = self.sample_masks(generator)
         context_indices = masks.context.to(images.device)
         target_indices = torch.unique(torch.cat(masks.targets)).to(images.device)
-        with torch.no_grad():
-            targets = self.target_encoder.forward_features(images).index_select(1, target_indices)
-            targets = functional.layer_norm(targets.float(), (targets.shape[-1],))
+        if self.target_mode == "ema":
+            with torch.no_grad():
+                targets = self.target_encoder.forward_features(images).index_select(1, target_indices)
+                targets = functional.layer_norm(targets.float(), (targets.shape[-1],))
+            regularization = images.new_zeros((), dtype=torch.float32)
+        else:
+            # One encoder, no EMA copy and no stop-gradient on the full-input branch.
+            full = self.context_encoder.forward_features(images)
+            full = self.target_projector(full.flatten(0, 1)).reshape_as(full).float()
+            targets = full.index_select(1, target_indices)
+            # Average spatial tokens, then regularize each temporal position across
+            # independent clips. Temporal/positional diversity cannot fake batch diversity.
+            populations = full.reshape(len(images), self.context_encoder.temporal_size, -1, full.shape[-1]).mean(2)
+            regularization = self.sigreg(populations.transpose(0, 1), generator=generator)
         context = self.context_projection(self.context_encoder.forward_features(images, context_indices))
         position = self.predictor_pos_embed.to(dtype=context.dtype)
         context = context + position.index_select(1, context_indices)
@@ -251,10 +347,25 @@ class ImageJEPA(nn.Module):
         target_tokens = target_tokens.expand(images.shape[0], -1, -1)
         predictions = self.predictor(torch.cat((context, target_tokens), dim=1))[:, context.shape[1] :]
         predictions = self.prediction_head(predictions)
+        detached = predictions.detach().float()
+        time_steps = self.context_encoder.temporal_size
+        prediction_loss = functional.mse_loss(predictions.float(), targets)
         return {
-            "loss": functional.mse_loss(predictions.float(), targets),
+            "loss": prediction_loss + self.sigreg_weight * regularization,
+            "prediction_loss": prediction_loss,
+            "sigreg_loss": regularization.detach(),
             "target_std": targets.flatten(0, 1).std(dim=0, unbiased=False).mean().detach(),
             "prediction_std": predictions.detach().float().flatten(0, 1).std(dim=0, unbiased=False).mean(),
+            # Keep sample diversity separate from spatial/temporal variation.
+            "target_sample_std": targets.std(dim=0, unbiased=False).mean().detach(),
+            "prediction_sample_std": detached.std(dim=0, unbiased=False).mean(),
+            "target_temporal_std": targets.reshape(len(images), time_steps, -1, targets.shape[-1])
+            .std(dim=1, unbiased=False)
+            .mean()
+            .detach(),
+            "prediction_temporal_std": detached.reshape(len(images), time_steps, -1, detached.shape[-1])
+            .std(dim=1, unbiased=False)
+            .mean(),
             "context_tokens": images.new_tensor(context_indices.numel()),
             "target_tokens": images.new_tensor(target_indices.numel()),
         }
@@ -263,6 +374,8 @@ class ImageJEPA(nn.Module):
     def update_teacher(self, momentum: float):
         if not math.isfinite(momentum) or not 0 <= momentum <= 1:
             raise ValueError("Teacher momentum must be between 0 and 1")
+        if self.target_encoder is None:
+            return
         for teacher, student in zip(self.target_encoder.parameters(), self.context_encoder.parameters(), strict=True):
             teacher.lerp_(student, 1.0 - momentum)
         for teacher, student in zip(self.target_encoder.buffers(), self.context_encoder.buffers(), strict=True):
@@ -270,13 +383,13 @@ class ImageJEPA(nn.Module):
 
     @torch.no_grad()
     def encode(self, images: torch.Tensor, *, pool: bool = True, use_teacher: bool = True) -> torch.Tensor:
-        encoder = self.target_encoder if use_teacher else self.context_encoder
+        encoder = self.target_encoder if use_teacher and self.target_encoder is not None else self.context_encoder
         tokens = encoder.forward_features(images)
         return tokens.mean(dim=1) if pool else tokens
 
 
 def load_encoder(checkpoint: str | Path, device: str | torch.device = "cpu") -> ImageEncoder:
-    """Load the EMA encoder from a training checkpoint, ready for inference.
+    """Load the EMA encoder, or the online SIGReg backbone, ready for inference.
 
     Checkpoints contain ``model_config`` and ``model`` (the full JEPA state
     dictionary). Only encoder weights are loaded; optimizer state is unused.
@@ -284,10 +397,20 @@ def load_encoder(checkpoint: str | Path, device: str | torch.device = "cpu") -> 
     """
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model_config = payload["model_config"]
-    encoder_keys = ("image_size", "patch_size", "embed_dim", "depth", "num_heads", "mlp_ratio")
+    encoder_keys = (
+        "image_size",
+        "patch_size",
+        "embed_dim",
+        "depth",
+        "num_heads",
+        "mlp_ratio",
+        "input_mode",
+        "num_frames",
+        "tubelet_size",
+    )
     config = {key: model_config[key] for key in encoder_keys if key in model_config}
     encoder = ImageEncoder(**config)
     state = payload["model"]
-    prefix = "target_encoder."
+    prefix = "context_encoder." if model_config.get("target_mode", "ema") == "sigreg" else "target_encoder."
     encoder.load_state_dict({key.removeprefix(prefix): value for key, value in state.items() if key.startswith(prefix)})
     return encoder.to(device).eval().requires_grad_(requires_grad=False)

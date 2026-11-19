@@ -1,4 +1,4 @@
-"""Train an image JEPA on verified, local LeRobot v3 tactile videos."""
+"""Train single-frame or spatiotemporal JEPA on verified LeRobot tactile videos."""
 
 import argparse
 from contextlib import nullcontext
@@ -34,8 +34,10 @@ def read_config(path: str | Path) -> dict:
 
 
 def make_dataset(config: dict, split: str) -> LeRobotTactileDataset:
+    model = config["model"]
+    frames = model.get("num_frames", 1) if model.get("input_mode", "single_frame") == "spatiotemporal" else 1
     return LeRobotTactileDataset(
-        **config["data"], image_size=config["model"]["image_size"], split=split, seed=config["seed"]
+        **config["data"], image_size=model["image_size"], split=split, seed=config["seed"], num_frames=frames
     )
 
 
@@ -176,6 +178,28 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
     output.mkdir(parents=True, exist_ok=True)
     if (output / "latest.pt").exists() and resume is None:
         raise FileExistsError(f"{output}/latest.pt exists; use --resume or a new --output-dir")
+    model_cfg = config["model"]
+    video_mode = model_cfg.get("input_mode", "single_frame") == "spatiotemporal"
+    frames = model_cfg.get("num_frames", 1) if video_mode else 1
+    tubelet = model_cfg.get("tubelet_size", 1) if video_mode else 1
+    config["representation"] = {
+        "input_mode": model_cfg.get("input_mode", "single_frame"),
+        "num_frames": frames,
+        "tubelet_size": tubelet,
+        "temporal_tokens": frames // tubelet,
+        "tokens_per_sample": (model_cfg["image_size"] // model_cfg["patch_size"]) ** 2 * (frames // tubelet),
+        "clip_frame_step": config["data"].get("clip_frame_step", 1),
+        "mask_type": "spatial_tube" if video_mode else "spatial_rectangle",
+        "target_mode": model_cfg.get("target_mode", "ema"),
+        "objective": (
+            "masked_feature_mse_plus_sigreg"
+            if model_cfg.get("target_mode", "ema") == "sigreg"
+            else "masked_normalized_teacher_feature_mse"
+        ),
+        "sigreg_population": "independent_clips_per_temporal_position",
+        "samples_per_step": cfg["batch_size"],
+        "frames_per_step": cfg["batch_size"] * frames,
+    }
     (output / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
     (output / "data_summary.json").write_text(
         json.dumps({"train": train_data.summary, "val": val_data.summary}, indent=2)
@@ -208,7 +232,17 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
     start_step, best_loss = 0, math.inf
     if resume:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=True)
-        if checkpoint["model_config"] != model.model_config:
+        previous_model = {
+            "input_mode": "single_frame",
+            "num_frames": 1,
+            "tubelet_size": 1,
+            "target_mode": "ema",
+            "sigreg_weight": 0.09,
+            "sigreg_knots": 17,
+            "sigreg_num_proj": 1024,
+            **checkpoint["model_config"],
+        }
+        if previous_model != model.model_config:
             raise ValueError("Resume model configuration differs from checkpoint")
         if checkpoint["config"]["data"] != config["data"] or checkpoint["config"]["seed"] != config["seed"]:
             raise ValueError("Resume data paths, sampling and split seed must match checkpoint")
@@ -229,6 +263,11 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
                 "start_step": start_step,
                 "initialization": "resume" if resume else "random",
                 "resume_checkpoint": resume,
+                "input_mode": model.context_encoder.input_mode,
+                "target_mode": model.target_mode,
+                "num_frames": model.context_encoder.num_frames,
+                "tubelet_size": model.context_encoder.tubelet_size,
+                "tokens_per_sample": model.context_encoder.pos_embed.shape[1],
             }
         ),
         flush=True,
@@ -276,9 +315,10 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
                             **{key: float(value) for key, value in metrics.items()},
                             "lr": lr,
                             "weight_decay": weight_decay,
-                            "momentum": momentum,
+                            "momentum": momentum if model.target_mode == "ema" else 0.0,
                             "grad_norm": float(grad_norm),
                             "elapsed_seconds": time.monotonic() - started,
+                            "frames_per_step": cfg["batch_size"] * frames,
                             **memory_stats(device),
                         }
                         log_record(record, log, pbar, tracker)
@@ -307,6 +347,11 @@ def main() -> None:
     parser.add_argument("--resume")
     parser.add_argument("--inspect", action="store_true")
     parser.add_argument("--output-dir")
+    parser.add_argument("--input-mode", choices=("single_frame", "spatiotemporal"))
+    parser.add_argument("--target-mode", choices=("ema", "sigreg"))
+    parser.add_argument("--exp-name", help="Independent experiment name for SwanLab/W&B")
+    parser.add_argument("--num-frames", type=int)
+    parser.add_argument("--tubelet-size", type=int)
     for key in ("max-steps", "batch-size", "num-workers", "val-batches", "steps-per-epoch"):
         parser.add_argument(f"--{key}", type=int)
     parser.add_argument("--max-episodes-per-source", type=int)
@@ -315,6 +360,11 @@ def main() -> None:
     parser.add_argument("--tracking-backend", choices=("none", "wandb", "swanlab"))
     args = parser.parse_args()
     config = read_config(args.config)
+    for key in ("input_mode", "target_mode", "num_frames", "tubelet_size"):
+        if getattr(args, key) is not None:
+            config["model"][key] = getattr(args, key)
+    if args.exp_name is not None:
+        config["exp_name"] = args.exp_name
     for key in ("max_steps", "batch_size", "num_workers", "val_batches", "steps_per_epoch", "device", "precision"):
         if getattr(args, key) is not None:
             config["training"][key] = getattr(args, key)
