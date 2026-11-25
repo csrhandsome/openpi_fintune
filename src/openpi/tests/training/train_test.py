@@ -197,6 +197,9 @@ def test_default_ros_config_and_dataset_validation(
     sync_path.write_text(json.dumps({"action_semantics": "next_camera_observation_measured_state"}))
     validate_dataset(config)
 
+    sync_path.write_text(json.dumps({"action_semantics": "next_camera_observation_target_command"}))
+    validate_dataset(config)
+
     sync_path.write_text(json.dumps({"action_semantics": "current_measured_state"}))
     with pytest.raises(ValueError, match="Action timing"):
         validate_dataset(config)

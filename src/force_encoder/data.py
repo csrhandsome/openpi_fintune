@@ -56,6 +56,17 @@ class _CameraEpisode:
     timestamp_mode: str
 
 
+@dataclass(frozen=True)
+class _PairedCameraEpisode:
+    source: str
+    episode_index: int
+    left: _CameraEpisode
+    right: _CameraEpisode
+    has_fem: bool
+    fem_feature: str | None
+    fem_arm_index: int | None
+
+
 @dataclass
 class _Video:
     container: Any
@@ -68,13 +79,19 @@ class LeRobotTactileDataset(Dataset):
 
     ``sources`` contains dictionaries with ``name``, ``root`` (the lerobot_v3
     directory), optional ``video_keys``, and optional ``timestamp_mode``.
+    Dataset-level ``video_keys`` may be provided as a default when sources omit
+    ``video_keys``; otherwise ``observation.gripper_image*`` keys are selected.
     Native v3 exports may select another ``info_file`` (relative to root) and
-    explicitly override ``require_verified`` per source. Complete episode/frame
-    metadata checks apply even when a native export has no conversion marker.
-    ``verified.json`` is required by default and its episode/frame counts must
-    match both info.json and the complete episode table. Splits happen before
-    expanding cameras, preventing leakage of another sensor from one episode.
-    Video and timestamp caches are bounded and reset after a worker fork.
+    explicitly override ``require_verified`` per source or at dataset level.
+    Setting ``skip_incomplete_sources=True`` skips sources whose metadata is not
+    yet present or that lack enough episodes for the requested splits, recording
+    them in ``summary['skipped_sources']`` while still validating any present
+    dataset metadata. Complete episode/frame metadata checks apply even when a
+    native export has no conversion marker. ``verified.json`` is required by
+    default and its episode/frame counts must match both info.json and the
+    complete episode table. Splits happen before expanding cameras, preventing
+    leakage of another sensor from one episode. Video and timestamp caches are
+    bounded and reset after a worker fork.
     """
 
     def __init__(
@@ -90,6 +107,8 @@ class LeRobotTactileDataset(Dataset):
         test_fraction: float = 0.0,
         require_verified: bool = True,
         timestamp_mode: str = "frame_index",
+        video_keys: list[str] | None = None,
+        skip_incomplete_sources: bool = False,
         video_cache_size: int = 4,
         timestamp_cache_size: int = 8,
         frame_cache_size: int = 16,
@@ -106,6 +125,15 @@ class LeRobotTactileDataset(Dataset):
             raise ValueError("frame_stride and image_size must be positive")
         if num_frames < 1 or clip_frame_step < 1:
             raise ValueError("num_frames and clip_frame_step must be positive")
+        if not isinstance(skip_incomplete_sources, bool):
+            raise ValueError("skip_incomplete_sources must be a boolean")
+        default_video_keys: list[str] | None = None
+        if video_keys is not None:
+            if isinstance(video_keys, str):
+                raise ValueError("video_keys must be a list, not a string")
+            default_video_keys = list(video_keys)
+            if not default_video_keys or len(set(default_video_keys)) != len(default_video_keys):
+                raise ValueError("video_keys must select at least one unique tactile video key")
         self.num_frames = num_frames
         self.clip_frame_step = clip_frame_step
         self.clip_span = 1 + (num_frames - 1) * clip_frame_step
@@ -125,6 +153,7 @@ class LeRobotTactileDataset(Dataset):
         self._summary: dict[str, Any] = {
             "split": split,
             "sources": [],
+            "skipped_sources": [],
             "frame_stride": frame_stride,
             "val_fraction": val_fraction,
             "test_fraction": test_fraction,
@@ -142,7 +171,17 @@ class LeRobotTactileDataset(Dataset):
             mode = source.get("timestamp_mode", timestamp_mode)
             if mode not in {"frame_index", "recorded"}:
                 raise ValueError(f"{name}: timestamp_mode must be frame_index or recorded")
-            self._add_source(source, mode, require_verified, val_fraction, test_fraction, seed, max_episodes_per_source)
+            self._add_source(
+                source,
+                mode,
+                require_verified,
+                val_fraction,
+                test_fraction,
+                seed,
+                max_episodes_per_source,
+                default_video_keys,
+                skip_incomplete_sources,
+            )
         if not self._streams:
             raise ValueError(f"No tactile video samples in {split} split")
         self._cumulative = np.asarray(self._ends, dtype=np.int64)
@@ -155,12 +194,29 @@ class LeRobotTactileDataset(Dataset):
         self._frames: OrderedDict[tuple[str, float], torch.Tensor] = OrderedDict()
         self._validated_streams: set[tuple[str, int, str]] = set()
 
-    def _add_source(self, source, mode, require_verified, val_fraction, test_fraction, seed, episode_limit):
+    def _add_source(
+        self,
+        source,
+        mode,
+        require_verified,
+        val_fraction,
+        test_fraction,
+        seed,
+        episode_limit,
+        default_video_keys,
+        skip_incomplete,
+    ):
         import pyarrow.parquet as pq
 
         root = Path(source["root"]).expanduser().resolve()
         name = str(source["name"])
+        source_skip_incomplete = source.get("skip_incomplete", skip_incomplete)
+        if not isinstance(source_skip_incomplete, bool):
+            raise ValueError(f"{name}: skip_incomplete must be a boolean")
         info_file = root / source.get("info_file", "meta/info.json")
+        if source_skip_incomplete and not info_file.is_file():
+            self._summary["skipped_sources"].append({"name": name, "root": str(root), "reason": "missing_info_file"})
+            return
         info = json.loads(info_file.read_text())
         if info.get("codebase_version") != "v3.0":
             raise ValueError(f"{name}: expected LeRobot v3.0, found {info.get('codebase_version')!r}")
@@ -177,7 +233,9 @@ class LeRobotTactileDataset(Dataset):
                     raise ValueError(f"{name}: verified {marker_key} does not match info.{info_key}")
         features = info.get("features", {})
         keys = source.get("video_keys")
-        if keys is None:
+        if keys is None and default_video_keys is not None:
+            keys = list(default_video_keys)
+        elif keys is None:
             keys = sorted(
                 k
                 for k, v in features.items()
@@ -199,6 +257,9 @@ class LeRobotTactileDataset(Dataset):
             )
         files = sorted((root / "meta/episodes").rglob("*.parquet"))
         if not files:
+            if source_skip_incomplete and int(info.get("total_episodes", 0)) == 0:
+                self._summary["skipped_sources"].append({"name": name, "root": str(root), "reason": "no_episodes"})
+                return
             raise ValueError(f"{name}: no LeRobot v3 episode parquet files")
         episodes = []
         for path in files:
@@ -221,6 +282,15 @@ class LeRobotTactileDataset(Dataset):
             order = order[:episode_limit]
         minimum = 1 + int(val_fraction > 0) + int(test_fraction > 0)
         if len(order) < minimum:
+            if source_skip_incomplete:
+                self._summary["skipped_sources"].append(
+                    {
+                        "name": name,
+                        "root": str(root),
+                        "reason": f"insufficient_episodes:{len(order)}<{minimum}",
+                    }
+                )
+                return
             raise ValueError(f"{name}: need at least {minimum} episodes for nonempty train/val/test splits")
         n_val = (
             min(len(order) - 1 - int(test_fraction > 0), max(1, round(len(order) * val_fraction)))
@@ -386,6 +456,9 @@ class LeRobotTactileDataset(Dataset):
     def __getitem__(self, index: int) -> torch.Tensor:
         self._ensure_process()
         record, frame_index = self._locate(index)
+        return self._decode_camera(record, frame_index)
+
+    def _decode_camera(self, record: _CameraEpisode, frame_index: int) -> torch.Tensor:
         video = self._video(record.video_path)
         if self.num_frames > 1:
             indices = [frame_index + step * self.clip_frame_step for step in range(self.num_frames)]
@@ -504,6 +577,324 @@ class LeRobotTactileDataset(Dataset):
 
     def __del__(self):
         self.close()
+
+
+class PairedTactileFemDataset(LeRobotTactileDataset):
+    """Dual-camera (left/right finger) tactile dataset with optional FEM labels.
+
+    Each sample corresponds to one gripper's paired left/right internal RGB
+    clips and, when ``has_fem: true`` on the source, the corresponding ``[2, 11]``
+    FEM physical state label at the final frame of the clip.
+    """
+
+    def __init__(
+        self,
+        sources: list[dict[str, Any]],
+        image_size: int = 224,
+        split: str = "train",
+        val_fraction: float = 0.05,
+        seed: int = 42,
+        frame_stride: int = 5,
+        max_episodes_per_source: int | None = None,
+        *,
+        test_fraction: float = 0.0,
+        require_verified: bool = True,
+        timestamp_mode: str = "frame_index",
+        video_keys: list[str] | None = None,
+        skip_incomplete_sources: bool = False,
+        video_cache_size: int = 4,
+        timestamp_cache_size: int = 8,
+        frame_cache_size: int = 16,
+        num_frames: int = 1,
+        clip_frame_step: int = 1,
+        fem_dim: int = 11,
+    ) -> None:
+        self.fem_dim = fem_dim
+        self._fem_labels: OrderedDict[tuple[str, int, str], np.ndarray] = OrderedDict()
+        super().__init__(
+            sources=sources,
+            image_size=image_size,
+            split=split,
+            val_fraction=val_fraction,
+            seed=seed,
+            frame_stride=frame_stride,
+            max_episodes_per_source=max_episodes_per_source,
+            test_fraction=test_fraction,
+            require_verified=require_verified,
+            timestamp_mode=timestamp_mode,
+            video_keys=video_keys,
+            skip_incomplete_sources=skip_incomplete_sources,
+            video_cache_size=video_cache_size,
+            timestamp_cache_size=timestamp_cache_size,
+            frame_cache_size=frame_cache_size,
+            num_frames=num_frames,
+            clip_frame_step=clip_frame_step,
+        )
+
+    @staticmethod
+    def _resolve_camera_pairs(name: str, source: dict[str, Any], features: dict[str, Any]) -> list[tuple[str, str]]:
+        raw_pairs = source.get("camera_pairs")
+        if raw_pairs is not None:
+            pairs = [tuple(pair) for pair in raw_pairs]
+        elif (
+            features.get("observation.gripper_image_left", {}).get("dtype") == "video"
+            and features.get("observation.gripper_image_right", {}).get("dtype") == "video"
+        ):
+            pairs = [("observation.gripper_image_left", "observation.gripper_image_right")]
+        elif all(
+            features.get(f"observation.images.{cam}", {}).get("dtype") == "video"
+            for cam in ("left_hand_left_rgb", "left_hand_right_rgb", "right_hand_left_rgb", "right_hand_right_rgb")
+        ):
+            pairs = [
+                ("observation.images.left_hand_left_rgb", "observation.images.left_hand_right_rgb"),
+                ("observation.images.right_hand_left_rgb", "observation.images.right_hand_right_rgb"),
+            ]
+        else:
+            raise ValueError(f"{name}: specify camera_pairs of [left_key, right_key]")
+        if not pairs or any(len(pair) != 2 or pair[0] == pair[1] for pair in pairs):
+            raise ValueError(f"{name}: camera_pairs must be nonempty [left, right] pairs")
+        for left_key, right_key in pairs:
+            for key in (left_key, right_key):
+                if features.get(key, {}).get("dtype") != "video":
+                    raise ValueError(f"{name}: {key!r} is not a video feature")
+        return pairs
+
+    def _add_source(
+        self,
+        source,
+        mode,
+        require_verified,
+        val_fraction,
+        test_fraction,
+        seed,
+        episode_limit,
+        default_video_keys,
+        skip_incomplete,
+    ):
+        import pyarrow.parquet as pq
+
+        root = Path(source["root"]).expanduser().resolve()
+        name = str(source["name"])
+        source_skip_incomplete = source.get("skip_incomplete", skip_incomplete)
+        if not isinstance(source_skip_incomplete, bool):
+            raise ValueError(f"{name}: skip_incomplete must be a boolean")
+        info_file = root / source.get("info_file", "meta/info.json")
+        if source_skip_incomplete and not info_file.is_file():
+            self._summary["skipped_sources"].append({"name": name, "root": str(root), "reason": "missing_info_file"})
+            return
+        info = json.loads(info_file.read_text())
+        if info.get("codebase_version") != "v3.0":
+            raise ValueError(f"{name}: expected LeRobot v3.0, found {info.get('codebase_version')!r}")
+        marker = root / "verified.json"
+        source_require_verified = source.get("require_verified", require_verified)
+        if not isinstance(source_require_verified, bool):
+            raise ValueError(f"{name}: require_verified must be a boolean")
+        if source_require_verified and not marker.is_file():
+            raise ValueError(f"{name}: missing {marker}; unfinished datasets are excluded")
+        if marker.is_file():
+            verified = json.loads(marker.read_text())
+            for marker_key, info_key in (("episodes", "total_episodes"), ("frames", "total_frames")):
+                if int(verified.get(marker_key, -1)) != int(info.get(info_key, -2)):
+                    raise ValueError(f"{name}: verified {marker_key} does not match info.{info_key}")
+
+        features = info.get("features", {})
+        pairs = self._resolve_camera_pairs(name, source, features)
+        keys = list(dict.fromkeys(key for pair in pairs for key in pair))
+
+        has_fem = bool(source.get("has_fem", False))
+        fem_feature = str(source.get("fem_feature", "observation.fem_label")) if has_fem else None
+        fem_arm_indices: list[int | None]
+        if has_fem:
+            if fem_feature not in features:
+                raise ValueError(f"{name}: has_fem=True but {fem_feature!r} missing from info features")
+            fem_shape = list(features[fem_feature].get("shape", []))
+            if fem_shape == [2, 2, self.fem_dim]:
+                raw_arms = source.get("fem_arm_indices")
+                fem_arm_indices = list(range(len(pairs))) if raw_arms is None else list(raw_arms)
+            elif fem_shape == [2, self.fem_dim]:
+                fem_arm_indices = [None] * len(pairs)
+            else:
+                raise ValueError(
+                    f"{name}: expected {fem_feature} shape [2, 2, {self.fem_dim}] or [2, {self.fem_dim}], got {fem_shape}"
+                )
+            if len(fem_arm_indices) != len(pairs):
+                raise ValueError(f"{name}: fem_arm_indices length must match camera_pairs")
+        else:
+            fem_arm_indices = [None] * len(pairs)
+
+        columns = ["episode_index", "length", "data/chunk_index", "data/file_index"]
+        for key in keys:
+            columns.extend(
+                f"videos/{key}/{field}" for field in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
+            )
+        files = sorted((root / "meta/episodes").rglob("*.parquet"))
+        if not files:
+            if source_skip_incomplete and int(info.get("total_episodes", 0)) == 0:
+                self._summary["skipped_sources"].append({"name": name, "root": str(root), "reason": "no_episodes"})
+                return
+            raise ValueError(f"{name}: no LeRobot v3 episode parquet files")
+        episodes = []
+        for path in files:
+            episodes.extend(pq.read_table(path, columns=columns).to_pylist())
+        episodes.sort(key=lambda row: int(row["episode_index"]))
+        indices = [int(row["episode_index"]) for row in episodes]
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"{name}: duplicate episode indices")
+        if len(episodes) != int(info["total_episodes"]):
+            raise ValueError(f"{name}: episode table count does not match info.total_episodes")
+        if any(int(row["length"]) < 1 for row in episodes):
+            raise ValueError(f"{name}: empty episode in metadata")
+        if sum(int(row["length"]) for row in episodes) != int(info["total_frames"]):
+            raise ValueError(f"{name}: episode lengths do not match info.total_frames")
+
+        name_seed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
+        rng = np.random.default_rng((seed + name_seed) % (2**64))
+        order = rng.permutation(len(episodes)).tolist()
+        if episode_limit is not None:
+            order = order[:episode_limit]
+        minimum = 1 + int(val_fraction > 0) + int(test_fraction > 0)
+        if len(order) < minimum:
+            if source_skip_incomplete:
+                self._summary["skipped_sources"].append(
+                    {"name": name, "root": str(root), "reason": f"insufficient_episodes:{len(order)}<{minimum}"}
+                )
+                return
+            raise ValueError(f"{name}: need at least {minimum} episodes for nonempty train/val/test splits")
+        n_val = (
+            min(len(order) - 1 - int(test_fraction > 0), max(1, round(len(order) * val_fraction)))
+            if val_fraction
+            else 0
+        )
+        n_test = min(len(order) - n_val - 1, max(1, round(len(order) * test_fraction))) if test_fraction else 0
+        partitions = {
+            "all": order,
+            "val": order[:n_val],
+            "test": order[n_val : n_val + n_test],
+            "train": order[n_val + n_test :],
+        }
+        chosen = partitions[self.split]
+        selected = [episodes[i] for i in sorted(chosen)]
+        eligible = [row for row in selected if int(row["length"]) >= self.clip_span]
+        start = self._ends[-1] if self._ends else 0
+
+        def _make_cam(row: dict[str, Any], key: str, data_path: Path, episode_index: int, length: int) -> _CameraEpisode:
+            prefix = f"videos/{key}/"
+            video_path = root / info.get("video_path", _VIDEO_PATH).format(
+                video_key=key,
+                episode_index=episode_index,
+                chunk_index=int(row[prefix + "chunk_index"]),
+                file_index=int(row[prefix + "file_index"]),
+            )
+            offset, end_ts = float(row[prefix + "from_timestamp"]), float(row[prefix + "to_timestamp"])
+            if not math.isfinite(offset) or not math.isfinite(end_ts) or offset < 0 or end_ts <= offset:
+                raise ValueError(f"{name} episode {episode_index}: invalid video timestamp interval")
+            return _CameraEpisode(name, episode_index, key, length, data_path, video_path, offset, end_ts, mode)
+
+        for row in eligible:
+            episode_index = int(row["episode_index"])
+            length = int(row["length"])
+            data_path = root / info.get("data_path", _DATA_PATH).format(
+                episode_index=episode_index,
+                chunk_index=int(row["data/chunk_index"]),
+                file_index=int(row["data/file_index"]),
+            )
+            for (left_key, right_key), arm_index in zip(pairs, fem_arm_indices, strict=True):
+                left_ep = _make_cam(row, left_key, data_path, episode_index, length)
+                right_ep = _make_cam(row, right_key, data_path, episode_index, length)
+                self._streams.append(
+                    _PairedCameraEpisode(name, episode_index, left_ep, right_ep, has_fem, fem_feature, arm_index)
+                )
+                self._ends.append(
+                    (self._ends[-1] if self._ends else 0) + (length - self.clip_span) // self.frame_stride + 1
+                )
+
+        end = self._ends[-1] if self._ends else 0
+        if end > start:
+            self.source_ranges.append((name, start, end))
+        self._summary["sources"].append(
+            {
+                "name": name,
+                "root": str(root),
+                "info_file": str(info_file),
+                "require_verified": source_require_verified,
+                "verified": marker.is_file(),
+                "camera_pairs": [list(pair) for pair in pairs],
+                "has_fem": has_fem,
+                "fem_feature": fem_feature,
+                "timestamp_mode": mode,
+                "episodes": len(eligible),
+                "frames": sum(int(row["length"]) for row in eligible),
+                "excluded_short_episodes": len(selected) - len(eligible),
+                "samples": end - start,
+                "available_episodes": len(episodes),
+                "available_frames": int(info["total_frames"]),
+            }
+        )
+
+    def _episode_fem_labels(self, record: _PairedCameraEpisode) -> np.ndarray:
+        import pyarrow.parquet as pq
+
+        assert record.fem_feature is not None
+        cache_key = (str(record.left.data_path), record.episode_index, record.fem_feature)
+        if cache_key not in self._fem_labels:
+            path = str(record.left.data_path)
+            if path not in self._parquet_files:
+                self._parquet_files[path] = pq.ParquetFile(path)
+                if len(self._parquet_files) > self._video_cache_size:
+                    self._parquet_files.popitem(last=False)[1].close()
+            self._parquet_files.move_to_end(path)
+            parquet = self._parquet_files[path]
+            episode_column = parquet.schema_arrow.get_field_index("episode_index")
+            if episode_column < 0:
+                raise ValueError(f"Missing episode_index column in {path}")
+            pieces = []
+            for group in range(parquet.num_row_groups):
+                stats = parquet.metadata.row_group(group).column(episode_column).statistics
+                if stats is not None and stats.has_min_max and not stats.min <= record.episode_index <= stats.max:
+                    continue
+                table = parquet.read_row_group(group, columns=["episode_index", record.fem_feature])
+                mask = table["episode_index"].to_numpy() == record.episode_index
+                if mask.any():
+                    arr = np.asarray(table[record.fem_feature].to_pylist(), dtype=np.float32)
+                    pieces.append(arr[mask])
+            labels = np.concatenate(pieces, axis=0) if pieces else np.empty((0, 2, self.fem_dim), dtype=np.float32)
+            if len(labels) != record.left.length:
+                raise ValueError(
+                    f"{path}: FEM label count {len(labels)} != episode length {record.left.length} "
+                    f"for episode {record.episode_index}"
+                )
+            self._fem_labels[cache_key] = labels
+            if len(self._fem_labels) > self._timestamp_cache_size:
+                self._fem_labels.popitem(last=False)
+        self._fem_labels.move_to_end(cache_key)
+        return self._fem_labels[cache_key]
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        self._ensure_process()
+        record, frame_index = self._locate(index)
+        left = self._decode_camera(record.left, frame_index)
+        right = self._decode_camera(record.right, frame_index)
+        if record.has_fem:
+            label_frame = frame_index + (self.num_frames - 1) * self.clip_frame_step
+            ep_labels = self._episode_fem_labels(record)
+            frame_label = ep_labels[label_frame]
+            if record.fem_arm_index is not None:
+                frame_label = frame_label[record.fem_arm_index]
+            fem_label = torch.from_numpy(np.asarray(frame_label, dtype=np.float32).copy())
+            has_fem = torch.tensor(True, dtype=torch.bool)
+        else:
+            fem_label = torch.zeros((2, self.fem_dim), dtype=torch.float32)
+            has_fem = torch.tensor(False, dtype=torch.bool)
+        return {"left": left, "right": right, "fem_label": fem_label, "has_fem": has_fem}
+
+    def close(self) -> None:
+        super().close()
+        self._fem_labels = OrderedDict()
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_fem_labels"] = OrderedDict()
+        return state
 
 
 class BalancedSourceSampler(Sampler[int]):

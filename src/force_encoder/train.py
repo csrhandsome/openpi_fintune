@@ -16,6 +16,8 @@ import yaml
 
 from force_encoder.data import BalancedSourceSampler
 from force_encoder.data import LeRobotTactileDataset
+from force_encoder.data import PairedTactileFemDataset
+from force_encoder.model import DualCameraForceJEPA
 from force_encoder.model import ImageJEPA
 from openpi.training.tracking import init_tracking
 
@@ -28,6 +30,9 @@ def read_config(path: str | Path) -> dict:
     for source in config["data"]["sources"]:
         root = Path(source["root"]).expanduser()
         source["root"] = str(root if root.is_absolute() else PROJECT_ROOT / root)
+    if config["data"].get("fem_stats_path"):
+        stats_path = Path(config["data"]["fem_stats_path"]).expanduser()
+        config["data"]["fem_stats_path"] = str(stats_path if stats_path.is_absolute() else PROJECT_ROOT / stats_path)
     output = Path(config["output_dir"]).expanduser()
     config["output_dir"] = str(output if output.is_absolute() else PROJECT_ROOT / output)
     return config
@@ -36,9 +41,51 @@ def read_config(path: str | Path) -> dict:
 def make_dataset(config: dict, split: str) -> LeRobotTactileDataset:
     model = config["model"]
     frames = model.get("num_frames", 1) if model.get("input_mode", "single_frame") == "spatiotemporal" else 1
+    data_cfg = {k: v for k, v in config["data"].items() if k != "fem_stats_path"}
+    if model.get("model_type", "image_jepa") == "dual_fem_jepa":
+        return PairedTactileFemDataset(
+            **data_cfg,
+            image_size=model["image_size"],
+            split=split,
+            seed=config["seed"],
+            num_frames=frames,
+            fem_dim=model.get("fem_dim", 11),
+        )
     return LeRobotTactileDataset(
-        **config["data"], image_size=model["image_size"], split=split, seed=config["seed"], num_frames=frames
+        **data_cfg, image_size=model["image_size"], split=split, seed=config["seed"], num_frames=frames
     )
+
+
+def make_model(config: dict) -> ImageJEPA | DualCameraForceJEPA:
+    model_cfg = dict(config["model"])
+    model_type = model_cfg.pop("model_type", "image_jepa")
+    if model_type == "dual_fem_jepa":
+        model = DualCameraForceJEPA(**model_cfg)
+        stats_path = config["data"].get("fem_stats_path")
+        if stats_path:
+            stats = json.loads(Path(stats_path).read_text())
+            model.set_fem_stats(stats["mean"], stats["std"])
+        return model
+    if model_type != "image_jepa":
+        raise ValueError(f"Unsupported model_type: {model_type!r}")
+    return ImageJEPA(**model_cfg)
+
+
+def _forward_batch(
+    model: ImageJEPA | DualCameraForceJEPA,
+    batch: torch.Tensor | dict[str, torch.Tensor],
+    device: torch.device,
+    generator: torch.Generator | None = None,
+) -> tuple[dict[str, torch.Tensor], int]:
+    if isinstance(batch, dict):
+        left = batch["left"].to(device, non_blocking=True)
+        right = batch["right"].to(device, non_blocking=True)
+        fem_label = batch["fem_label"].to(device, non_blocking=True)
+        has_fem = batch["has_fem"].to(device, non_blocking=True)
+        metrics = model(left, right, fem_label=fem_label, has_fem=has_fem, generator=generator)
+        return metrics, len(left)
+    images = batch.to(device, non_blocking=True)
+    return model(images, generator=generator), len(images)
 
 
 def seed_worker(_worker_id: int) -> None:
@@ -128,7 +175,7 @@ def save_checkpoint(path: Path, model: ImageJEPA, optimizer, step: int, config: 
 
 
 @torch.no_grad()
-def validate(model: ImageJEPA, loader: DataLoader, device: torch.device, cfg: dict) -> dict:
+def validate(model: ImageJEPA | DualCameraForceJEPA, loader: DataLoader, device: torch.device, cfg: dict) -> dict:
     model.eval()
     generator = torch.Generator().manual_seed(12345)
     totals = {}
@@ -137,12 +184,11 @@ def validate(model: ImageJEPA, loader: DataLoader, device: torch.device, cfg: di
     for index, batch in enumerate(loader):
         if index >= cfg["val_batches"]:
             break
-        images = batch.to(device, non_blocking=True)
         with amp_context(device, cfg["precision"]):
-            metrics = model(images, generator=generator)
+            metrics, batch_size = _forward_batch(model, batch, device, generator=generator)
         for key, value in metrics.items():
-            totals[key] = totals.get(key, 0.0) + float(value) * len(images)
-        samples += len(images)
+            totals[key] = totals.get(key, 0.0) + float(value) * batch_size
+        samples += batch_size
     model.train()
     if samples == 0:
         raise ValueError("Validation produced no images")
@@ -159,11 +205,23 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
     if inspect:
         # Decode one sample per source; only shape/range statistics leave this process.
         for name, start, _end in train_data.source_ranges:
-            image = train_data[start]
-            print(
-                json.dumps({"source": name, "shape": list(image.shape), "finite": bool(image.isfinite().all())}),
-                flush=True,
-            )
+            sample = train_data[start]
+            if isinstance(sample, dict):
+                info = {
+                    "source": name,
+                    "left_shape": list(sample["left"].shape),
+                    "right_shape": list(sample["right"].shape),
+                    "fem_shape": list(sample["fem_label"].shape),
+                    "has_fem": bool(sample["has_fem"]),
+                    "finite": bool(
+                        sample["left"].isfinite().all()
+                        and sample["right"].isfinite().all()
+                        and sample["fem_label"].isfinite().all()
+                    ),
+                }
+            else:
+                info = {"source": name, "shape": list(sample.shape), "finite": bool(sample.isfinite().all())}
+            print(json.dumps(info), flush=True)
         return
     cfg = config["training"]
     if cfg["max_steps"] <= 0 or cfg["steps_per_epoch"] <= 0 or cfg["batch_size"] <= 0:
@@ -220,7 +278,7 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
     # Balance validation too, so a large dataset cannot dominate the reported metric.
     val_sampler = BalancedSourceSampler(val_data, num_samples=cfg["val_batches"] * cfg["batch_size"], seed=12345)
     val_loader = DataLoader(val_data, sampler=val_sampler, **loader_kwargs)
-    model = ImageJEPA(**config["model"]).to(device)
+    model = make_model(config).to(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -293,14 +351,13 @@ def run(config: dict, *, resume: str | None = None, inspect: bool = False) -> No
                 for batch_index, batch in enumerate(train_loader):
                     if batch_index < skip_batches:
                         continue
-                    images = batch.to(device, non_blocking=True)
                     lr, weight_decay, momentum = schedule(step, cfg)
                     for index, group in enumerate(optimizer.param_groups):
                         group["lr"] = lr
                         group["weight_decay"] = weight_decay if index == 0 else 0.0
                     optimizer.zero_grad(set_to_none=True)
                     with amp_context(device, cfg["precision"]):
-                        metrics = model(images)
+                        metrics, _ = _forward_batch(model, batch, device)
                     if not torch.isfinite(metrics["loss"]):
                         raise FloatingPointError(f"Nonfinite JEPA loss at step {step}")
                     metrics["loss"].backward()

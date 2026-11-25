@@ -414,3 +414,271 @@ def load_encoder(checkpoint: str | Path, device: str | torch.device = "cpu") -> 
     prefix = "context_encoder." if model_config.get("target_mode", "ema") == "sigreg" else "target_encoder."
     encoder.load_state_dict({key.removeprefix(prefix): value for key, value in state.items() if key.startswith(prefix)})
     return encoder.to(device).eval().requires_grad_(requires_grad=False)
+
+
+class DualCameraForceJEPA(nn.Module):
+    """Dual-camera V-JEPA with EMA/SIGReg targets and optional FEM supervision.
+
+    Left and right internal gripper cameras share ``context_encoder`` (and
+    ``target_encoder`` in EMA mode). Branch A performs masked spatiotemporal
+    JEPA prediction across both camera views; Branch B supervises the online
+    encoder on simulation samples with 11-D per-finger FEM labels.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 224,
+        patch_size: int = 16,
+        embed_dim: int = 192,
+        depth: int = 12,
+        num_heads: int = 3,
+        predictor_depth: int = 4,
+        predictor_dim: int = 192,
+        mlp_ratio: float = 4.0,
+        num_local_targets: int = 2,
+        num_global_targets: int = 2,
+        local_scale: tuple[float, float] = (0.05, 0.10),
+        global_scale: tuple[float, float] = (0.15, 0.20),
+        max_target_overlap: float = 0.25,
+        input_mode: str = "single_frame",
+        num_frames: int = 1,
+        tubelet_size: int = 1,
+        target_mode: str = "ema",
+        sigreg_weight: float = 0.09,
+        sigreg_knots: int = 17,
+        sigreg_num_proj: int = 1024,
+        fem_dim: int = 11,
+        jepa_weight: float = 1.0,
+        fem_weight: float = 1.0,
+        jepa_loss_type: str = "mse",
+        fem_loss_type: str = "smooth_l1",
+    ) -> None:
+        super().__init__()
+        if target_mode not in {"ema", "sigreg"}:
+            raise ValueError("target_mode must be ema or sigreg")
+        if jepa_loss_type not in {"mse", "l1"}:
+            raise ValueError("jepa_loss_type must be mse or l1")
+        if fem_loss_type not in {"mse", "smooth_l1"}:
+            raise ValueError("fem_loss_type must be mse or smooth_l1")
+        if not math.isfinite(sigreg_weight) or sigreg_weight <= 0:
+            raise ValueError("sigreg_weight must be finite and positive")
+        if fem_dim < 1:
+            raise ValueError("fem_dim must be positive")
+
+        self.context_encoder = ImageEncoder(
+            image_size, patch_size, embed_dim, depth, num_heads, mlp_ratio, input_mode, num_frames, tubelet_size
+        )
+        self.target_mode = target_mode
+        self.sigreg_weight = sigreg_weight
+        self.fem_dim = fem_dim
+        self.jepa_weight = jepa_weight
+        self.fem_weight = fem_weight
+        self.jepa_loss_type = jepa_loss_type
+        self.fem_loss_type = fem_loss_type
+
+        self.target_encoder = (
+            copy.deepcopy(self.context_encoder).requires_grad_(requires_grad=False).eval()
+            if target_mode == "ema"
+            else None
+        )
+        if target_mode == "sigreg":
+            self.target_projector = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.BatchNorm1d(embed_dim * 2),
+                nn.GELU(),
+                nn.Linear(embed_dim * 2, embed_dim),
+            )
+            self.sigreg = SIGReg(sigreg_knots, sigreg_num_proj)
+
+        self.context_projection = nn.Linear(embed_dim, predictor_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_dim))
+        self.cam_embed = nn.Parameter(torch.zeros(2, 1, predictor_dim))
+        nn.init.trunc_normal_(self.cam_embed, std=0.02)
+        self.register_buffer(
+            "predictor_pos_embed",
+            _spatiotemporal_position_embedding(
+                self.context_encoder.grid_size, self.context_encoder.temporal_size, predictor_dim
+            ),
+        )
+        self.predictor = _transformer(predictor_dim, predictor_depth, num_heads, mlp_ratio)
+        self.prediction_head = nn.Linear(predictor_dim, embed_dim)
+
+        # Symmetric per-finger FEM head: takes [z_self, z_other] -> fem_dim.
+        self.fem_head = nn.Sequential(
+            nn.LayerNorm(2 * embed_dim),
+            nn.Linear(2 * embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, fem_dim),
+        )
+        self.register_buffer("fem_mean", torch.zeros(fem_dim, dtype=torch.float32))
+        self.register_buffer("fem_std", torch.ones(fem_dim, dtype=torch.float32))
+
+        self.mask_config = {
+            "num_local_targets": num_local_targets,
+            "num_global_targets": num_global_targets,
+            "local_scale": local_scale,
+            "global_scale": global_scale,
+            "max_target_overlap": max_target_overlap,
+        }
+        self.model_config = {
+            "model_type": "dual_fem_jepa",
+            **self.context_encoder.config,
+            "predictor_depth": predictor_depth,
+            "predictor_dim": predictor_dim,
+            **self.mask_config,
+            "target_mode": target_mode,
+            "sigreg_weight": sigreg_weight,
+            "sigreg_knots": sigreg_knots,
+            "sigreg_num_proj": sigreg_num_proj,
+            "fem_dim": fem_dim,
+            "jepa_weight": jepa_weight,
+            "fem_weight": fem_weight,
+            "jepa_loss_type": jepa_loss_type,
+            "fem_loss_type": fem_loss_type,
+        }
+
+    def set_fem_stats(self, mean: torch.Tensor | list[float], std: torch.Tensor | list[float]) -> None:
+        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=self.fem_mean.device)
+        std_t = torch.as_tensor(std, dtype=torch.float32, device=self.fem_std.device).clamp_min(1e-6)
+        if mean_t.shape != (self.fem_dim,) or std_t.shape != (self.fem_dim,):
+            raise ValueError(f"Expected FEM stats shape ({self.fem_dim},), got {mean_t.shape} and {std_t.shape}")
+        self.fem_mean.copy_(mean_t)
+        self.fem_std.copy_(std_t)
+
+    def train(self, mode: bool = True):  # noqa: FBT001, FBT002
+        super().train(mode)
+        if self.target_encoder is not None:
+            self.target_encoder.eval()
+        return self
+
+    def sample_masks(self, generator: torch.Generator | None = None) -> JEPAMasks:
+        masks = sample_masks(self.context_encoder.grid_size, generator=generator, **self.mask_config)
+        offsets = torch.arange(self.context_encoder.temporal_size) * self.context_encoder.grid_size**2
+
+        def expand(indices):
+            return (offsets[:, None] + indices[None]).flatten()
+
+        return JEPAMasks(expand(masks.context), tuple(expand(target) for target in masks.targets))
+
+    def forward(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        fem_label: torch.Tensor | None = None,
+        has_fem: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if left.shape != right.shape:
+            raise ValueError(f"Left and right camera shapes must match, got {left.shape} and {right.shape}")
+        batch_size = left.shape[0]
+        both = torch.cat((left, right), dim=0)
+
+        masks = self.sample_masks(generator)
+        context_indices = masks.context.to(left.device)
+        target_indices = torch.unique(torch.cat(masks.targets)).to(left.device)
+
+        if self.target_mode == "ema":
+            with torch.no_grad():
+                targets = self.target_encoder.forward_features(both).index_select(1, target_indices)
+                targets = functional.layer_norm(targets.float(), (targets.shape[-1],))
+            regularization = left.new_zeros((), dtype=torch.float32)
+        else:
+            full = self.context_encoder.forward_features(both)
+            full = self.target_projector(full.flatten(0, 1)).reshape_as(full).float()
+            targets = full.index_select(1, target_indices)
+            populations = full.reshape(len(both), self.context_encoder.temporal_size, -1, full.shape[-1]).mean(2)
+            regularization = self.sigreg(populations.transpose(0, 1), generator=generator)
+
+        ctx_both = self.context_projection(self.context_encoder.forward_features(both, context_indices))
+        ctx_left, ctx_right = ctx_both.chunk(2, dim=0)
+        position = self.predictor_pos_embed.to(dtype=ctx_left.dtype)
+        ctx_pos = position.index_select(1, context_indices)
+        tgt_pos = position.index_select(1, target_indices)
+        cam_l = self.cam_embed[0:1].to(dtype=ctx_left.dtype)
+        cam_r = self.cam_embed[1:2].to(dtype=ctx_left.dtype)
+
+        ctx_left = ctx_left + ctx_pos + cam_l
+        ctx_right = ctx_right + ctx_pos + cam_r
+        tgt_left = (self.mask_token.to(dtype=ctx_left.dtype) + tgt_pos + cam_l).expand(batch_size, -1, -1)
+        tgt_right = (self.mask_token.to(dtype=ctx_left.dtype) + tgt_pos + cam_r).expand(batch_size, -1, -1)
+
+        n_ctx = ctx_left.shape[1] + ctx_right.shape[1]
+        seq = torch.cat((ctx_left, ctx_right, tgt_left, tgt_right), dim=1)
+        pred_tokens = self.predictor(seq)[:, n_ctx:]
+        pred_left, pred_right = pred_tokens.chunk(2, dim=1)
+        predictions = self.prediction_head(torch.cat((pred_left, pred_right), dim=0))
+
+        if self.jepa_loss_type == "l1":
+            prediction_loss = functional.l1_loss(predictions.float(), targets)
+        else:
+            prediction_loss = functional.mse_loss(predictions.float(), targets)
+
+        # Branch B: Current FEM supervision on unmasked online encoder features.
+        fem_loss = left.new_zeros((), dtype=torch.float32)
+        fem_mae = left.new_zeros((), dtype=torch.float32)
+        fem_valid_fraction = left.new_zeros((), dtype=torch.float32)
+        if fem_label is not None and has_fem is not None:
+            valid = has_fem.bool()
+            fem_valid_fraction = valid.float().mean().detach()
+            if valid.any():
+                z_left = self.context_encoder.forward_features(left[valid]).mean(dim=1)
+                z_right = self.context_encoder.forward_features(right[valid]).mean(dim=1)
+                pred_fem_left = self.fem_head(torch.cat((z_left, z_right), dim=-1))
+                pred_fem_right = self.fem_head(torch.cat((z_right, z_left), dim=-1))
+                pred_fem = torch.stack((pred_fem_left, pred_fem_right), dim=1).float()
+                target_fem = (fem_label[valid].float() - self.fem_mean) / self.fem_std.clamp_min(1e-6)
+                if self.fem_loss_type == "mse":
+                    fem_loss = functional.mse_loss(pred_fem, target_fem)
+                else:
+                    fem_loss = functional.smooth_l1_loss(pred_fem, target_fem)
+                fem_mae = functional.l1_loss(pred_fem.detach(), target_fem)
+
+        jepa_loss = prediction_loss + self.sigreg_weight * regularization
+        total_loss = self.jepa_weight * jepa_loss + self.fem_weight * fem_loss
+        detached = predictions.detach().float()
+        time_steps = self.context_encoder.temporal_size
+        return {
+            "loss": total_loss,
+            "prediction_loss": prediction_loss,
+            "sigreg_loss": regularization.detach(),
+            "fem_loss": fem_loss,
+            "fem_mae_norm": fem_mae,
+            "fem_valid_fraction": fem_valid_fraction,
+            "target_std": targets.flatten(0, 1).std(dim=0, unbiased=False).mean().detach(),
+            "prediction_std": detached.flatten(0, 1).std(dim=0, unbiased=False).mean(),
+            "target_sample_std": targets.std(dim=0, unbiased=False).mean().detach(),
+            "prediction_sample_std": detached.std(dim=0, unbiased=False).mean(),
+            "target_temporal_std": targets.reshape(len(both), time_steps, -1, targets.shape[-1])
+            .std(dim=1, unbiased=False)
+            .mean()
+            .detach(),
+            "prediction_temporal_std": detached.reshape(len(both), time_steps, -1, detached.shape[-1])
+            .std(dim=1, unbiased=False)
+            .mean(),
+            "context_tokens": left.new_tensor(context_indices.numel()),
+            "target_tokens": left.new_tensor(target_indices.numel()),
+        }
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float) -> None:
+        if not math.isfinite(momentum) or not 0 <= momentum <= 1:
+            raise ValueError("Teacher momentum must be between 0 and 1")
+        if self.target_encoder is None:
+            return
+        for teacher, student in zip(self.target_encoder.parameters(), self.context_encoder.parameters(), strict=True):
+            teacher.lerp_(student, 1.0 - momentum)
+        for teacher, student in zip(self.target_encoder.buffers(), self.context_encoder.buffers(), strict=True):
+            teacher.copy_(student)
+
+    @torch.no_grad()
+    def encode(
+        self, left: torch.Tensor, right: torch.Tensor, *, pool: bool = True, use_teacher: bool = True
+    ) -> torch.Tensor:
+        """Encode paired left/right camera clips into a joint [B, 2, D] or [B, 2, N, D] tensor."""
+        encoder = self.target_encoder if use_teacher and self.target_encoder is not None else self.context_encoder
+        both = torch.cat((left, right), dim=0)
+        tokens = encoder.forward_features(both)
+        if pool:
+            tokens = tokens.mean(dim=1)
+        z_left, z_right = tokens.chunk(2, dim=0)
+        return torch.stack((z_left, z_right), dim=1)

@@ -1,0 +1,91 @@
+# Dual-camera Physics-Aware Force Encoder: V-JEPA (EMA) + Current FEM Supervision.
+# Run from project root after computing FEM normalization stats:
+#   .venv/bin/python scripts/compute_norm_stats_fem.py --config config/train/force_encoder_physics_jepa.yaml
+#   PYTHONPATH=src .venv/bin/python -m force_encoder.train --config config/train/force_encoder_physics_jepa.yaml
+name: force_encoder
+project_name: openpi
+exp_name: physics_jepa_dual_ema
+tracking_backend: swanlab  # swanlab / wandb / none
+seed: 42
+output_dir: checkpoints/force_encoder/physics_jepa_dual_ema
+data:
+  # Optional precomputed global FEM mean/std JSON (from scripts/compute_norm_stats_fem.py).
+  fem_stats_path: null
+  sources:
+    # Example simulation source with FEM labels (2 arms x 2 fingers x 11 dims):
+    # - name: soft_sim_hanging_mug
+    #   root: /mnt/nas/soft_sim/datasets_fem/hanging_mug
+    #   timestamp_mode: frame_index
+    #   require_verified: false
+    #   has_fem: true
+    #   fem_feature: observation.fem_label
+    #   camera_pairs:
+    #     - [observation.images.left_hand_left_rgb, observation.images.left_hand_right_rgb]
+    #     - [observation.images.right_hand_left_rgb, observation.images.right_hand_right_rgb]
+    - name: tactile-video-pretrain-nc
+      root: data/force/tactile-video-pretrain-nc/lerobot_v3
+      timestamp_mode: frame_index
+      has_fem: false
+    - name: FreeTacMan
+      root: data/force/FreeTacMan/lerobot_v3
+      timestamp_mode: frame_index
+      has_fem: false
+    - name: ViTaMIn
+      root: data/force/ViTaMIn/lerobot_v3
+      timestamp_mode: frame_index
+      has_fem: false
+    - name: HapTile
+      root: data/force/HapTile/lerobot_v3
+      timestamp_mode: frame_index
+      has_fem: false
+  val_fraction: 0.05
+  test_fraction: 0.05
+  frame_stride: 5
+  clip_frame_step: 2
+  max_episodes_per_source: null
+model:
+  model_type: dual_fem_jepa
+  input_mode: spatiotemporal
+  num_frames: 16
+  tubelet_size: 2
+  target_mode: ema
+  sigreg_weight: 0.09
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
+  image_size: 224
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  predictor_depth: 4
+  predictor_dim: 768
+  mlp_ratio: 4.0
+  num_local_targets: 2
+  num_global_targets: 2
+  local_scale: [0.05, 0.10]
+  global_scale: [0.15, 0.20]
+  max_target_overlap: 0.25
+  fem_dim: 11
+  jepa_weight: 1.0
+  fem_weight: 1.0
+  jepa_loss_type: mse
+  fem_loss_type: smooth_l1
+training:
+  device: cuda
+  precision: bf16
+  batch_size: 8
+  num_workers: 4
+  steps_per_epoch: 1000
+  max_steps: 100000
+  learning_rate: 0.0003
+  min_learning_rate: 0.000001
+  warmup_steps: 2000
+  weight_decay: 0.04
+  final_weight_decay: 0.1
+  ema_start: 0.996
+  ema_end: 1.0
+  grad_clip: 1.0
+  log_every: 20
+  validate_every: 1000
+  val_batches: 20
+  save_every: 1000

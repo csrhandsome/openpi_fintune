@@ -87,7 +87,10 @@ def _valid_action_timing(sync: dict) -> bool:
     offset = sync.get("action_target_offset_frames")
     if offset is not None:
         return offset == 1
-    if sync.get("action_semantics") == "next_camera_observation_measured_state":
+    if sync.get("action_semantics") in {
+        "next_camera_observation_measured_state",
+        "next_camera_observation_target_command",
+    }:
         return True
     frames = sync.get("frame_records")
     return bool(frames) and isinstance(frames[0], dict) and "action_joint_position" in frames[0]

@@ -1,0 +1,165 @@
+# ViT-Base/16 spatiotemporal JEPA over soft_sim RoboTwin 5-view FEM datasets.
+# Presets all 44 enabled tasks from soft_sim/configs/robotwin_collection.yaml
+# (6 disabled tasks out of 50: blocks_ranking_size, dump_bin_bigbin, handover_mic,
+# open_laptop, place_can_basket, place_object_basket).
+# Run from the project root after linking data/soft_sim:
+#   PYTHONPATH=src .venv/bin/python -m force_encoder.setup_data \
+#     --soft-sim-root /data/codes/grade_two/my_projects/robot/soft_sim/data/datasets
+name: force_encoder
+project_name: openpi
+exp_name: jepa_video16_tube2_ema_soft_sim
+tracking_backend: swanlab  # swanlab / wandb / none（关闭追踪）
+seed: 42
+output_dir: checkpoints/force_encoder/jepa_video16_tube2_ema_soft_sim
+data:
+  # soft_sim exports native LeRobot v3.0 datasets without verified.json;
+  # full episode/frame/interval metadata checks still run at load time.
+  require_verified: false
+  # Skip tasks not yet generated or with <3 episodes while collection is running.
+  skip_incomplete_sources: true
+  timestamp_mode: frame_index
+  # Only use the four internal gripper finger cameras (exclude external_rgb).
+  video_keys:
+    - observation.images.left_hand_left_rgb
+    - observation.images.left_hand_right_rgb
+    - observation.images.right_hand_left_rgb
+    - observation.images.right_hand_right_rgb
+  sources:
+    - name: adjust_bottle
+      root: data/soft_sim/adjust_bottle
+    - name: beat_block_hammer
+      root: data/soft_sim/beat_block_hammer
+    - name: blocks_ranking_rgb
+      root: data/soft_sim/blocks_ranking_rgb
+    - name: click_alarmclock
+      root: data/soft_sim/click_alarmclock
+    - name: click_bell
+      root: data/soft_sim/click_bell
+    - name: grab_roller
+      root: data/soft_sim/grab_roller
+    - name: handover_block
+      root: data/soft_sim/handover_block
+    - name: hanging_mug
+      root: data/soft_sim/hanging_mug
+    - name: lift_pot
+      root: data/soft_sim/lift_pot
+    - name: move_can_pot
+      root: data/soft_sim/move_can_pot
+    - name: move_pillbottle_pad
+      root: data/soft_sim/move_pillbottle_pad
+    - name: move_playingcard_away
+      root: data/soft_sim/move_playingcard_away
+    - name: move_stapler_pad
+      root: data/soft_sim/move_stapler_pad
+    - name: open_microwave
+      root: data/soft_sim/open_microwave
+    - name: pick_diverse_bottles
+      root: data/soft_sim/pick_diverse_bottles
+    - name: pick_dual_bottles
+      root: data/soft_sim/pick_dual_bottles
+    - name: place_a2b_left
+      root: data/soft_sim/place_a2b_left
+    - name: place_a2b_right
+      root: data/soft_sim/place_a2b_right
+    - name: place_bread_basket
+      root: data/soft_sim/place_bread_basket
+    - name: place_bread_skillet
+      root: data/soft_sim/place_bread_skillet
+    - name: place_burger_fries
+      root: data/soft_sim/place_burger_fries
+    - name: place_cans_plasticbox
+      root: data/soft_sim/place_cans_plasticbox
+    - name: place_container_plate
+      root: data/soft_sim/place_container_plate
+    - name: place_dual_shoes
+      root: data/soft_sim/place_dual_shoes
+    - name: place_empty_cup
+      root: data/soft_sim/place_empty_cup
+    - name: place_fan
+      root: data/soft_sim/place_fan
+    - name: place_mouse_pad
+      root: data/soft_sim/place_mouse_pad
+    - name: place_object_scale
+      root: data/soft_sim/place_object_scale
+    - name: place_object_stand
+      root: data/soft_sim/place_object_stand
+    - name: place_phone_stand
+      root: data/soft_sim/place_phone_stand
+    - name: place_shoe
+      root: data/soft_sim/place_shoe
+    - name: press_stapler
+      root: data/soft_sim/press_stapler
+    - name: put_bottles_dustbin
+      root: data/soft_sim/put_bottles_dustbin
+    - name: put_object_cabinet
+      root: data/soft_sim/put_object_cabinet
+    - name: rotate_qrcode
+      root: data/soft_sim/rotate_qrcode
+    - name: scan_object
+      root: data/soft_sim/scan_object
+    - name: shake_bottle
+      root: data/soft_sim/shake_bottle
+    - name: shake_bottle_horizontally
+      root: data/soft_sim/shake_bottle_horizontally
+    - name: stack_blocks_three
+      root: data/soft_sim/stack_blocks_three
+    - name: stack_blocks_two
+      root: data/soft_sim/stack_blocks_two
+    - name: stack_bowls_three
+      root: data/soft_sim/stack_bowls_three
+    - name: stack_bowls_two
+      root: data/soft_sim/stack_bowls_two
+    - name: stamp_seal
+      root: data/soft_sim/stamp_seal
+    - name: turn_switch
+      root: data/soft_sim/turn_switch
+  val_fraction: 0.05
+  # Hold out test episodes from SSL as well as downstream head training.
+  test_fraction: 0.05
+  frame_stride: 5
+  # Gap between frames WITHIN a clip; frame_stride above is the gap between clip starts.
+  clip_frame_step: 2
+  max_episodes_per_source: null
+model:
+  input_mode: spatiotemporal
+  num_frames: 16
+  tubelet_size: 2
+  # ema: frozen EMA teacher; sigreg: shared encoder, both branches receive gradients.
+  target_mode: ema
+  sigreg_weight: 0.09
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
+  image_size: 224
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  predictor_depth: 4
+  predictor_dim: 768
+  mlp_ratio: 4.0
+  num_local_targets: 2
+  num_global_targets: 2
+  local_scale: [0.05, 0.10]
+  global_scale: [0.15, 0.20]
+  max_target_overlap: 0.25
+training:
+  device: cuda
+  precision: bf16
+  # Number of clips, not number of frames (8 clips = 128 images per update).
+  batch_size: 8
+  num_workers: 4
+  # A fixed-length epoch, drawing equally from each dataset with replacement.
+  steps_per_epoch: 1000
+  max_steps: 100000
+  learning_rate: 0.0003
+  min_learning_rate: 0.000001
+  warmup_steps: 2000
+  weight_decay: 0.04
+  final_weight_decay: 0.1
+  ema_start: 0.996
+  ema_end: 1.0
+  grad_clip: 1.0
+  log_every: 20
+  validate_every: 1000
+  val_batches: 20
+  save_every: 1000

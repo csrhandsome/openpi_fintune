@@ -327,3 +327,57 @@ def test_preprocess_matches_training_and_is_rgb(v3_root):
     with pytest.raises(IndexError):
         dataset[len(dataset)]
     assert dataset.sample_metadata(-1) == dataset.sample_metadata(len(dataset) - 1)
+
+
+def test_dataset_level_video_keys_and_skip_incomplete_sources(v3_root, tmp_path):
+    (v3_root / "verified.json").unlink()
+    small_root = tmp_path / "too_small"
+    (small_root / "meta/episodes/chunk-000").mkdir(parents=True)
+    small_info = json.loads((v3_root / "meta/info.json").read_text())
+    small_info.update(total_episodes=1, total_frames=3)
+    (small_root / "meta/info.json").write_text(json.dumps(small_info))
+    small_rows = pq.read_table(v3_root / "meta/episodes/chunk-000/file-000.parquet").to_pylist()[:1]
+    pq.write_table(pa.Table.from_pylist(small_rows), small_root / "meta/episodes/chunk-000/file-000.parquet")
+
+    sources = [
+        {"name": "missing_task", "root": tmp_path / "not_created_yet"},
+        {"name": "small_task", "root": small_root},
+        {"name": "ready_task", "root": v3_root},
+    ]
+    dataset = LeRobotTactileDataset(
+        sources,
+        image_size=16,
+        split="train",
+        val_fraction=0.25,
+        test_fraction=0.25,
+        frame_stride=1,
+        require_verified=False,
+        video_keys=[TACTILE_KEYS[0]],
+        skip_incomplete_sources=True,
+    )
+    try:
+        assert [s["name"] for s in dataset.summary["sources"]] == ["ready_task"]
+        assert dataset.summary["sources"][0]["video_keys"] == [TACTILE_KEYS[0]]
+        assert dataset.summary["skipped_sources"] == [
+            {
+                "name": "missing_task",
+                "root": str((tmp_path / "not_created_yet").resolve()),
+                "reason": "missing_info_file",
+            },
+            {"name": "small_task", "root": str(small_root.resolve()), "reason": "insufficient_episodes:1<3"},
+        ]
+        assert {dataset.sample_metadata(i)["video_key"] for i in range(len(dataset))} == {TACTILE_KEYS[0]}
+    finally:
+        dataset.close()
+
+    # Corrupt metadata on an existing ready source must still fail even when skipping incomplete ones.
+    bad_info = json.loads((v3_root / "meta/info.json").read_text())
+    bad_info["total_frames"] += 1
+    (v3_root / "meta/info.json").write_text(json.dumps(bad_info))
+    with pytest.raises(ValueError, match="episode lengths do not match"):
+        LeRobotTactileDataset(
+            sources,
+            require_verified=False,
+            video_keys=[TACTILE_KEYS[0]],
+            skip_incomplete_sources=True,
+        )
